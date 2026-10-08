@@ -551,6 +551,34 @@ export default class ImpactScene {
     const valid = (v) => Array.isArray(v) && v.length >= 3 && v.slice(0, 3).every(Number.isFinite)
       && Math.hypot(v[0], v[1], v[2]) > RE_KM && Math.hypot(v[0], v[1], v[2]) < 100000;
     const m = this.model;
+    // After the impact the stream has moved downrange: frame the live
+    // fragment nearest the stream mean (never the mean itself, which can sit
+    // inside the Earth) in the current playhead frame, from further out.
+    if (m && this.lastT != null && this.lastT > 300 && this.stats.alive > 0) {
+      let sx = 0; let sy = 0; let sz = 0; let n = 0;
+      for (let f = 0; f < m.F; f += 1) {
+        if (!this.fragAlive[f]) continue;
+        sx += this.fragNow[f * 3]; sy += this.fragNow[(f * 3) + 1]; sz += this.fragNow[(f * 3) + 2]; n += 1;
+      }
+      sx /= n; sy /= n; sz /= n;
+      let best = -1; let bestD = Infinity;
+      for (let f = 0; f < m.F; f += 1) {
+        if (!this.fragAlive[f]) continue;
+        const d = ((this.fragNow[f * 3] - sx) ** 2) + ((this.fragNow[(f * 3) + 1] - sy) ** 2) + ((this.fragNow[(f * 3) + 2] - sz) ** 2);
+        if (d < bestD) { bestD = d; best = f; }
+      }
+      if (best >= 0) {
+        const c = this.toCart(this.fragNow[best * 3], this.fragNow[(best * 3) + 1], this.fragNow[(best * 3) + 2]);
+        if ([c.x, c.y, c.z].every(Number.isFinite)) {
+          camera.cancelFlight();
+          camera.flyToBoundingSphere(new Cesium.BoundingSphere(c, 2000e3), {
+            offset: new Cesium.HeadingPitchRange(Cesium.Math.toRadians(20), Cesium.Math.toRadians(-55), 1.3e7),
+            duration: 2.2,
+          });
+          return true;
+        }
+      }
+    }
     const eciT = Array.isArray(target?.eci) ? target.eci.slice(0, 3).map(Number) : null;
     let eci = null;
     let ms = Date.parse(target?.utc || '');

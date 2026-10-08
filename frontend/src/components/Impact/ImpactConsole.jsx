@@ -23,6 +23,13 @@ function fmtKm(v) {
   return v.toFixed(1);
 }
 
+function hourTicks(t0, t1) {
+  const ticks = [t0, 0];
+  for (let t = 3600; t < t1 - 900; t += 3600) ticks.push(t);
+  ticks.push(t1);
+  return ticks.filter((t, i, a) => t >= t0 && t <= t1 && a.indexOf(t) === i);
+}
+
 function phaseOf(t) {
   if (t < 0) return 'APPROACH';
   if (t < IMPACT_BAND_S) return 'IMPACT';
@@ -76,7 +83,9 @@ export default function ImpactConsole() {
   const pct = (t) => `${(((t - t0) / span) * 100).toFixed(3)}%`;
   const phase = phaseOf(tRelS);
   const ready = !!replay;
-  const fragTotal = replay?.fragments?.ids?.length ?? event?.fragments_simulated ?? null;
+  const fragShown = replay?.fragments?.ids?.length ?? null;
+  // envelope.n_alive counts every simulated fragment, not just the displayed sample.
+  const fragSim = replay?.provenance?.fragments_simulated ?? event?.fragments_simulated ?? null;
   const step = Number(replay?.step_s) || 30;
   const playheadUtc = ready && Number.isFinite(Date.parse(replay.collision_utc))
     ? new Date(Date.parse(replay.collision_utc) + (tRelS * 1000)).toISOString().slice(11, 19)
@@ -111,7 +120,7 @@ export default function ImpactConsole() {
           </span>
         )}
         <span className="im-spacer" />
-        <button type="button" className="ui-btn im-btn" onClick={flyTo} disabled={!event}>Fly to impact</button>
+        <button type="button" className="ui-btn im-btn" onClick={flyTo} disabled={!event}>{tRelS > 300 ? 'Fly to debris' : 'Fly to impact'}</button>
         <button type="button" className="im-x" onClick={close} aria-label="Close replay (back to live)" title="Back to live">
           <svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true"><path d="M1 1l8 8M9 1l-8 8" stroke="currentColor" strokeWidth="1.4" /></svg>
         </button>
@@ -170,12 +179,17 @@ export default function ImpactConsole() {
           disabled={!ready}
           aria-label="Replay time relative to collision"
         />
+        <div className="im-phases" aria-hidden="true">
+          <span className={phase === 'APPROACH' ? 'is-on' : ''} style={{ left: 0 }}>Approach</span>
+          <span className={`im-phase-impact${phase === 'IMPACT' ? ' is-on' : ''}`} style={{ left: pct(0) }}>Impact</span>
+          <span className={phase === 'SPREAD' ? 'is-on' : ''} style={{ left: pct((Math.min(t1, IMPACT_BAND_S) + t1) / 2) }}>Spread</span>
+        </div>
         <div className="im-ticks" aria-hidden="true">
-          <span style={{ left: 0 }}>T−{Math.round(-t0 / 60)}m</span>
-          <span className="im-tick-lbl" style={{ left: `calc(${pct(t0 / 2)})` }}>APPROACH</span>
-          <span className="im-tick-lbl im-tick-lbl--t0" style={{ left: pct(0) }}>T0 IMPACT</span>
-          <span className="im-tick-lbl" style={{ left: pct((Math.min(t1, IMPACT_BAND_S) + t1) / 2) }}>SPREAD</span>
-          <span style={{ right: 0 }}>T+{Math.round(t1 / 60)}m</span>
+          {hourTicks(t0, t1).map((t) => (
+            <span key={t} className={t === 0 ? 'im-tick-t0' : ''} style={{ left: pct(t) }}>
+              {t === 0 ? 'T0' : `${t < 0 ? 'T−' : 'T+'}${Math.abs(Math.round(t / 60))}m`}
+            </span>
+          ))}
         </div>
       </div>
 
@@ -184,7 +198,7 @@ export default function ImpactConsole() {
         {!loading && error && <span className="im-note is-error">{error}</span>}
         {ready && (
           <>
-            <Stat label="Alive" value={env?.n_alive != null ? `${env.n_alive}` : (tRelS < 0 ? '0' : '—')} sub={fragTotal != null ? `/ ${fragTotal}` : null} />
+            <Stat label="Alive" value={env?.n_alive != null ? `${env.n_alive}` : (tRelS < 0 ? '0' : '—')} sub={fragSim != null ? `/ ${fragSim} sim` : null} />
             <Stat label="Spread p50" value={tRelS < 0 ? '—' : fmtKm(env?.p50_km)} sub="km" />
             <Stat label="p90" value={tRelS < 0 ? '—' : fmtKm(env?.p90_km)} sub="km" />
             <Stat label="Along-track" value={tRelS < 0 ? '—' : fmtKm(env?.along_track_spread_km)} sub="km" />
@@ -200,8 +214,9 @@ export default function ImpactConsole() {
       {ready && (
         <div className="im-prov" title={replay?.provenance?.note || ''}>
           {replay?.provenance?.propagator || 'propagated'} · linear interp. between {step}s samples
-          {replay?.provenance?.sampled_from ? ` · ${fragTotal} of ${replay.provenance.sampled_from} fragments shown` : ''}
-          {replay?.threatened?.length ? ' · threatened-sat tracks: client J2 from live state' : ''}
+          {fragShown != null ? ` · ${fragShown} of ${fragSim ?? '?'} simulated fragments drawn` : ''}
+          {replay?.provenance?.sampled_from ? ` (${replay.provenance.sampled_from} predicted)` : ''}
+          {replay?.threatened?.length && !replay.threatened[0]?.positions ? ' · threatened-sat tracks: client RK4 J2 from live state' : ''}
         </div>
       )}
     </div>

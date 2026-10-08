@@ -297,8 +297,15 @@ class DebrisEvent:
 
     def state_at(self, t: datetime) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Copy of the fragment state at t without mutating the event (t >= collision)."""
+        r, v, alive, dt = self.state_spec(t)
+        if dt == 0:
+            return r, v, alive
+        return _advance(r, v, self.bc, alive, dt)
+
+    def state_spec(self, t: datetime):
+        """(r, v, alive, dt) copies such that propagating by dt gives the state at t."""
         if t <= self.collision_utc:
-            return self.result.r_km.copy(), self.result.v_kms.copy(), np.ones(len(self.result.r_km), bool)
+            return self.result.r_km.copy(), self.result.v_kms.copy(), np.ones(len(self.result.r_km), bool), 0.0
         back_s = (self.epoch - t).total_seconds()
         if t >= self.epoch or back_s <= STATE_BACKSTEP_MAX_S:
             # forward from the live state, or a short RK4 step backwards from it
@@ -309,7 +316,7 @@ class DebrisEvent:
         else:
             r, v, alive = self.result.r_km, self.result.v_kms, np.ones(len(self.result.r_km), bool)
             dt = (t - self.collision_utc).total_seconds()
-        return _advance(r.copy(), v.copy(), self.bc, alive.copy(), dt)
+        return r.copy(), v.copy(), alive.copy(), dt
 
     def fragment_dicts(self) -> list[dict]:
         res = self.result
@@ -387,6 +394,7 @@ def _bound_ok(r: np.ndarray) -> np.ndarray:
 # DEBRIS_WORKER=0 disables the worker.
 
 ADVANCE_WORKER_MIN_STEPS = 8        # _advance spans with >= this many steps go to the worker
+ADVANCE_WORKER_MIN_ROWS = 200       # ...as do clouds this big (if the worker is idle)
 _BACKEND_ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -434,7 +442,7 @@ def _rest_tracks(R, V, rest, r0, v0, offsets):
     return R, V
 
 
-def _screen_kernel(F_r, F_v, F_bc, F_alive, F_rel, F_ev, n_events, S_r_all, S_v_all,
+def _screen_kernel(F_r, F_v, F_dt, F_bc, F_alive, F_rel, F_ev, n_events, S_r_all, S_v_all,
                    rest, rest_r0, rest_v0, offsets, step_s, threshold_km, excluded):
     """Fragment x satellite screening over the grid (pure numpy/scipy).
 
@@ -442,6 +450,14 @@ def _screen_kernel(F_r, F_v, F_bc, F_alive, F_rel, F_ev, n_events, S_r_all, S_v_
     pair as arrays, plus per-event cloud-radius timelines."""
     from scipy.spatial import cKDTree
     S_r_all, S_v_all = _rest_tracks(S_r_all, S_v_all, rest, rest_r0, rest_v0, offsets)
+    # bring each group of fragments (same dt) to the grid start
+    F_r, F_v, F_alive = F_r.copy(), F_v.copy(), F_alive.copy()
+    for dt in np.unique(F_dt):
+        if dt == 0:
+            continue
+        g = np.nonzero(F_dt == dt)[0]
+        F_r[g], F_v[g], F_alive[g] = _advance_local(F_r[g], F_v[g], F_bc[g], F_alive[g], float(dt))
+    F_r0, F_v0 = F_r.copy(), F_v.copy()
     n_steps = len(offsets) - 1
     cand_radius = threshold_km + MAX_REL_SPEED_KMS * step_s / 2.0
     timeline: dict[int, list[dict]] = {k: [] for k in range(n_events)}
@@ -491,7 +507,7 @@ def _screen_kernel(F_r, F_v, F_bc, F_alive, F_rel, F_ev, n_events, S_r_all, S_v_
     if not hits:
         e3 = np.zeros((0, 3))
         return {"f": np.zeros(0, int), "s": np.zeros(0, int), "miss": np.zeros(0), "t_off": np.zeros(0),
-                "dv": e3, "miss_vec": e3, "sat_r": e3, "timeline": timeline}
+                "dv": e3, "miss_vec": e3, "sat_r": e3, "timeline": timeline, "F_r0": F_r0, "F_v0": F_v0}
     f, s, miss, t_off, dv, mv, sr = (np.concatenate(x) for x in zip(*hits))
     # best (smallest miss) per (fragment, satellite) pair
     order = np.lexsort((miss, s, f))
@@ -500,7 +516,8 @@ def _screen_kernel(F_r, F_v, F_bc, F_alive, F_rel, F_ev, n_events, S_r_all, S_v_
     first[1:] = (f[1:] != f[:-1]) | (s[1:] != s[:-1])
     sel = order[first]
     return {"f": f[first], "s": s[first], "miss": miss[sel], "t_off": t_off[sel],
-            "dv": dv[sel], "miss_vec": mv[sel], "sat_r": sr[sel], "timeline": timeline}
+            "dv": dv[sel], "miss_vec": mv[sel], "sat_r": sr[sel], "timeline": timeline,
+            "F_r0": F_r0, "F_v0": F_v0}
 
 
 _KERNELS = {"advance": _advance_local, "series": _series_kernel, "screen": _screen_kernel}
@@ -572,9 +589,11 @@ class _KernelWorker:
             finally:
                 self._lock.release()
 
-    def call(self, op: str, **args):
-        if self.enabled:
-            with self._lock:
+    def call(self, op: str, _wait: bool = True, **args):
+        """Run kernel ``op`` in the worker; in-process if disabled/failed, or if
+        ``_wait`` is False and the worker is busy."""
+        if self.enabled and self._lock.acquire(blocking=_wait):
+            try:
                 for _attempt in range(2):
                     try:
                         self._start_locked()
@@ -593,6 +612,8 @@ class _KernelWorker:
                         return res
                     logger.warning("debris worker kernel error: %s", res)
                     break
+            finally:
+                self._lock.release()
         self.fallbacks += 1
         return _KERNELS[op](**args)
 
@@ -641,10 +662,14 @@ def propagate_series(r, v, bc, alive, dts, chunk_s: float | None = None):
 def _advance(r, v, bc, alive, dt_s, chunk_s: float | None = None):
     """Propagate alive rows over dt_s; rows dropping below 100 km are marked decayed.
 
-    Long spans run in the worker process (GIL-free); short ones in-process."""
+    Long spans or large clouds run in the worker process (GIL-free); a short
+    step of a big cloud only uses the worker when it is idle."""
     step = DEBRIS_STEP_S if chunk_s is None else chunk_s
-    if abs(float(dt_s)) / max(step, 1e-9) >= ADVANCE_WORKER_MIN_STEPS and np.any(alive):
-        return _worker.call("advance", r=np.asarray(r, float), v=np.asarray(v, float),
+    n_steps = abs(float(dt_s)) / max(step, 1e-9)
+    n_alive = int(np.count_nonzero(alive))
+    if n_alive and dt_s and (n_steps >= ADVANCE_WORKER_MIN_STEPS or n_alive >= ADVANCE_WORKER_MIN_ROWS):
+        return _worker.call("advance", _wait=n_steps >= ADVANCE_WORKER_MIN_STEPS,
+                            r=np.asarray(r, float), v=np.asarray(v, float),
                             bc=np.asarray(bc, float), alive=np.asarray(alive, bool),
                             dt_s=float(dt_s), chunk_s=chunk_s)
     return _advance_local(r, v, bc, alive, dt_s, chunk_s)
@@ -853,7 +878,7 @@ class DebrisModel:
 
         # Fragments: state at sim_time. Pending events are back-propagated from
         # breakup to sim_time and masked until their release step.
-        fr_r, fr_v, fr_bc, fr_alive, fr_ev, fr_idx, fr_release = [], [], [], [], [], [], []
+        fr_r, fr_v, fr_bc, fr_alive, fr_ev, fr_idx, fr_release, fr_dt = [], [], [], [], [], [], [], []
         for k, ev in enumerate(events):
             if ev.pending(sim_time):
                 dt_back = (sim_time - ev.collision_utc).total_seconds()
@@ -863,20 +888,22 @@ class DebrisModel:
                 # grid step after the TCA (propagated by the sub-step remainder)
                 # and keep them frozen until then.
                 release = int(math.ceil(-dt_back / step_s))
-                r, v, alive = _advance(ev.result.r_km, ev.result.v_kms, ev.bc,
-                                       np.ones(len(ev.result.r_km), bool), release * step_s + dt_back)
+                r, v, alive = ev.result.r_km, ev.result.v_kms, np.ones(len(ev.result.r_km), bool)
+                dt0 = release * step_s + dt_back
             else:
                 with self._lock:
-                    r, v, alive = ev.state_at(sim_time)
+                    r, v, alive, dt0 = ev.state_spec(sim_time)
                 release = 0
             n = len(r)
+            # propagation by dt0 happens inside the kernel (worker process)
+            fr_dt.append(np.full(n, float(dt0)))
             fr_r.append(r); fr_v.append(v); fr_bc.append(ev.bc); fr_alive.append(alive)
             fr_ev.append(np.full(n, k)); fr_idx.append(np.arange(n)); fr_release.append(np.full(n, release))
         if not fr_r or not sats:
             self._last_alerts, self._last_exposure = [], {}
             return []
         F_r = np.concatenate(fr_r); F_v = np.concatenate(fr_v); F_bc = np.concatenate(fr_bc)
-        F_r0, F_v0 = F_r.copy(), F_v.copy()   # state at sim_time (or at release for pending events)
+        F_dt = np.concatenate(fr_dt)
         F_alive = np.concatenate(fr_alive); F_ev = np.concatenate(fr_ev)
         F_idx = np.concatenate(fr_idx); F_rel = np.concatenate(fr_release)
 
@@ -895,7 +922,7 @@ class DebrisModel:
         t_kernel = _time.perf_counter()
         n_fallback0 = _worker.fallbacks
         out = _worker.call(
-            "screen", F_r=F_r, F_v=F_v, F_bc=F_bc, F_alive=F_alive, F_rel=F_rel, F_ev=F_ev,
+            "screen", F_r=F_r, F_v=F_v, F_dt=F_dt, F_bc=F_bc, F_alive=F_alive, F_rel=F_rel, F_ev=F_ev,
             n_events=len(events), S_r_all=S_r_all, S_v_all=S_v_all, rest=rest,
             rest_r0=np.array([sats[i][2] for i in rest], float).reshape(-1, 3),
             rest_v0=np.array([sats[i][3] for i in rest], float).reshape(-1, 3),
@@ -904,6 +931,7 @@ class DebrisModel:
         t_kernel = _time.perf_counter() - t_kernel
         in_worker = _worker.fallbacks == n_fallback0 and _worker.enabled
         timeline = out["timeline"]
+        F_r0, F_v0 = out["F_r0"], out["F_v0"]   # state at sim_time (or at release for pending events)
 
         # Pc for every candidate pair at once (one vectorised ncx2 call)
         n_c = len(out["f"])

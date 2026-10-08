@@ -32,9 +32,25 @@ def app_module():
     return main
 
 
+def _all_routes(routes):
+    """Flatten included routers.
+
+    FastAPI >= 0.13x keeps ``include_router`` results as lazy ``_IncludedRouter``
+    wrappers in ``app.routes`` instead of copying each APIRoute, so walk into
+    ``original_router`` to see the real routes. (Routers here carry their own
+    prefix and are included without an extra one, so paths are unchanged.)
+    """
+    for route in routes:
+        inner = getattr(route, "original_router", None)
+        if inner is not None:
+            yield from _all_routes(inner.routes)
+        else:
+            yield route
+
+
 def _route_keys(app) -> set[tuple[str, str]]:
     keys: set[tuple[str, str]] = set()
-    for route in app.routes:
+    for route in _all_routes(app.routes):
         if isinstance(route, APIRoute):
             for method in route.methods:
                 if method in {"HEAD", "OPTIONS"}:
@@ -58,7 +74,7 @@ class TestSimulateRouteRegistration:
     def test_simulate_route_is_reachable_by_name(self, app_module):
         simulate_routes = [
             route
-            for route in app_module.app.routes
+            for route in _all_routes(app_module.app.routes)
             if isinstance(route, APIRoute) and route.path == "/api/simulate"
         ]
         methods = {
@@ -104,7 +120,7 @@ class TestFrontendBackendParity:
 
     def _backend_paths(self, app_module) -> set[str]:
         paths: set[str] = set()
-        for route in app_module.app.routes:
+        for route in _all_routes(app_module.app.routes):
             if not isinstance(route, APIRoute):
                 continue
             # Strip FastAPI path params so they line up with the frontend

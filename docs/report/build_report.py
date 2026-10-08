@@ -222,7 +222,7 @@ def inclination_alt(sats: list[dict]):
         p, v = s.get("position") or {}, s.get("velocity") or {}
         try:
             r = np.array([p["x"], p["y"], p["z"]], float)
-            vv = np.array([v["x"], v["y"], v["z"]], float)
+            vv = np.array([v.get("vx", v.get("x")), v.get("vy", v.get("y")), v.get("vz", v.get("z"))], float)
         except Exception:
             continue
         h = np.cross(r, vv)
@@ -310,79 +310,66 @@ def reproduce_breakup(event: dict):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def fig_pipeline():
-    fig, ax = plt.subplots(figsize=(7.2, 4.3))
-    ax.set_xlim(0, 100); ax.set_ylim(0, 60); ax.axis("off")
+    fig, ax = plt.subplots(figsize=(7.2, 4.7))
+    ax.set_xlim(0, 100); ax.set_ylim(0, 66); ax.axis("off")
     groups = {"phys": (BLUE, "#e8f1fc"), "ml": (CAT[6], "#eeecf9"), "dec": (TEAL, TEAL_L),
               "deb": (CAT[1], "#fdeee7"), "ag": (GOOD, "#e6f5ec")}
     boxes = [
-        ("TLE catalogue", "Space-Track / CDN / bundled", "phys"),
-        ("SGP4", "WGS-72, TEME, sim clock", "phys"),
-        ("24 h screening", "KD-tree per 60 s + Brent TCA", "phys"),
-        ("Foster Pc", "TLE-age RTN covariance", "phys"),
-        ("ML surrogate + SHAP", "XGBoost log10 Pc (advisory)", "ml"),
-        ("Decision score", "0-100, NASA CARA tiers", "dec"),
-        ("Cascade-safe manoeuvre", "re-propagated + 12 engines", "dec"),
-        ("Predicted collision", "pair at predicted TCA", "deb"),
-        ("NASA SBM breakup", "N = 0.1 M^0.75 Lc^-1.71", "deb"),
-        ("Fragment propagation", "RK4: 2-body + J2 + drag", "deb"),
-        ("Debris screening", "KD-tree 6 h, isotropic Pc", "deb"),
-        ("Cascade graph", "BFS depth, P(hit)=1-Π(1-Pc)", "dec"),
-        ("Agencies", "CelesTrak SATCAT owners", "ag"),
+        ("TLE\ncatalogue", "Space-Track / CDN /\nbundled snapshot", "phys"),
+        ("SGP4", "WGS-72, TEME,\nsimulation clock", "phys"),
+        ("24 h\nscreening", "KD-tree per 60 s\n+ Brent TCA", "phys"),
+        ("Foster Pc", "TLE-age RTN\ncovariance", "phys"),
+        ("ML surrogate\n+ SHAP", "XGBoost log10 Pc\n(advisory)", "ml"),
+        ("Decision\nscore", "0-100,\nNASA CARA tiers", "dec"),
+        ("Cascade-safe\nmanoeuvre", "re-propagated,\n12 engines", "dec"),
+        ("Predicted\ncollision", "pair at\npredicted TCA", "deb"),
+        ("NASA SBM\nbreakup", "N = 0.1 M^0.75\nLc^-1.71", "deb"),
+        ("Fragment\npropagation", "RK4: two-body\n+ J2 + drag", "deb"),
+        ("Debris\nscreening", "KD-tree 6 h,\nisotropic Pc", "deb"),
+        ("Cascade\ngraph", "BFS depth,\nP(hit)=1-Π(1-Pc)", "dec"),
+        ("Agencies", "CelesTrak\nSATCAT owners", "ag"),
     ]
-    w, h = 17.0, 11.0
-    rows_y = [48, 29, 10]
-    xs = [1.5, 21.5, 41.5, 61.5, 81.5]
-    pos = []
-    for i in range(5):
-        pos.append((xs[i], rows_y[0]))
-    for i in range(4):
-        pos.append((xs[4 - i], rows_y[1]))
-    for i in range(4):
-        pos.append((xs[1 + i], rows_y[2]))
+    w, h = 17.0, 14.0
+    rows_y = [50, 29, 8]
+    xs = [0.8, 20.8, 40.8, 60.8, 80.8]
+    pos = [(xs[i], rows_y[0]) for i in range(5)] + [(xs[4 - i], rows_y[1]) for i in range(4)] + \
+          [(xs[1 + i], rows_y[2]) for i in range(4)]
     for (title, sub, g), (x, y) in zip(boxes, pos):
         edge, face = groups[g]
-        ls = "--" if g == "ml" else "-"
         ax.add_patch(FancyBboxPatch((x, y), w, h, boxstyle="round,pad=0.25,rounding_size=1.2",
-                                    fc=face, ec=edge, lw=1.4, ls=ls))
-        ax.text(x + w / 2, y + h * 0.64, title, ha="center", va="center", fontsize=7.6, weight="bold", color=INK)
-        ax.text(x + w / 2, y + h * 0.28, sub, ha="center", va="center", fontsize=5.9, color=INK2)
+                                    fc=face, ec=edge, lw=1.4, ls="--" if g == "ml" else "-"))
+        ax.text(x + w / 2, y + h * 0.69, title, ha="center", va="center", fontsize=7.0, weight="bold",
+                color=INK, linespacing=1.0)
+        ax.text(x + w / 2, y + h * 0.24, sub, ha="center", va="center", fontsize=5.5, color=INK2, linespacing=1.05)
 
-    def arrow(p, q):
-        ax.add_patch(FancyArrowPatch(p, q, arrowstyle="-|>", mutation_scale=9, lw=1.1, color=INK2,
-                                     shrinkA=1, shrinkB=1))
+    def arrow(p, q, col=INK2, ls="-", rad=0.0):
+        ax.add_patch(FancyArrowPatch(p, q, arrowstyle="-|>", mutation_scale=9, lw=1.1, color=col, ls=ls,
+                                     shrinkA=1, shrinkB=1, connectionstyle=f"arc3,rad={rad}"))
     for i in range(4):
         x, y = pos[i]
-        arrow((x + w + 0.4, y + h / 2), (pos[i + 1][0] - 0.4, y + h / 2))
-    # row1 -> row2 (ML -> decision)
+        arrow((x + w + 0.3, y + h / 2), (pos[i + 1][0] - 0.3, y + h / 2))
     x, y = pos[4]
     arrow((x + w / 2, y - 0.4), (x + w / 2, pos[5][1] + h + 0.4))
     for i in range(5, 8):
         x, y = pos[i]
-        arrow((x - 0.4, y + h / 2), (pos[i + 1][0] + w + 0.4, y + h / 2))
-    # Foster -> decision directly (physics is authoritative)
+        arrow((x - 0.3, y + h / 2), (pos[i + 1][0] + w + 0.3, y + h / 2))
     fx, fy = pos[3]
-    ax.add_patch(FancyArrowPatch((fx + w / 2 + 3, fy - 0.4), (pos[5][0] + 2, pos[5][1] + h + 0.4),
-                                 arrowstyle="-|>", mutation_scale=9, lw=1.1, color=BLUE,
-                                 connectionstyle="arc3,rad=0.15"))
-    ax.text(fx + w / 2 + 9.5, fy - 4.2, "physics Pc\n(authoritative)", fontsize=5.8, color=BLUE, ha="center")
-    # row2 -> row3 (SBM -> fragments)
+    arrow((fx + w * 0.75, fy - 0.4), (pos[5][0] + 2.5, pos[5][1] + h + 0.4), col=BLUE, rad=0.2)
+    ax.text(fx + w * 0.2, fy - 4.8, "physics Pc\n(authoritative)", fontsize=5.6, color=BLUE, ha="center")
     x, y = pos[8]
     arrow((x + w / 2, y - 0.4), (pos[9][0] + w / 2, pos[9][1] + h + 0.4))
     for i in range(9, 12):
         x, y = pos[i]
-        arrow((x + w + 0.4, y + h / 2), (pos[i + 1][0] - 0.4, y + h / 2))
-    # cascade graph feeds manoeuvre / decision (dashed loop)
+        arrow((x + w + 0.3, y + h / 2), (pos[i + 1][0] - 0.3, y + h / 2))
     cx, cy = pos[11]
-    ax.add_patch(FancyArrowPatch((cx + w / 2, cy + h + 0.4), (pos[6][0] + w / 2 + 4, pos[6][1] - 0.4),
-                                 arrowstyle="-|>", mutation_scale=8, lw=0.9, color=TEAL, ls="--",
-                                 connectionstyle="arc3,rad=-0.25"))
-    ax.text(cx + w / 2 + 6, cy + h + 3.2, "downstream objects\nfeed n_cascade", fontsize=5.8, color=TEAL)
+    arrow((cx + w / 2, cy + h + 0.4), (pos[6][0] + w / 2, pos[6][1] - 0.4), col=TEAL, ls="--")
+    ax.text(cx + w / 2 + 1.0, cy + h + 2.6, "downstream objects\nfeed n_cascade", fontsize=5.6, color=TEAL)
     legend = [("physics", "phys"), ("ML (advisory)", "ml"), ("decision / cascade", "dec"),
               ("collision → debris", "deb"), ("agency", "ag")]
     for i, (lab, g) in enumerate(legend):
-        ax.add_patch(FancyBboxPatch((1.5 + i * 19.5, 1.0), 2.4, 2.4, boxstyle="round,pad=0.1",
+        ax.add_patch(FancyBboxPatch((1.0 + i * 19.5, 1.2), 2.2, 2.2, boxstyle="round,pad=0.1",
                                     fc=groups[g][1], ec=groups[g][0], lw=1.2))
-        ax.text(4.7 + i * 19.5, 2.2, lab, fontsize=6.5, va="center", color=INK2)
+        ax.text(4.2 + i * 19.5, 2.3, lab, fontsize=6.3, va="center", color=INK2)
     return save(fig, "01_pipeline", "Pipeline as implemented in backend/main.py::refresh_alerts_once and the "
                 "/api/debris/simulate route (see docs/HOW_IT_WORKS.md for each module). Dashed box: advisory "
                 "model that never writes the physics Pc.")
@@ -446,12 +433,12 @@ def fig_agencies(agencies, satcat_rows, sats_live):
     a.barh(names, counts, color=[MUTED if n == "Unknown" else BLUE for n in names], height=0.65)
     for y, c in enumerate(counts):
         a.text(c + 4, y, str(c), va="center", fontsize=6.5, color=INK2)
-    a.set_title(f"Live catalogue by agency (n={agencies.get('total')})")
+    a.set_title(f"Live, by agency (n={agencies.get('total')})")
     a.set_xlim(0, max(counts) * 1.22); a.grid(axis="y", visible=False)
     a.tick_params(axis="y", labelsize=6.5)
     b = axes[1]
     b.barh([o for o, _ in top][::-1], [c for _, c in top][::-1], color=CAT[2], height=0.65)
-    b.set_title("SATCAT owners (top 10)")
+    b.set_title("SATCAT owners, top 10")
     b.set_xscale("log"); b.grid(axis="y", visible=False); b.tick_params(axis="y", labelsize=6.5)
     b.set_xlabel("objects (log)")
     c = axes[2]
@@ -478,8 +465,9 @@ def fig_screening(alerts, bench):
         h, _ = np.histogram([x["tca_hours"] for x in al if x["severity"] == sev], bins)
         a.bar(bins[:-1] + 1, h, 1.8, bottom=bottom, color=SEV_COL[sev], label=sev)
         bottom += h
-    a.set_xlabel("time to TCA [h]"); a.set_ylabel("alerts"); a.set_title("TCA distribution (24 h window)")
-    a.legend(loc="upper left", fontsize=6); a.grid(axis="x", visible=False)
+    a.set_xlabel("time to TCA [h]"); a.set_ylabel("alerts"); a.set_title("TCA distribution")
+    a.set_ylim(0, bottom.max() * 1.45)
+    a.legend(loc="upper center", fontsize=5.6, ncol=3, columnspacing=0.6, handlelength=1); a.grid(axis="x", visible=False)
     b = axes[1]
     floor = 1e-20
     for sev in ("WATCH", "WARNING", "CRITICAL"):
@@ -492,7 +480,7 @@ def fig_screening(alerts, bench):
     b.text(0.12, 2e-6, "Pc 1e-6", fontsize=6, color=CAUTION)
     b.set_xlim(0.1, 30)
     b.set_xlabel("miss distance [km]"); b.set_ylabel("Foster Pc (floored 1e-20)")
-    b.set_title("Miss distance vs Pc")
+    b.set_title("Miss vs Pc")
     c = axes[2]
     if bench:
         ns = [str(r["objects"]) for r in bench]
@@ -506,7 +494,7 @@ def fig_screening(alerts, bench):
         for i, r in enumerate(bench):
             c.text(i, bot[i] * 1.02, f"{r['t_total_s']:.2f}s", ha="center", fontsize=6.3, color=INK)
         c.set_xlabel("objects screened"); c.set_ylabel("wall time [s]")
-        c.set_title("Screening runtime (24 h, 60 s)")
+        c.set_title("Runtime vs catalogue size")
         c.legend(fontsize=5.8, loc="upper left"); c.grid(axis="x", visible=False)
         c.set_ylim(0, bot.max() * 1.25)
     fig.tight_layout(w_pad=1.0)
@@ -526,6 +514,7 @@ def fig_bplane(alert):
     C2 = R @ np.diag([sa ** 2, sb ** 2]) @ R.T
     b = np.array([alert["b_t_km"], alert["b_n_km"]])
     hbr = alert["hbr_km"]
+    lim = ce["a"] * 1.08
     pcs = alert.get("pc_checks") or {}
     fig, axes = plt.subplots(1, 3, figsize=(7.2, 2.75), gridspec_kw={"width_ratios": [1.25, 1, 1.05]})
     a = axes[0]
@@ -535,13 +524,21 @@ def fig_bplane(alert):
     a.annotate("", xy=(b[0] * 1000, b[1] * 1000), xytext=(0, 0),
                arrowprops=dict(arrowstyle="-|>", color=BAD, lw=1.2))
     a.add_patch(Circle((b[0] * 1000, b[1] * 1000), max(hbr * 1000, 1), fc=BAD, ec=BAD))
-    a.text(b[0] * 1000, b[1] * 1000 + 0.12 * ce["b"], f"miss {np.linalg.norm(b)*1000:.0f} m\nHBR {hbr*1000:.1f} m",
-           fontsize=6.3, color=BAD, ha="center")
+    a.text(-lim * 0.95, -lim * 0.62, f"miss {np.linalg.norm(b)*1000:.0f} m, HBR {hbr*1000:.1f} m",
+           fontsize=6.0, color=BAD)
     lim = ce["a"] * 1.08
-    a.set_xlim(-lim, lim); a.set_ylim(-ce["b"] * 1.6, ce["b"] * 1.6)
+    a.set_xlim(-lim, lim); a.set_ylim(-lim * 0.75, lim * 0.75); a.set_aspect("equal")
+    zi = a.inset_axes([0.64, 0.62, 0.34, 0.36])
+    zl = max(2.5 * np.linalg.norm(b) * 1000, 4 * hbr * 1000, 1.0)
+    zi.add_patch(Ellipse((0, 0), 2 * sa * 1000, 2 * sb * 1000, angle=math.degrees(ang), fc=BLUE, alpha=0.15, ec=BLUE, lw=0.5))
+    zi.annotate("", xy=(b[0] * 1000, b[1] * 1000), xytext=(0, 0), arrowprops=dict(arrowstyle="-|>", color=BAD, lw=1))
+    zi.add_patch(Circle((b[0] * 1000, b[1] * 1000), hbr * 1000, fc=BAD, alpha=0.5, ec=BAD))
+    zi.scatter([0], [0], s=6, color=INK)
+    zi.set_xlim(-zl, zl); zi.set_ylim(-zl, zl); zi.set_aspect("equal")
+    zi.tick_params(labelsize=4.5); zi.set_title(f"zoom ±{zl:.0f} m", fontsize=5.5, loc="center")
     a.set_xlabel("B-plane T [m]"); a.set_ylabel("B-plane N [m]")
     a.set_title("Encounter B-plane (1/2/3σ)")
-    a.text(0.02, 0.04, f"σ = {sa*1000:.0f} × {sb*1000:.0f} m (1σ)", transform=a.transAxes, fontsize=6.3, color=INK2)
+    a.text(-lim * 0.95, -lim * 0.71, f"1σ = {sa*1000:.0f} × {sb*1000:.0f} m", fontsize=6.0, color=INK2)
     # methods
     c = axes[1]
     meths = [("Foster", pcs.get("foster"), BLUE), ("Chan", pcs.get("chan"), CAT[2]),
@@ -552,7 +549,7 @@ def fig_bplane(alert):
     ys = np.arange(len(labs))[::-1]
     c.barh(ys, [math.log10(v) + 12 if v == v else 0 for v in vals], left=-12, color=cols, height=0.6)
     for y, v in zip(ys, vals):
-        c.text((math.log10(v) if v == v else -12) + 0.15, y, f"{v:.2e}" if v == v else "below MC resolution",
+        c.text((math.log10(v) if v == v else -8) + 0.15, y, f"{v:.2e}" if v == v else "below MC resolution",
                va="center", fontsize=6.3, color=INK)
     if pcs.get("monte_carlo") and pcs.get("mc_stderr"):
         mc, se = pcs["monte_carlo"], pcs["mc_stderr"]
@@ -564,7 +561,7 @@ def fig_bplane(alert):
     c.grid(axis="y", visible=False)
     # dilution curve
     d = axes[2]
-    ks = np.logspace(-1.5, 1.5, 61)
+    ks = np.logspace(-3, 2, 101)
     pk = [foster_pc(b, (kk ** 2) * C2, hbr) for kk in ks]
     d.plot(ks, pk, color=BLUE, lw=1.8)
     d.axvline(1, color=INK2, ls=":", lw=0.8)
@@ -592,7 +589,7 @@ def fig_tle_sigma(alerts):
     obs = [t for a in alerts for t in (a.get("tle_age_days") or [])]
     if obs:
         ax.plot(obs, np.full(len(obs), -1.5), "|", color=INK2, ms=6, alpha=0.5)
-        ax.text(max(obs) + 1, -1.5, "TLE ages in live alerts", fontsize=5.8, va="center", color=INK2)
+        ax.text(max(obs) + 1.5, -1.5, f"TLE ages in live alerts ({min(obs):.1f}–{max(obs):.1f} d)", fontsize=5.8, va="center", color=INK2)
     ax.set_xlabel("TLE age at TCA [days]"); ax.set_ylabel("1σ [km]")
     ax.set_ylim(-3, s.max() * 1.05)
     ax.set_title("TLE-age covariance model")
@@ -636,7 +633,7 @@ def fig_pca(an):
     a.axvline(n95, color=CAT[1], ls="--", lw=0.8)
     a.text(n95 - 0.1, 50, f"{n95} PCs for 95 %", rotation=90, fontsize=6.3, color=CAT[1], ha="right")
     a.set_xticks(xs, [f"PC{i}" for i in xs]); a.set_ylabel("explained variance [%]")
-    a.set_ylim(0, 108); a.set_title("PCA scree"); a.legend(loc="center right"); a.grid(axis="x", visible=False)
+    a.set_ylim(0, 108); a.set_title("PCA scree"); a.legend(loc="upper left", bbox_to_anchor=(0.0, 0.9)); a.grid(axis="x", visible=False)
     b = axes[1]
     im = b.imshow(L, cmap=DIVERGE, vmin=-1, vmax=1, aspect="auto")
     for i in range(L.shape[0]):
@@ -766,31 +763,30 @@ def fig_decision(alerts, scen_alert):
     from app.core import decision as dec
 
     W = dict(dec.WEIGHTS)
-    fig = plt.figure(figsize=(7.2, 2.6))
-    gs = fig.add_gridspec(1, 3, width_ratios=[0.9, 1.0, 1.25])
+    fig = plt.figure(figsize=(7.2, 2.7))
+    gs = fig.add_gridspec(1, 3, width_ratios=[1.0, 0.85, 1.25])
     a = fig.add_subplot(gs[0])
     cols = {"physics": BLUE, "ml": CAT[6], "cascade": TEAL, "manoeuvre": CAT[1]}
     vals = [W[k] for k in cols]
-    a.pie(vals, colors=list(cols.values()), startangle=90, counterclock=False,
-          wedgeprops=dict(width=0.38, edgecolor="white", linewidth=1.5))
-    a.text(0, 0, "weights\nΣ = 1", ha="center", va="center", fontsize=7, color=INK)
-    for k, v, ang in zip(cols, vals, np.cumsum([0] + vals[:-1]) + np.array(vals) / 2):
-        th = math.radians(90 - 360 * ang)
-        a.text(1.28 * math.cos(th), 1.28 * math.sin(th), f"{k}\n{v:.2f}", ha="center", va="center", fontsize=6.3)
-    a.set_title("Component weights", loc="center"); a.set_aspect("equal")
+    a.barh(range(len(vals))[::-1], [v * 100 for v in vals], color=list(cols.values()), height=0.6)
+    for y, (k, v) in zip(range(len(vals))[::-1], zip(cols, vals)):
+        a.text(v * 100 + 1.5, y, f"{v:.2f}", va="center", fontsize=6.6)
+    a.set_yticks(range(len(vals))[::-1], list(cols), fontsize=7)
+    a.set_xlim(0, 75); a.set_xlabel("max points (weight × 100)")
+    a.set_title("Component weights (Σ = 1)"); a.grid(axis="y", visible=False)
     b = fig.add_subplot(gs[1])
     tiers = [("MANOEUVRE", dec.PC_MANOEUVRE, 1e0), ("PREPARE", dec.PC_PREPARE, dec.PC_MANOEUVRE),
              ("MONITOR", dec.PC_MONITOR, dec.PC_PREPARE), ("NONE", 1e-12, dec.PC_MONITOR)]
     for lab, lo, hi in tiers:
-        b.fill_between([0, 1], math.log10(lo), math.log10(hi), color=ACT_COL[lab], alpha=0.85)
+        b.fill_between([0, 1], math.log10(lo), math.log10(hi), color=ACT_COL[lab], alpha=0.9, lw=0)
         b.text(0.5, (math.log10(lo) + math.log10(hi)) / 2, f"{lab}\nPc ≥ {lo:.0e}" if lab != "NONE" else "NONE",
-               ha="center", va="center", fontsize=6.5, color="white", weight="bold")
+               ha="center", va="center", fontsize=6.3, color="white", weight="bold")
     if scen_alert:
         y = math.log10(scen_alert["probability_of_collision"])
-        b.annotate("demo alert", xy=(1, y), xytext=(1.25, y), fontsize=6.2, va="center",
-                   arrowprops=dict(arrowstyle="-|>", color=INK, lw=0.8), annotation_clip=False)
+        b.plot([0, 1], [y, y], color=INK, lw=1.2, ls="--")
+        b.text(0.03, y + 0.15, "demo alert", fontsize=5.8, color=INK, va="bottom")
     b.set_xlim(0, 1); b.set_ylim(-12, 0); b.set_xticks([])
-    b.set_ylabel("log10 Foster Pc"); b.set_title("Action tiers (physics decides)")
+    b.set_ylabel("log10 Foster Pc"); b.set_title("Action tiers")
     b.grid(False)
     c = fig.add_subplot(gs[2])
     sc = [x["decision"]["score"] for x in alerts if x.get("decision")]
@@ -800,63 +796,69 @@ def fig_decision(alerts, scen_alert):
     for lab in ("NONE", "MONITOR", "PREPARE", "MANOEUVRE"):
         h, _ = np.histogram([s for s, ac in zip(sc, act) if ac == lab], bins)
         if h.sum():
-            c.bar(bins[:-1] + 2.5, h, 4.4, bottom=bottom, color=ACT_COL[lab], label=f"{lab} ({h.sum()})")
+            c.bar(bins[:-1] + 2.5, h, 4.4, bottom=bottom, color=ACT_COL[lab], label=f"{lab} ({h.sum()})", log=True)
             bottom += h
-    c.set_yscale("symlog", linthresh=1); c.set_xlabel("decision score"); c.set_ylabel("alerts")
-    c.set_title(f"Scores of {len(sc)} alerts (demo run)"); c.legend(fontsize=5.8)
+    c.set_yscale("log"); c.set_ylim(0.7, max(bottom.max() * 3, 10))
+    c.set_xlabel("decision score"); c.set_ylabel("alerts (log)")
+    c.set_title(f"Scores of {len(sc)} alerts (demo run)"); c.legend(fontsize=5.8, loc="upper right")
     c.grid(axis="x", visible=False)
-    fig.tight_layout(w_pad=0.8)
+    fig.tight_layout(w_pad=1.0)
     return save(fig, "13_decision", "app.core.decision.WEIGHTS / PC_* constants; score histogram from alert.decision "
                 "of every alert in GET /api/alerts while the cascade_demo scenario was loaded.")
 
 
 def fig_decision_breakdown(alert):
-    comps = alert["decision"]["components"]
+    d = alert["decision"]
+    comps = d["components"]
     cols = {"physics": BLUE, "ml": CAT[6], "cascade": TEAL, "manoeuvre": CAT[1]}
-    fig, ax = plt.subplots(figsize=(7.2, 1.35))
-    left = 0
-    for c in comps:
-        w = c["weight"] * 100
-        ax.barh(0, w, left=left, color="none", ec=cols[c["source"]], lw=0.8, height=0.5, ls=":")
-        ax.barh(0, c["points"], left=left, color=cols[c["source"]], height=0.5)
+    desc = {"physics": "Foster Pc", "ml": "ML surrogate Pc", "cascade": "downstream objects D", "manoeuvre": "Δv of plan [m/s]"}
+    fig, ax = plt.subplots(figsize=(7.2, 1.9))
+    ys = np.arange(len(comps))[::-1]
+    for y, c in zip(ys, comps):
+        mx = c["weight"] * 100
+        ax.barh(y, mx, color="none", ec=cols[c["source"]], lw=0.8, ls=":", height=0.6)
+        ax.barh(y, c["points"], color=cols[c["source"]], height=0.6)
         raw = c["raw"]
-        rtxt = "n/a" if raw is None else (f"{raw:.1e}" if isinstance(raw, float) and raw < 0.01 else f"{raw:g}")
-        ax.text(left + w / 2, 0.45, f"{c['source']}  raw {rtxt}\nn={c['normalized']:.2f} × w={c['weight']:.2f} → {c['points']:.1f} pts",
-                ha="center", va="bottom", fontsize=5.9, color=INK)
-        left += w
-    ax.set_xlim(0, 100); ax.set_ylim(-0.4, 1.3); ax.set_yticks([])
-    ax.set_xlabel(f"points (dotted outline = maximum per component).  Score {alert['decision']['score']:.1f}/100 → "
-                  f"{alert['decision']['action']}, confidence {alert['decision']['model_agreement']['confidence']}")
-    ax.grid(False); ax.spines["left"].set_visible(False)
+        rtxt = "n/a" if raw is None else (f"{raw:.2e}" if isinstance(raw, float) and abs(raw) < 0.01 else f"{raw:g}")
+        ax.text(mx + 1.2, y, f"raw {rtxt} → n = {c['normalized']:.2f} × w {c['weight']:.2f} = {c['points']:.1f} pts",
+                va="center", fontsize=6.3, color=INK)
+    ax.set_yticks(ys, [f"{c['source']}\n({desc.get(c['source'], c['name'])})" for c in comps], fontsize=6.3)
+    ax.set_xlim(0, 100)
+    ax.set_xlabel("points (dotted = maximum for the component)")
+    ax.set_title(f"Breakdown for {alert['id']}: score {d['score']:.1f}/100 → {d['action']} "
+                 f"(confidence {d['model_agreement']['confidence']})")
+    ax.grid(axis="y", visible=False)
     return save(fig, "14_decision_breakdown", f"alert.decision.components of {alert['id']} (GET /api/alerts, cascade_demo run).")
 
 
 def fig_options(rm, alert):
     opts = rm.get("options") or []
-    fig, axes = plt.subplots(1, 2, figsize=(7.2, 2.7), gridspec_kw={"width_ratios": [1.25, 1]})
+    fig, axes = plt.subplots(1, 2, figsize=(7.2, 2.7), gridspec_kw={"width_ratios": [1.1, 1]})
     a = axes[0]
     floor = 1e-14
+    seen = Counter()
     for i, o in enumerate(opts):
         pc = max(o.get("new_pc_collision") or 0.0, floor)
         col = GOOD if o.get("cascade_safe") else BAD
-        mk = "*" if i == rm.get("chosen_index") else "o"
-        a.scatter(o["delta_v_ms"], pc, s=120 if mk == "*" else 40, marker=mk, color=col, edgecolor=INK, lw=0.5, zorder=4)
-        a.annotate(f"{o['candidate']}\n{o.get('secondary_count', len(o.get('secondary_conjunctions', [])))} secondaries",
-                   (o["delta_v_ms"], pc), xytext=(6, -2 + 8 * (i % 2)), textcoords="offset points", fontsize=5.8)
+        star = i == rm.get("chosen_index")
+        a.scatter(o["delta_v_ms"], pc, s=150 if star else 45, marker="*" if star else "o", color=col,
+                  edgecolor=INK, lw=0.5, zorder=4)
+        k = seen[round(o["delta_v_ms"], 3)]
+        seen[round(o["delta_v_ms"], 3)] += 1
+        a.annotate(f"#{i + 1}", (o["delta_v_ms"], pc), xytext=(7, 6 - 11 * k), textcoords="offset points",
+                   fontsize=6.3, weight="bold", color=INK)
     a.axhline(alert["probability_of_collision"], color=BAD, ls="--", lw=0.8)
-    a.text(0.02, alert["probability_of_collision"] * 1.6, f"before burn {alert['probability_of_collision']:.1e}",
+    a.text(0.02, alert["probability_of_collision"] * 1.8, f"before burn {alert['probability_of_collision']:.1e}",
            fontsize=6, color=BAD, transform=a.get_yaxis_transform())
     a.axhline(rm.get("target_pc", 1e-6), color=CAUTION, ls=":", lw=0.8)
-    a.text(0.02, rm.get("target_pc", 1e-6) * 1.6, "target 1e-6", fontsize=6, color=CAUTION, transform=a.get_yaxis_transform())
+    a.text(0.02, rm.get("target_pc", 1e-6) * 1.8, "target 1e-6", fontsize=6, color=CAUTION, transform=a.get_yaxis_transform())
     a.set_yscale("log"); a.set_xlabel("Δv [m/s]"); a.set_ylabel("re-propagated Pc after burn")
     if opts:
-        dvs = [o["delta_v_ms"] for o in opts]
-        a.set_xlim(0, max(dvs) * 1.6)
-    a.set_title(f"Avoidance options ({rm.get('candidates_evaluated', '?')} candidates evaluated)")
+        a.set_xlim(0, max(o["delta_v_ms"] for o in opts) * 1.5)
+    a.set_title(f"Options ({rm.get('candidates_evaluated', '?')} candidates evaluated)")
     a.scatter([], [], color=GOOD, label="cascade-safe"); a.scatter([], [], color=BAD, label="hampers others")
     a.scatter([], [], marker="*", color=MUTED, s=80, label="chosen")
     a.legend(fontsize=6, loc="center right")
-    # CW check
     b = axes[1]
     from app.core import analytic_checks as ac
     chk = rm.get("analytic_check") or {}
@@ -875,15 +877,15 @@ def fig_options(rm, alert):
         b.scatter(tn / 3600, num, color=CAT[1], s=16, zorder=4, label="RK4 two-body (numeric)")
         if chk:
             b.scatter([t_tca / 3600], [chk["numeric_km"]], marker="D", s=30, color=BAD, zorder=5,
-                      label=f"production check @TCA: rel err {100*chk['rel_error']:.2f} %")
+                      label=f"planner check @TCA: rel err {100*chk['rel_error']:.2f} %")
         b.set_xlabel("time since burn [h]"); b.set_ylabel("along-track shift [km]")
-        b.set_title(f"Along-track drift for Δv_RSW = {dv} m/s")
-        b.legend(fontsize=5.8, loc="lower left" if cw[-1] < 0 else "upper left")
+        b.set_title(f"Along-track drift, Δv_RSW = {[round(float(x), 3) for x in dv]} m/s")
+        b.legend(fontsize=5.8, loc="upper left" if cw[-1] > 0 else "lower left")
     fig.tight_layout(w_pad=1.0)
     return save(fig, "15_options", f"recommended_maneuver.options of {alert['id']} (GET /api/alerts, cascade_demo run; "
-                f"selection rule: {rm.get('selection_rule', 'n/a')[:90]}). Right: app.core.analytic_checks "
-                "cw_position vs numeric_along_track_shift_km on a circular orbit with the option's mean motion; "
-                "red diamond = the planner's own analytic_check.")
+                "numbers # match the table below). Right: app.core.analytic_checks cw_position vs "
+                "numeric_along_track_shift_km on a circular orbit with the option's mean motion; red diamond = the "
+                "planner's own analytic_check.")
 
 
 def fig_engines(rm):
@@ -913,10 +915,12 @@ def fig_engines(rm):
     rec = rm.get("recommended_engine")
     axes[0].set_title(f"{opt.get('candidate', '')}: Tsiolkovsky propellant")
     axes[1].set_title(f"Constant-thrust burn time (recommended: {rec})", fontsize=8)
-    for lab, c in (("practical & impulsive OK", GOOD), ("needs finite / low-thrust arc", CAUTION), ("impractical (cryogenic)", MUTED)):
-        axes[1].barh([], [], color=c, label=lab)
-    axes[1].legend(fontsize=5.8, loc="lower right")
-    fig.tight_layout(w_pad=0.5)
+    from matplotlib.patches import Patch
+    hs = [Patch(color=c, label=lab) for lab, c in (("practical, impulsive OK", GOOD),
+                                                   ("needs finite / low-thrust arc", CAUTION),
+                                                   ("impractical (cryogenic)", MUTED))]
+    fig.legend(handles=hs, loc="lower center", ncol=3, fontsize=6.3, bbox_to_anchor=(0.5, -0.02))
+    fig.tight_layout(w_pad=0.5, rect=(0, 0.06, 1, 1))
     return save(fig, "16_engines", f"options[{ci}].engines of the demo alert (app.core.propulsion.evaluate_engines; "
                 f"mass {rm.get('mass_kg')} kg [{rm.get('mass_source')}]); finite_burn_ok = burn ≤ 10 % of lead time and ≤ 1/10 orbit.")
 
@@ -929,7 +933,7 @@ def fig_breakup(res, sbm, event):
     xs = np.logspace(math.log10(res.lc_min_m), math.log10(res.lc_max_m), 60)
     emp = np.array([np.sum(lc >= x) * w for x in xs])
     law = np.array([sbm.sbm_cumulative_count(res.m_ref_kg, x) - sbm.sbm_cumulative_count(res.m_ref_kg, res.lc_max_m) for x in xs])
-    a.loglog(xs, law, color=INK, lw=1.4, ls="--", label="0.1·M^0.75·Lc^-1.71 (truncated)")
+    a.loglog(xs, law, color=INK, lw=1.4, ls="--", label=r"$0.1\,M^{0.75}L_c^{-1.71}$ (truncated at $L_{c,max}$)")
     a.step(xs, np.maximum(emp, 0.8), color=CAT[1], lw=1.6, where="post", label=f"sampled fragments (n={res.n_sampled})")
     a.set_xlabel("characteristic length Lc [m]"); a.set_ylabel("N(≥ Lc)")
     a.set_title(f"Size distribution, M_ref = {res.m_ref_kg:.0f} kg")
@@ -985,28 +989,32 @@ def fig_debris_alerts(alerts_deb):
     for a in deb:
         by_sat[(a["sat1"]["id"], a["sat1"]["name"], a["sat1"].get("agency", "?"))].append(a)
     items = sorted(by_sat.items(), key=lambda kv: -max(x["probability_of_collision"] for x in kv[1]))
-    fig, axes = plt.subplots(1, 2, figsize=(7.2, 2.4), gridspec_kw={"width_ratios": [1.6, 1]})
+    fig, axes = plt.subplots(1, 2, figsize=(7.2, 2.5), gridspec_kw={"width_ratios": [1.45, 1]})
     a = axes[0]
     ys = np.arange(len(items))[::-1]
     for y, ((sid, name, ag), lst) in zip(ys, items):
         pcs = [max(x["probability_of_collision"], 1e-20) for x in lst]
         a.scatter(np.log10(pcs), [y] * len(pcs), color=CAT[1], s=18, zorder=3)
-        a.hlines(y, -20, max(np.log10(pcs)), color=GRID, lw=1)
-        mm = min(x["miss_distance_km"] for x in lst)
-        a.text(max(np.log10(pcs)) + 0.2, y, f"min miss {mm:.2f} km", va="center", fontsize=5.8, color=INK2)
-    a.set_yticks(ys, [f"{n[:20]} ({s})" for (s, n, _), _ in items], fontsize=6)
+        a.text(max(np.log10(pcs)) + 0.15, y, f"{len(lst)} frag., min miss {min(x['miss_distance_km'] for x in lst):.2f} km",
+               va="center", fontsize=5.8, color=INK2)
+    a.set_yticks(ys, [f"{n[:20]} #{s} ({ag})" for (s, n, ag), _ in items], fontsize=5.9)
     lo = min(math.log10(max(x["probability_of_collision"], 1e-20)) for x in deb)
-    a.set_xlim(lo - 0.5, max(math.log10(max(x["probability_of_collision"], 1e-20)) for x in deb) + 2.5)
+    hi = max(math.log10(max(x["probability_of_collision"], 1e-20)) for x in deb)
+    a.set_xlim(lo - 0.4, hi + 2.2)
     a.set_xlabel("log10 fragment Pc"); a.set_title(f"{len(deb)} fragment alerts on {len(items)} satellites")
     a.grid(axis="y", visible=False)
     b = axes[1]
-    agc = Counter(k[2] for k in by_sat)
-    b.bar(list(agc.keys()), list(agc.values()), color=TEAL, width=0.5)
-    b.set_ylabel("threatened satellites"); b.set_title("By agency (SATCAT owner)")
-    b.grid(axis="x", visible=False)
+    for i, ((sid, name, ag), lst) in enumerate(items):
+        b.scatter([x["tca_minutes"] for x in lst], [x["miss_distance_km"] for x in lst], s=22,
+                  color=CAT[i % len(CAT)], edgecolor="white", lw=0.4, label=f"#{sid}", zorder=3)
+    b.axhline(5, color=INK2, ls=":", lw=0.8)
+    b.text(2, 5.1, "5 km screening threshold", fontsize=5.6, color=INK2, va="bottom")
+    b.set_xlabel("minutes from now to fragment TCA"); b.set_ylabel("miss distance [km]")
+    b.set_ylim(0, 6.2); b.set_title("When and how close")
+    b.legend(fontsize=5.4, ncol=2, loc="lower right")
     fig.tight_layout()
     return save(fig, "19_debris_alerts", "source=='debris' alerts from GET /api/alerts after POST /api/debris/simulate "
-                "and a pipeline recompute (6 h window, 30 s step, 5 km threshold, isotropic Foster Pc).")
+                "and a pipeline recompute (6 h window, 30 s step, 5 km threshold, isotropic Foster Pc); agency = SATCAT owner.")
 
 
 def fig_cascade(alerts_deb, node_prob):
@@ -1048,9 +1056,10 @@ def fig_cascade(alerts_deb, node_prob):
     pos = {}
     for L, ns in layers.items():
         k = len(ns)
+        sp = 1.0 if L == 1 else 1.55
         for i, n in enumerate(ns):
-            pos[n] = (L, (k - 1) / 2 - i if k > 1 else 0)
-    fig, ax = plt.subplots(figsize=(7.2, 3.4))
+            pos[n] = (L, ((k - 1) / 2 - i) * sp)
+    fig, ax = plt.subplots(figsize=(7.2, 4.4))
     for u, v, d in G.edges(data=True):
         (x1, y1), (x2, y2) = pos[u], pos[v]
         style = ":" if d.get("agency") else "-"
@@ -1066,12 +1075,13 @@ def fig_cascade(alerts_deb, node_prob):
             p = node_prob.get(str(n)) if node_prob else None
             if p is not None:
                 lab += f"\nP(hit) {p:.1e}"
-        ax.text(x, y - (0.38 if d["layer"] != 1 else 0.25), lab, ha="center", va="top", fontsize=5.0 if d["layer"] == 1 else 5.6, color=INK)
+        ax.text(x, y - (0.3 if d["layer"] != 1 else 0.22), lab, ha="center", va="top", fontsize=5.0 if d["layer"] == 1 else 5.5,
+                color=INK, linespacing=1.05, bbox=dict(fc="white", ec="none", alpha=0.75, pad=0.3) if d["layer"] in (2, 3) else None)
     for L, t in enumerate(["collision event", "fragments (depth 1)", "threatened satellites (depth 2)",
                            "their conjunctions (depth 3)", "agencies (SATCAT)"]):
         if L in layers:
             ys = [pos[n][1] for n in layers[L]]
-            ax.text(L, max(ys) + 0.75, t, ha="center", fontsize=6.6, weight="bold", color=lcol[L])
+            ax.text(L, max(ys) + 0.55 + (0.45 if L % 2 else 0), t, ha="center", fontsize=6.6, weight="bold", color=lcol[L])
     ax.axis("off")
     allys = [p[1] for p in pos.values()]
     ax.set_ylim(min(allys) - 1.4, max(allys) + 1.2); ax.set_xlim(-0.5, 4.5)
@@ -1122,7 +1132,9 @@ ST = {
     "cellh": ParagraphStyle("cellh", fontName="DV-B", fontSize=6.8, leading=8.6, textColor=colors.white),
     "eq": ParagraphStyle("eq", fontName="DV", fontSize=8.6, leading=12.5, textColor=C(NAVY)),
     "bul": ParagraphStyle("bul", fontName="DV", fontSize=8.4, leading=11.6, textColor=C(INK), leftIndent=9,
-                          bulletIndent=0, spaceAfter=1.5),
+                          bulletIndent=0, spaceAfter=1.5, bulletFontName="DV", bulletColor=C(TEAL)),
+    "kpi": ParagraphStyle("kpi", fontName="DV-B", fontSize=17, leading=21, textColor=C(INK)),
+    "title": ParagraphStyle("title", fontName="DV-B", fontSize=34, leading=40, textColor=colors.white),
     "lab": ParagraphStyle("lab", fontName="DV-B", fontSize=6.6, leading=8, textColor=C(TEAL)),
 }
 
@@ -1231,7 +1243,7 @@ def kpi_table(tiles, dark=False, ncol=None):
     w = TW / ncol
     cells = []
     for val, lab, col in tiles:
-        cells.append([P(f'<font color="{col}" size="17"><b>{val}</b></font>', "body"),
+        cells.append([P(f'<font color="{col}"><b>{val}</b></font>', "kpi"),
                       P(f'<font color="{"#b9c7dc" if dark else INK2}" size="6.8">{lab}</font>', "body")])
     rows = []
     for i in range(0, len(cells), ncol):
@@ -1410,7 +1422,7 @@ def fig_verification(ver):
         a.text(len(xs) + 0.4, y, f"{npass}/{len(xs)}" + (f"  ({nfix} fixed)" if nfix else ""), va="center", fontsize=6)
     a.set_yticks(ys, areas, fontsize=6.4); a.set_xlabel("checks"); a.grid(axis="y", visible=False)
     a.set_xlim(0, max(Counter(x["area"] for x in ver).values()) * 1.45)
-    a.set_title("Checks per area (green = pass)")
+    a.set_title("Checks per area")
     b = axes[1]
     rng = np.random.default_rng(0)
     n_exact = 0
@@ -1430,7 +1442,7 @@ def fig_verification(ver):
     b.text(0.05, ys.max() + 0.3, "tolerance", color=BAD, fontsize=6.3)
     b.set_yticks(ys, [""] * len(areas)); b.set_xlim(-16.5, 1.2); b.set_ylim(-0.7, len(areas) - 0.2)
     b.set_xlabel("log10 (error ÷ tolerance)   — left of the red line = inside tolerance")
-    b.set_title(f"Margin to tolerance ({n_exact} exact / inequality checks not shown)")
+    b.set_title(f"Error ÷ tolerance  ({n_exact} exact checks not shown)")
     fig.tight_layout(w_pad=0.6)
     return save(fig, "21_verification", "docs/report/verification.json (independent re-implementations: scipy, sklearn, "
                 "raw sgp4, DOP853 integrators). error = abs_err or rel_err, whichever the tolerance applies to; "
@@ -1765,8 +1777,8 @@ def main():
     S.append(Spacer(1, 30 * mm))
     S.append(P(f'<font color="{TEAL}" size="9"><b>SPACE TRAFFIC MANAGEMENT · HACKATHON SUBMISSION</b></font>', "body"))
     S.append(Spacer(1, 4 * mm))
-    S.append(P('<font color="white" size="34"><b>Orbital Sentinel</b></font>', "body"))
-    S.append(Spacer(1, 9 * mm))
+    S.append(P('Orbital Sentinel', "title"))
+    S.append(Spacer(1, 4 * mm))
     S.append(P('<font color="#d6e2f2" size="13">From two-line elements to a cascade-safe avoidance burn — '
                "every number computed, cross-checked and traceable.</font>", "body"))
     S.append(Spacer(1, 12 * mm))
@@ -1787,6 +1799,28 @@ def main():
     S.append(Spacer(1, 3 * mm))
     S.append(P('<font color="#b9c7dc" size="8">Repository: orbit-sentinal · FastAPI backend + React/Cesium frontend · '
                "deep-dive: docs/HOW_IT_WORKS.md</font>", "body"))
+    S.append(Spacer(1, 12 * mm))
+    S.append(P(f'<font color="{TEAL}" size="9"><b>INSIDE THIS REPORT</b></font>', "body"))
+    S.append(Spacer(1, 3 * mm))
+    toc = [("00", "Executive summary"), ("01", "System pipeline"), ("02", "Catalogue & agencies"),
+           ("03", "Conjunction screening"), ("04", "Collision probability"), ("05", "ML surrogate & explainability"),
+           ("06", "Decision score"), ("07", "Cascade-safe avoidance"), ("08", "Collision → debris → cascade"),
+           ("09", "Physics cross-validation"), ("10", "Independent verification"), ("11", "Assumptions, limitations & how to verify")]
+    half = (len(toc) + 1) // 2
+    trows = []
+    for i in range(half):
+        row = []
+        for j in (i, i + half):
+            if j < len(toc):
+                row.append(P(f'<font color="{TEAL}" size="10"><b>{toc[j][0]}</b></font>&nbsp;&nbsp;'
+                             f'<font color="#d6e2f2" size="10">{rl(toc[j][1])}</font>', "body"))
+            else:
+                row.append("")
+        trows.append(row)
+    tt = Table(trows, colWidths=[TW / 2] * 2)
+    tt.setStyle(TableStyle([("LINEBELOW", (0, 0), (-1, -1), 0.4, C("#1d3b66")), ("TOPPADDING", (0, 0), (-1, -1), 5),
+                            ("BOTTOMPADDING", (0, 0), (-1, -1), 5), ("LEFTPADDING", (0, 0), (-1, -1), 0)]))
+    S.append(tt)
     S.append(NextPageTemplate("body"))
     S.append(PageBreak())
 
@@ -1814,7 +1848,7 @@ def main():
         "(Foster vs Chan series, Monte Carlo, exact Rice CDF and Alfano maximum; propagation energy; CW, Hohmann "
         "and rocket-equation manoeuvre checks; NASA SBM fragment counts).",
         f"<b>The ML surrogate is measured, explained and kept in its place.</b> Held-out MAE "
-        f"{reg.get('mae_log10_pc', float('nan')):.3f} dex vs {base_mae} dex for a miss-distance-only baseline; "
+        f"{reg.get('mae_log10_pc', float('nan')):.3f} dex vs {base_mae:.2f} dex for a miss-distance-only baseline; "
         f"precision {c14.get('precision', 0):.3f} / recall {c14.get('recall', 0):.3f} at Pc 1e-4. TreeSHAP shows the "
         f"main driver is <i>{rl(an.get('main_factor_label', '?'))}</i>. PCA was tested and rejected with numbers. "
         "The model never overwrites the physics Pc.",
@@ -1894,6 +1928,22 @@ def main():
         S.append(P(f"Measured: {r500.get('objects')} objects → {r500.get('alerts')} pairs in {r500.get('t_total_s')} s "
                    f"(KD radius {r500.get('kd_radius_km')} km). Runtime grows sub-quadratically because the KD-tree only "
                    "visits spatial neighbours.", "small"))
+    top = sorted([a for a in alerts if a.get("source", "screening") == "screening"],
+                 key=lambda a: (-a["probability_of_collision"], a["miss_distance_km"]))[:8]
+    if top:
+        S.append(Spacer(1, 5))
+        S.append(P(f"Top {len(top)} live alerts by Foster Pc (GET /api/alerts)", "h2"))
+        rows = []
+        for a in top:
+            dcs = a.get("decision") or {}
+            rows.append([f"{rl(a['sat1']['name'][:24])} × {rl(a['sat2']['name'][:24])}",
+                         f"{a['tca_hours']:.1f} h", f"{a['miss_distance_km']:.3f} km", f"{a['relative_speed_kms']:.2f} km/s",
+                         fmt(a["probability_of_collision"]),
+                         f'<font color="{SEV_COL.get(a["severity"], INK)}"><b>{a["severity"]}</b></font>',
+                         f"{rl(dcs.get('action', '–'))} ({dcs.get('score', 0):.0f})",
+                         "/".join(f"{x:.1f}" for x in (a.get("tle_age_days") or []))])
+        S.append(data_table(["Pair", "TCA in", "Miss", "v_rel", "Foster Pc", "Severity", "Decision", "TLE age [d]"], rows,
+                            [TW * 0.33, TW * 0.07, TW * 0.09, TW * 0.10, TW * 0.12, TW * 0.10, TW * 0.11, TW * 0.08]))
     S.append(PageBreak())
 
     # 4 Pc
@@ -1901,7 +1951,7 @@ def main():
     S += what_how_why(
         "The probability that the two hard bodies overlap at TCA, given position uncertainty. This number — not the "
         "ML model — drives severity and the action.",
-        "Project the combined covariance onto the encounter (B-)plane ⟂ Δv and integrate the 2-D Gaussian over the "
+        "Project the combined covariance onto the encounter (B-)plane perpendicular to Δv and integrate the 2-D Gaussian over the "
         "hard-body disk: 48-point Gauss–Legendre radially × 96-point trapezoid in angle.",
         "Every alert carries pc_checks: Chan series (analytic), Monte Carlo (sampling), Alfano max (upper bound). "
         "Foster also matches adaptive dblquad to 1e-4 in the test suite.")
@@ -1912,9 +1962,11 @@ def main():
     S += figure("05_bplane")
     if scen_alert:
         pcs = scen_alert.get("pc_checks", {})
+        mc_txt = (f"gives {fmt(pcs.get('monte_carlo'))}" if pcs.get("monte_carlo") else
+                  "is below its resolution, so it reports null instead of a noisy number")
         S.append(P(f"For the demo alert, Foster {fmt(pcs.get('foster'))} vs Chan {fmt(pcs.get('chan'))}: spread "
                    f"{pcs.get('spread_decades')} decades → <b>consistent = {pcs.get('consistent')}</b>. Monte Carlo "
-                   f"({pcs.get('mc_samples')} samples, {pcs.get('mc_hits')} hits) gives {fmt(pcs.get('monte_carlo'))}. "
+                   f"({pcs.get('mc_samples')} samples, {pcs.get('mc_hits')} hits) {mc_txt}. "
                    f"Alfano's maximum {fmt(pcs.get('alfano_max'))} is what Pc could reach if the covariance size were wrong.", "small"))
     t2 = Table([[figure("06_tle_sigma", width=TW * 0.5, keep=False),
                  [P("Why model the covariance?", "h2"),
@@ -2020,6 +2072,20 @@ def main():
         "Clohessy–Wiltshire: y(t) = (2ẋ<sub>0</sub>/n)(cos nt − 1) + (ẏ<sub>0</sub>/n)(4 sin nt − 3nt)",
         "Tsiolkovsky: m<sub>p</sub> = m<sub>0</sub>(1 − e<super>−Δv/(I<sub>sp</sub> g<sub>0</sub>)</super>);   finite_burn_ok ⇔ t<sub>burn</sub> ≤ 0.1 · lead time  and  ≤ 1/10 orbit"])
     S += figure("15_options")
+    if rm.get("options"):
+        rows = []
+        for i, o in enumerate(rm["options"]):
+            sec = o.get("secondary_conjunctions") or []
+            chosen_mark = " ★" if i == rm.get("chosen_index") else ""
+            rows.append([f"<b>#{i + 1}{chosen_mark}</b>", rl(o["candidate"]), f"{o['delta_v_ms']:g}",
+                         f"{o.get('new_miss_distance_km', 0):.3f}", fmt(o.get("new_pc_collision")),
+                         f"{len(sec)} (max Pc {fmt(o.get('secondary_max_pc'))})",
+                         f'<font color="{GOOD if o.get("cascade_safe") else BAD}"><b>{"yes" if o.get("cascade_safe") else "no"}</b></font>',
+                         f"{o.get('propellant_kg', 0):.3f}", rl(o.get("recommended_engine", "") or "")])
+        S.append(data_table(["#", "Burn", "Δv [m/s]", "New miss [km]", "New Pc", "Secondaries (24 h)", "Cascade-safe",
+                             "Prop. [kg]", "Engine"], rows,
+                            [TW * 0.06, TW * 0.12, TW * 0.08, TW * 0.10, TW * 0.12, TW * 0.19, TW * 0.10, TW * 0.08, TW * 0.15]))
+        S.append(Spacer(1, 6))
     S += figure("16_engines")
     if rm:
         S.append(P(f"Selection rule: <i>{rl(rm.get('selection_rule', ''))}</i> · mover mass {rm.get('mass_kg')} kg "
@@ -2050,8 +2116,8 @@ def main():
     if event:
         ds = (scen.get("debris") or {}).get("debris_screening") or {}
         S.append(P(f"Debris screening: {ds.get('fragments_screened')} fragments × {ds.get('satellites_screened')} "
-                   f"satellites, {ds.get('window_hours')} h at {ds.get('step_s')} s → {ds.get('alerts_returned')} alerts in "
-                   f"{ds.get('elapsed_s')} s. Cascade depth is the BFS hop count from the collision event; P(hit) "
+                   f"satellites, {ds.get('window_hours'):g} h at {ds.get('step_s'):g} s steps → {ds.get('alerts_returned')} alerts in "
+                   f"{ds.get('elapsed_s'):.1f} s. Cascade depth is the BFS hop count from the collision event; P(hit) "
                    "combines all incident alerts assuming independence. This is a graph over predicted encounters in the "
                    "screening window, not a multi-year population model.", "small"))
     S.append(PageBreak())

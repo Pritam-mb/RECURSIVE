@@ -21,6 +21,8 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
+ASSUMED_MASS_KG = 500.0  # used only for the fragment-count estimate when no mass is known
+
 # ──────────────────────────────────────────────────────────────────────────────
 # FUNCTION 1 — Build RTN covariance matrix in ECI frame
 # ──────────────────────────────────────────────────────────────────────────────
@@ -31,60 +33,23 @@ def build_rtn_covariance(
     tle_age_hours: float = 0.5,
 ) -> np.ndarray:
     """
-    Build a 3×3 position covariance matrix in ECI frame based on RTN
-    (Radial / Transverse / Normal) uncertainty model.
+    Build a 3x3 ECI position covariance from the TLE-age error-growth model.
 
-    Sigma model (km):
-      Radial    σ_r = 0.05 km  (50 m — well-determined from two-body dynamics)
-      Transverse σ_t = 1.0 * (1 + tle_age_hours / 24.0) km  (grows with TLE age)
-      Normal    σ_n = 0.05 km  (50 m — orbit-plane uncertainty)
+    sigma_RTN(age) = SIGMA0 + GROWTH * age_days (km), see
+    app.core.screening.SIGMA0_RTN_KM / SIGMA_GROWTH_RTN_KM_PER_DAY for the
+    parameters and their sources (Flohrer et al. 2008; Vallado & Cefola 2012).
+    tle_age_hours must be |epoch_of_interest - TLE epoch|.
 
-    Returns: 3×3 numpy array in km² (covariance units).
+    Returns: 3x3 numpy array in km^2.
     """
+    from app.core.screening import rtn_to_eci_cov, tle_age_sigmas_km
+
+    sig = tle_age_sigmas_km(float(tle_age_hours) / 24.0)
     try:
-        position_km = np.asarray(position_km, dtype=float)
-        velocity_kms = np.asarray(velocity_kms, dtype=float)
-
-        r_norm = float(np.linalg.norm(position_km))
-        v_norm = float(np.linalg.norm(velocity_kms))
-
-        if r_norm < 1e-6 or v_norm < 1e-6:
-            # Degenerate state — return identity-scaled covariance
-            sigma_t = 1.0 * (1.0 + tle_age_hours / 24.0)
-            return np.diag([0.05**2, sigma_t**2, 0.05**2])
-
-        # RTN basis vectors
-        r_hat = position_km / r_norm
-        h_vec = np.cross(position_km, velocity_kms)
-        h_norm = float(np.linalg.norm(h_vec))
-        if h_norm < 1e-10:
-            n_hat = np.array([0.0, 0.0, 1.0])
-        else:
-            n_hat = h_vec / h_norm
-        t_hat = np.cross(n_hat, r_hat)
-        t_norm = float(np.linalg.norm(t_hat))
-        if t_norm > 1e-10:
-            t_hat = t_hat / t_norm
-
-        # Sigma values (km)
-        sigma_r = 0.05
-        sigma_t = 1.0 * (1.0 + tle_age_hours / 24.0)
-        sigma_n = 0.05
-
-        # Diagonal covariance in RTN frame (km²)
-        D_rtn = np.diag([sigma_r**2, sigma_t**2, sigma_n**2])
-
-        # Rotation matrix: columns are RTN basis vectors → transforms RTN→ECI
-        R = np.column_stack([r_hat, t_hat, n_hat])  # 3×3
-
-        # Covariance in ECI: C_eci = R @ D_rtn @ R^T
-        cov_eci = R @ D_rtn @ R.T
-        return cov_eci
-
+        return rtn_to_eci_cov(np.asarray(position_km, float), np.asarray(velocity_kms, float), sig)
     except Exception as exc:
-        logger.warning("build_rtn_covariance failed: %s — returning default", exc)
-        sigma_t = 1.0 * (1.0 + tle_age_hours / 24.0)
-        return np.diag([0.05**2, sigma_t**2, 0.05**2])
+        logger.warning("build_rtn_covariance degenerate state: %s", exc)
+        return np.diag(np.square(sig))
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -197,6 +162,25 @@ def project_covariance_to_bplane(
 # ──────────────────────────────────────────────────────────────────────────────
 
 def foster_integrate(
+    b_vec_km: np.ndarray,
+    cov_2d_km2: np.ndarray,
+    hbr_km: float = 0.010,
+) -> float:
+    """
+    Foster 2-D Pc via deterministic Gauss-Legendre x trapezoid quadrature of
+    the bivariate normal over the hard-body disk (app.core.screening.foster_pc).
+    Cross-checked against the adaptive dblquad version below in
+    tests/test_screening_real.py.
+    """
+    try:
+        from app.core.screening import foster_pc
+        return foster_pc(b_vec_km, cov_2d_km2, hbr_km)
+    except Exception as exc:
+        logger.warning("foster_pc failed (%s) - using dblquad", exc)
+        return foster_integrate_dblquad(b_vec_km, cov_2d_km2, hbr_km)
+
+
+def foster_integrate_dblquad(
     b_vec_km: np.ndarray,
     cov_2d_km2: np.ndarray,
     hbr_km: float = 0.010,
@@ -331,6 +315,8 @@ def compute_collision_probability(
     cov_p: np.ndarray | None = None,
     cov_q: np.ndarray | None = None,
     tle_age_hours: float = 0.5,
+    hbr_km: float = 0.010,
+    tle_age_hours_q: float | None = None,
 ) -> dict:
     """
     Compute Foster B-plane collision probability between two space objects.
@@ -364,8 +350,11 @@ def compute_collision_probability(
         # Build covariances if not provided
         if cov_p is None:
             cov_p = build_rtn_covariance(r_p, v_p, tle_age_hours)
+        sigma_source = "provided" if (cov_p is not None and cov_q is not None) else "tle_age_model"
         if cov_q is None:
-            cov_q = build_rtn_covariance(r_q, v_q, tle_age_hours)
+            cov_q = build_rtn_covariance(
+                r_q, v_q, tle_age_hours if tle_age_hours_q is None else tle_age_hours_q
+            )
 
         cov_combined = np.asarray(cov_p, dtype=float) + np.asarray(cov_q, dtype=float)
 
@@ -380,8 +369,8 @@ def compute_collision_probability(
         # Project covariance onto B-plane
         cov_2d = project_covariance_to_bplane(cov_combined, B)
 
-        # Foster integration
-        hbr_km = 0.010  # 10 m combined hard-body radius
+        # Foster integration (hbr_km = combined hard-body radius, caller-supplied)
+        hbr_km = float(hbr_km)
         p_collision = foster_integrate(b_vec, cov_2d, hbr_km=hbr_km)
 
         # Covariance ellipse for frontend rendering
@@ -395,9 +384,9 @@ def compute_collision_probability(
         overlap_fraction = min(1.0, disk_area / ellipse_area)
         affection_rate = round(overlap_fraction * 100.0, 2)
 
-        # Fragment count (assumed 500 kg satellites at relative velocity)
-        mass_p = 500.0
-        mass_q = 500.0
+        # Fragment count: masses are an ASSUMPTION (no mass data here), tagged below.
+        mass_p = ASSUMED_MASS_KG
+        mass_q = ASSUMED_MASS_KG
         frag_count = nasa_fragment_count(mass_p, mass_q, rel_vel_kms)
 
         covariance_ellipse = {
@@ -406,6 +395,8 @@ def compute_collision_probability(
             "angle": round(ellipse["angle_rad"], 4),  # radians
             "affection_rate": affection_rate,          # 0–100 %
             "predicted_fragments": frag_count,         # integer
+            "assumed_mass_kg": ASSUMED_MASS_KG,
+            "mass_source": "default",
         }
 
         return {
@@ -415,33 +406,30 @@ def compute_collision_probability(
             "b_n_km": round(b_n_km, 6),
             "cov_2d": cov_2d.tolist(),
             "covariance_ellipse": covariance_ellipse,
+            "hbr_km": hbr_km,
+            "pc_method": "foster",
+            "sigma_source": sigma_source,
         }
 
     except Exception as exc:
-        logger.warning("compute_collision_probability failed: %s — using fallback", exc)
+        # No fabricated numbers: report the failure explicitly.
+        logger.warning("compute_collision_probability failed: %s", exc)
         try:
             r_p2 = np.array([state_p.get("x", 0), state_p.get("y", 0), state_p.get("z", 0)], dtype=float)
             r_q2 = np.array([state_q.get("x", 0), state_q.get("y", 0), state_q.get("z", 0)], dtype=float)
             miss_km = float(np.linalg.norm(r_q2 - r_p2))
         except Exception:
-            miss_km = 1.0
-        sigma = max(1.0, miss_km / 6.0)
-        hbr = 0.010
-        p = float(math.exp(-0.5 * (miss_km / sigma) ** 2) * (hbr / sigma) ** 2)
-        p = min(1.0, max(0.0, p))
+            miss_km = float("nan")
         return {
-            "p_collision": p,
+            "p_collision": 0.0,
             "miss_distance_km": round(miss_km, 6),
-            "b_t_km": 0.0,
-            "b_n_km": 0.0,
-            "cov_2d": [[1.0, 0.0], [0.0, 0.0025]],
-            "covariance_ellipse": {
-                "a": 3000.0,
-                "b": 150.0,
-                "angle": 0.0,
-                "affection_rate": 0.0,
-                "predicted_fragments": 0,
-            },
+            "b_t_km": None,
+            "b_n_km": None,
+            "cov_2d": None,
+            "covariance_ellipse": None,
+            "hbr_km": hbr_km,
+            "pc_method": "failed",
+            "sigma_source": None,
         }
 
 

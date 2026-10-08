@@ -1,6 +1,8 @@
 import { useRef, useEffect, useMemo } from 'react';
 import useTestMode from '../hooks/useTestMode';
 import useStore from '../store/useStore';
+import { severityLabel } from '../utils/severity';
+import { cloudCentroid, cloudEventId, cloudLabel, cloudRadius } from '../utils/debrisCloud';
 import {
   CORRECTION_DECAY_S,
   MAX_EXTRAPOLATION_S,
@@ -133,8 +135,13 @@ function threatColor(cpi) {
   return null;
 }
 
+// Colour level from the backend severity tier (CRITICAL ≥ 8, WARNING ≥ 5 on
+// the threatColor scale); the tier, not a CPI cut, decides the colour.
+const TIER_LEVEL = { CRITICAL: 9, WARNING: 6, WATCH: 0 };
+const alertLevel = (alert) => TIER_LEVEL[severityLabel(alert)] ?? 0;
+
 function formatMiss(km) {
-  if (!(km > 0)) return '';
+  if (km == null || !(km > 0)) return '';
   return km < 1 ? `${(km * 1000).toFixed(0)} M` : `${km.toFixed(1)} KM`;
 }
 
@@ -233,11 +240,12 @@ export default function ThreatGlobe({ alerts = EMPTY, satellites = EMPTY, select
       if ((cpiById.get(key) ?? -1) < cpi) cpiById.set(key, cpi);
     };
     for (const a of alerts) {
-      const cpi = Number(a.cpi_score ?? 0);
-      bump(a.sat1?.id, cpi);
-      bump(a.sat2?.id, cpi);
+      const level = alertLevel(a);
+      bump(a.sat1?.id, level);
+      bump(a.sat2?.id, level);
     }
-    const ranked = [...alerts].sort((a, b) => Number(b.cpi_score ?? 0) - Number(a.cpi_score ?? 0));
+    const ranked = [...alerts].sort((a, b) => (alertLevel(b) - alertLevel(a))
+      || (Number(b.cpi_score ?? 0) - Number(a.cpi_score ?? 0)));
     return { cpiById, ranked };
   }, [alerts]);
 
@@ -369,19 +377,24 @@ export default function ThreatGlobe({ alerts = EMPTY, satellites = EMPTY, select
         ctx.setLineDash([3, 3]);
         ctx.strokeStyle = PALETTE.caution;
         const breathe = 0.45 + (0.15 * Math.sin(nowMs / 1000 * (TWO_PI / 6)));
+        const seenLabels = new Set();
         for (const cloud of clouds) {
-          const c = cloud.center_eci_km;
+          const c = cloudCentroid(cloud);
           if (!c) continue;
-          const p = projectEci(c.x ?? 0, c.y ?? 0, c.z ?? 0, scratchProj);
+          const p = projectEci(c.x, c.y, c.z, scratchProj);
           if (!p.visible) continue;
-          const radiusPx = Math.max(10, (cloud.radius_km_now || 100) * (R / 6371.0));
+          const radius = cloudRadius(cloud);
+          // Percentile radius of the real fragment spread; a dot when absent.
+          const radiusPx = radius ? Math.max(3, radius.km * (R / 6371.0)) : 3;
           ctx.globalAlpha = breathe;
           ctx.beginPath();
           ctx.arc(p.sx, p.sy, radiusPx, 0, TWO_PI);
           ctx.stroke();
           ctx.globalAlpha = 1;
           ctx.setLineDash([]);
-          const text = `DEBRIS ${cloud.fragment_count || 0} FRAG`;
+          const text = cloudLabel(cloud);
+          if (seenLabels.has(text)) { ctx.setLineDash([3, 3]); continue; }
+          seenLabels.add(text);
           const tw = ctx.measureText(text).width + 10;
           const bx = p.sx - (tw / 2);
           const by = p.sy - radiusPx - 16;
@@ -476,16 +489,33 @@ export default function ThreatGlobe({ alerts = EMPTY, satellites = EMPTY, select
       ctx.setLineDash([4, 3]);
       let pillCount = 0;
       const pills = [];
+      // Debris alerts: the fragment has no TLE, so anchor the line at the
+      // centroid of its parent event's cloud (when the backend sent one).
+      const cloudAnchor = new Map();
+      for (const cloud of clouds || EMPTY) {
+        const id = cloudEventId(cloud);
+        const c = cloudCentroid(cloud);
+        if (id != null && c && !cloudAnchor.has(id)) {
+          cloudAnchor.set(id, projectEci(c.x, c.y, c.z, { sx: 0, sy: 0, visible: false }));
+        }
+      }
       for (const alert of ranked) {
+        const isDebris = alert.source === 'debris';
         const idA = Number(alert.sat1?.id);
         const idB = Number(alert.sat2?.id);
-        const pA = posOf(idA);
-        const pB = posOf(idB);
+        let pA = posOf(idA);
+        let pB = posOf(idB);
+        if (isDebris && (!pA || !pB)) {
+          const eventId = alert.parent_event?.event_id;
+          const anchor = eventId != null ? cloudAnchor.get(String(eventId)) : null;
+          if (!pA) pA = anchor ?? null;
+          else pB = anchor ?? null;
+        }
         if (!pA || !pB || !pA.visible || !pB.visible) continue;
-        const cpi = Number(alert.cpi_score ?? 0);
         const isTop = pillCount < MAX_CONJUNCTION_LABELS;
-        const color = threatColor(cpi);
-        ctx.strokeStyle = isTop && color ? color : PALETTE.lineStrong;
+        const color = threatColor(alertLevel(alert));
+        ctx.setLineDash(isDebris ? [1, 3] : [4, 3]);
+        ctx.strokeStyle = isDebris ? PALETTE.caution : isTop && color ? color : PALETTE.lineStrong;
         ctx.globalAlpha = isTop ? 0.7 : 0.9;
         ctx.beginPath();
         ctx.moveTo(pA.sx, pA.sy);
@@ -556,13 +586,15 @@ export default function ThreatGlobe({ alerts = EMPTY, satellites = EMPTY, select
         const alert = pills[i];
         const pA = pills[i + 1];
         const pB = pills[i + 2];
-        const miss = formatMiss(Number(alert.miss_distance_km ?? 0));
+        const missKm = alert.miss_distance_km == null ? null : Number(alert.miss_distance_km);
+        const miss = formatMiss(Number.isFinite(missKm) ? missKm : null);
         const tca = formatTca(alert);
-        const text = miss && tca ? `${miss}  ${tca}` : (miss || tca);
-        if (!text) continue;
+        const core = miss && tca ? `${miss}  ${tca}` : (miss || tca);
+        if (!core) continue;
+        const text = alert.source === 'debris' ? `DEB  ${core}` : core;
         midpoint.sx = (pA.sx + pB.sx) / 2;
         midpoint.sy = (pA.sy + pB.sy) / 2;
-        drawCallout(ctx, midpoint, text, threatColor(Number(alert.cpi_score ?? 0)) || PALETTE.text, W, H);
+        drawCallout(ctx, midpoint, text, threatColor(alertLevel(alert)) || PALETTE.text, W, H);
       }
       if (selectedId != null) {
         const sid = Number(selectedId);

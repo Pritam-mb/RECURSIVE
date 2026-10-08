@@ -1,6 +1,13 @@
 """
-Lightweight Kalman filter for satellite state estimation.
-Fuses SGP4 propagation with position observations to maintain covariance.
+Lightweight Kalman filter bookkeeping attached to SGP4Propagator.propagate_one.
+
+HONESTY NOTE: there are no independent observations in this system - the
+"measurement" fed to update_with_observation() is the SGP4 output itself, so
+the resulting covariance is NOT a physical orbit uncertainty. It is therefore
+NOT used for collision probability anywhere: Pc covariance comes from the
+documented TLE-age error-growth model in app/core/screening.py
+(sigma_source="tle_age_model"). The filter is kept only because snapshot /
+state-cache code still serialises it for diagnostics.
 """
 
 from __future__ import annotations

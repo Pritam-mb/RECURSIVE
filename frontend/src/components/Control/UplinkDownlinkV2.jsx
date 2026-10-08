@@ -73,7 +73,10 @@ export default function UplinkDownlinkV2({ selectedSatId }) {
         if (!res.ok) throw new Error(`status ${res.status}`);
         const data = await res.json();
         if (cancelled) return;
-        const value = Number(data?.fuel_remaining_pct);
+        // null means "no fuel model for this object" (debris, rocket bodies);
+        // Number(null) would turn that into a fake 0%.
+        const raw = data?.fuel_remaining_pct;
+        const value = raw == null ? Number.NaN : Number(raw);
         setFuelPct(Number.isFinite(value) ? value : null);
       } catch (_) {
         if (!cancelled) setFuelPct(null);

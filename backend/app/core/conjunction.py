@@ -1,9 +1,9 @@
 """
 Conjunction assessment engine.
 Computes pairwise miss distances and identifies close approaches.
-Uses Foster 1992 B-plane integration (via analytics.py) for collision
-probability. Falls back to Gaussian approximation only when analytics
-module is unavailable.
+Screening itself lives in app/core/screening.py (future-window, refined TCA,
+Foster Pc with TLE-age covariance); this module keeps the CPI score, the
+legacy distance-band classifier, find_tca and a compatibility wrapper.
 
 CPI weights are calibrated against Foster Pc ordering so that higher
 CPI always correlates with higher Foster Pc.
@@ -38,7 +38,7 @@ WATCH_DISTANCE_KM = 500.0      # Green watch
 
 # ── Gaussian fallback (used only when analytics import fails) ─────────────────
 
-def _gaussian_fallback(miss_km: float) -> float:
+def _gaussian_fallback(miss_km: float) -> float:  # unused by the pipeline (verify_physics.py only)
     """
     Simple Gaussian approximation used ONLY as fallback when analytics.py
     cannot be imported. Never call this as the primary path.
@@ -178,8 +178,9 @@ def compute_collision_probability_2d(
     combined_radius_km: float = 0.010,
 ) -> float:
     """
-    Legacy RIC-frame 2D Gaussian approximation.
-    Kept for compatibility with Kalman-state-based paths.
+    Legacy RIC-frame approximation. NOT used by screening/Pc any more (the
+    Kalman covariance it was fed is not a physical uncertainty). Kept only so
+    old imports do not break.
     """
     try:
         eigvals = np.linalg.eigvals(covariance_2d)
@@ -280,9 +281,12 @@ def compute_cpi_score(
         vel_score = float(np.clip(vel_kms / 15.0 * 10.0, 0.0, 10.0))
 
         # ── TLE age / data quality component (0–10) ───────────────────────
-        # Older TLE → larger uncertainty → less reliable → slightly higher priority
+        # Older TLE → larger uncertainty → slightly higher priority. Scaled
+        # over 7 days (was 48 h): real catalogue TLEs are routinely 1–3 days
+        # old, so a 48 h scale saturated this term for almost every pair now
+        # that the actual |TCA − TLE epoch| is passed instead of a 0.5 h stub.
         age = max(0.0, float(tle_age_hours))
-        age_score = float(np.clip(age / 48.0 * 10.0, 0.0, 10.0))
+        age_score = float(np.clip(age / 168.0 * 10.0, 0.0, 10.0))
 
         # ── Weighted CPI (weights sum to 1.0) ──────────────────────────────
         cpi = (
@@ -299,176 +303,73 @@ def compute_cpi_score(
         return 0.0
 
 
-# ── Main screening function ───────────────────────────────────────────────────
+# ── Screening (delegates to the future-window screener) ─────────────────────
+
+class ScreenedConjunction:
+    """Thin wrapper so legacy callers can keep using ``.to_dict()``."""
+
+    __slots__ = ("_alert",)
+
+    def __init__(self, alert: dict):
+        self._alert = alert
+
+    def to_dict(self) -> dict:
+        return dict(self._alert)
+
+    def __getattr__(self, item):
+        a = object.__getattribute__(self, "_alert")
+        mapping = {
+            "sat1_id": ("sat1", "id"), "sat1_name": ("sat1", "name"),
+            "sat2_id": ("sat2", "id"), "sat2_name": ("sat2", "name"),
+        }
+        if item in mapping:
+            k1, k2 = mapping[item]
+            return a.get(k1, {}).get(k2)
+        if item in a:
+            return a[item]
+        raise AttributeError(item)
+
 
 def screen_conjunctions(
     states: list[SatelliteState],
-    threshold_km: float = WATCH_DISTANCE_KM,
+    threshold_km: float | None = None,
     kalman_states: dict = None,
     propagator: SGP4Propagator = None,
-) -> list[ConjunctionEvent]:
+    sim_time: datetime | None = None,
+) -> list[ScreenedConjunction]:
     """
-    Pairwise conjunction screening with Foster B-plane collision probability.
+    Legacy entry point, now a wrapper around app.core.screening.screen():
+    all-vs-all FUTURE-window screening (default 24 h), Brent-refined TCA,
+    Foster Pc with TLE-age covariance.
 
-    Uses analytics.compute_collision_probability (Foster 1992) as primary path.
-    Falls back to Gaussian approximation only if analytics import failed.
-
-    When a propagator is supplied, real Time-of-Closest-Approach is refined
-    via find_tca() for red/yellow pairs (distance <= WARNING_DISTANCE_KM),
-    so tca_utc reflects the actual closest approach rather than the snapshot
-    epoch and CPI uses the true time-to-closest-approach.
-
-    kalman_states: dict[norad_id] -> dict with covariance_6x6 (optional, legacy)
-    Returns events where miss distance < threshold or CPI > 2.0, sorted by CPI.
+    The old implementation kept pairs by their CURRENT separation (< 500 km)
+    and reported TCA = now. ``kalman_states`` is accepted for signature
+    compatibility and deliberately ignored: the Kalman filter in
+    app/core/kalman.py "observes" SGP4 output and its covariance is not a
+    physical uncertainty, so it must not feed Pc.
     """
-    if kalman_states is None:
-        kalman_states = {}
+    from app.core.screening import screen
 
-    events = []
-    n = len(states)
-
-    for i in range(n):
-        for j in range(i + 1, n):
-            s1, s2 = states[i], states[j]
-
-            # Skip if either had propagation errors
-            if s1.error_code != 0 or s2.error_code != 0:
-                continue
-
-            dist = compute_miss_distance(s1, s2)
-            rel_speed_kmh = compute_relative_speed(s1, s2)
-            rel_speed_kms = rel_speed_kmh / 3600.0
-            severity = classify_severity(dist)
-
-            if severity == "none":
-                continue  # Far outside watch threshold — skip entirely
-
-            # ── Foster B-plane collision probability (primary path) ─────────
-            p_collision = 0.0
-            covariance_ellipse = None
-
-            if _ANALYTICS_AVAILABLE:
+    if sim_time is None:
+        sim_time = None
+        for s in states or []:
+            stamp = getattr(s, "epoch_utc", None)
+            if stamp:
                 try:
-                    state_a_dict = {
-                        "x": float(s1.x), "y": float(s1.y), "z": float(s1.z),
-                        "vx": float(s1.vx), "vy": float(s1.vy), "vz": float(s1.vz),
-                    }
-                    state_b_dict = {
-                        "x": float(s2.x), "y": float(s2.y), "z": float(s2.z),
-                        "vx": float(s2.vx), "vy": float(s2.vy), "vz": float(s2.vz),
-                    }
-                    analytics_result = compute_collision_probability(
-                        state_a_dict,
-                        state_b_dict,
-                        tle_age_hours=0.5,
-                    )
-                    p_collision = analytics_result["p_collision"]
-                    covariance_ellipse = analytics_result["covariance_ellipse"]
-                except Exception as analytics_err:
-                    logger.warning(
-                        "Analytics Foster Pc failed for pair (%d, %d): %s — using fallback",
-                        s1.norad_id, s2.norad_id, analytics_err,
-                    )
-                    p_collision = _gaussian_fallback(dist)
-                    covariance_ellipse = None
-            else:
-                p_collision = _gaussian_fallback(dist)
-                covariance_ellipse = None
-
-            # ── Legacy Kalman-based RIC Pc (if covariances available) ──────
-            # Only used to potentially refine p_collision; Foster always wins
-            kal_state_1 = kalman_states.get(s1.norad_id)
-            kal_state_2 = kalman_states.get(s2.norad_id)
-            if (
-                not _ANALYTICS_AVAILABLE
-                and kal_state_1 is not None
-                and kal_state_2 is not None
-            ):
-                try:
-                    pos_1 = np.array([s1.x, s1.y, s1.z], dtype=float)
-                    vel_1 = np.array([s1.vx, s1.vy, s1.vz], dtype=float)
-                    r_hat, i_hat, c_hat = compute_ric_frame(pos_1, vel_1)
-                    cov_1 = np.asarray(kal_state_1.get("covariance_6x6", []), dtype=float)
-                    cov_2 = np.asarray(kal_state_2.get("covariance_6x6", []), dtype=float)
-                    if cov_1.ndim == 1 and cov_1.size == 36:
-                        cov_1 = cov_1.reshape(6, 6)
-                    if cov_2.ndim == 1 and cov_2.size == 36:
-                        cov_2 = cov_2.reshape(6, 6)
-                    if cov_1.shape == (6, 6) and cov_2.shape == (6, 6):
-                        cov_2d = transform_covariance_to_ric(cov_1, cov_2, r_hat, i_hat, c_hat)
-                        rel_pos = pos_1 - np.array([s2.x, s2.y, s2.z], dtype=float)
-                        rel_pos_ric = np.array([np.dot(rel_pos, r_hat), np.dot(rel_pos, i_hat)], dtype=float)
-                        p_collision = compute_collision_probability_2d(rel_pos_ric, cov_2d, 0.010)
-                except Exception as ric_err:
-                    logger.debug("RIC CPI computation failed: %s", ric_err)
-
-            # ── Real TCA refinement for close pairs (red/yellow) ────────────
-            tca_utc = s1.epoch_utc
-            if propagator is not None and severity in ("red", "yellow"):
-                try:
-                    refined = find_tca(
-                        propagator,
-                        s1.norad_id,
-                        s2.norad_id,
-                        hours_ahead=24.0,
-                        steps=240,
-                    )
-                    if refined is not None and refined.miss_distance_km <= dist:
-                        dist = refined.miss_distance_km
-                        rel_speed_kmh = refined.relative_speed_kmh
-                        rel_speed_kms = rel_speed_kmh / 3600.0
-                        tca_utc = refined.tca_utc
-                except Exception as tca_err:
-                    logger.debug("TCA refinement failed for (%d, %d): %s", s1.norad_id, s2.norad_id, tca_err)
-
-            # ── CPI with Foster-calibrated weights ─────────────────────────
-            # TCA urgency is measured against the snapshot epoch, not wall
-            # clock. Using datetime.now() made the value drift whenever the
-            # simulation clock is warped, and desynchronised CPI from the
-            # states actually being screened.
-            tca_hours = 12.0  # Used when TCA is unavailable
-            try:
-                tca_dt = datetime.fromisoformat(tca_utc)
-                if tca_dt.tzinfo is None:
-                    tca_dt = tca_dt.replace(tzinfo=timezone.utc)
-                reference = datetime.fromisoformat(s1.epoch_utc)
-                if reference.tzinfo is None:
-                    reference = reference.replace(tzinfo=timezone.utc)
-                tca_hours = max(0.0, (tca_dt - reference).total_seconds() / 3600.0)
-            except Exception:
-                pass
-
-            cpi_score = compute_cpi_score(
-                p_collision,
-                dist,
-                tca_hours=tca_hours,
-                relative_velocity_kms=rel_speed_kms,
-                tle_age_hours=0.5,
-            )
-
-            # Report if severity is high or CPI is concerning
-            if severity == "none" and cpi_score < 2.0:
-                continue
-
-            event = ConjunctionEvent()
-            event.sat1_id = s1.norad_id
-            event.sat1_name = s1.name
-            event.sat2_id = s2.norad_id
-            event.sat2_name = s2.name
-            event.miss_distance_km = dist
-            event.relative_speed_kmh = rel_speed_kmh
-            event.tca_utc = tca_utc
-            event.tca_hours = tca_hours
-            event.severity = severity
-            event.probability_of_collision = p_collision
-            event.cpi_score = cpi_score
-            event.covariance_ellipse = covariance_ellipse
-
-            events.append(event)
-
-    # Sort by CPI score descending (most critical first)
-    events.sort(key=lambda e: e.cpi_score, reverse=True)
-    return events
+                    sim_time = datetime.fromisoformat(stamp)
+                    break
+                except Exception:
+                    pass
+        if sim_time is None:
+            from app.core import sim_clock
+            sim_time = sim_clock.simulation_now()
+    if sim_time.tzinfo is None:
+        sim_time = sim_time.replace(tzinfo=timezone.utc)
+    # Thresholds >= the old 500 km "current separation" default are legacy
+    # values; future-window screening uses its own (env-configurable) radius.
+    thr = threshold_km if (threshold_km is not None and threshold_km < WATCH_DISTANCE_KM) else None
+    alerts = screen(states, sim_time, threshold_km=thr, propagator=propagator)
+    return [ScreenedConjunction(a) for a in alerts]
 
 
 def find_tca(
@@ -480,39 +381,75 @@ def find_tca(
     steps: int = 240,
 ) -> ConjunctionEvent | None:
     """
-    Find Time of Closest Approach between two satellites
-    over the next `hours_ahead` hours using iterative search.
+    Time of Closest Approach between two catalogued objects over
+    [start, start + hours_ahead] (start defaults to the SIMULATION clock).
+
+    Vectorised SGP4 scan on a grid no coarser than 60 s (``steps`` is a lower
+    bound on the sample count), then bounded Brent refinement of the global
+    minimum on [t - dt, t + dt] with direct sgp4 calls (~1 ms TCA accuracy).
+    Does not touch the propagator's Kalman bookkeeping.
     """
+    from scipy.optimize import minimize_scalar
+    from app.core.screening import _jd_fr
+
     if start is None:
-        start = datetime.now(timezone.utc)
+        from app.core import sim_clock
+        start = sim_clock.simulation_now()
+    if start.tzinfo is None:
+        start = start.replace(tzinfo=timezone.utc)
 
-    dt_step = timedelta(hours=hours_ahead) / steps
-    min_dist = float("inf")
-    best_event = None
+    sats = getattr(propagator, "_satellites", None)
+    if not sats:
+        return None
+    lock = getattr(propagator, "_lock", None)
+    if lock is not None:
+        with lock:
+            e1, e2 = sats.get(id1), sats.get(id2)
+    else:
+        e1, e2 = sats.get(id1), sats.get(id2)
+    if e1 is None or e2 is None:
+        return None
+    (sat1, name1), (sat2, name2) = e1, e2
 
-    for i in range(steps):
-        t = start + dt_step * i
-        s1 = propagator.propagate_one(id1, t)
-        s2 = propagator.propagate_one(id2, t)
+    span = float(hours_ahead) * 3600.0
+    n = max(int(steps), int(math.ceil(span / 60.0))) + 1
+    ts = np.linspace(0.0, span, n)
+    dt = ts[1] - ts[0] if n > 1 else span
+    jd0, fr0 = _jd_fr(start)
+    jd = np.full(n, jd0)
+    fr = fr0 + ts / 86400.0
+    err1, r1, _ = sat1.sgp4_array(jd, fr)
+    err2, r2, _ = sat2.sgp4_array(jd, fr)
+    d = np.linalg.norm(r1 - r2, axis=1)
+    d[(err1 != 0) | (err2 != 0)] = np.inf
+    if not np.isfinite(d).any():
+        return None
+    k = int(np.argmin(d))
 
-        if s1 is None or s2 is None:
-            continue
-        if s1.error_code != 0 or s2.error_code != 0:
-            continue
+    def dist(t):
+        ea, ra, _ = sat1.sgp4(jd0, fr0 + t / 86400.0)
+        eb, rb, _ = sat2.sgp4(jd0, fr0 + t / 86400.0)
+        if ea != 0 or eb != 0:
+            return 1e12
+        return float(np.linalg.norm(np.subtract(ra, rb)))
 
-        dist = compute_miss_distance(s1, s2)
+    lo, hi = max(0.0, ts[k] - dt), min(span, ts[k] + dt)
+    res = minimize_scalar(dist, bounds=(lo, hi), method="bounded", options={"xatol": 1e-3})
+    t_best = float(res.x) if res.fun <= d[k] else float(ts[k])
 
-        if dist < min_dist:
-            min_dist = dist
-            best_event = ConjunctionEvent()
-            best_event.sat1_id = s1.norad_id
-            best_event.sat1_name = s1.name
-            best_event.sat2_id = s2.norad_id
-            best_event.sat2_name = s2.name
-            best_event.miss_distance_km = dist
-            best_event.relative_speed_kmh = compute_relative_speed(s1, s2)
-            best_event.tca_utc = t.isoformat()
-            best_event.severity = classify_severity(dist)
-            best_event.covariance_ellipse = None  # Not computed here
+    ea, ra, va = sat1.sgp4(jd0, fr0 + t_best / 86400.0)
+    eb, rb, vb = sat2.sgp4(jd0, fr0 + t_best / 86400.0)
+    if ea != 0 or eb != 0:
+        return None
+    miss = float(np.linalg.norm(np.subtract(ra, rb)))
 
-    return best_event
+    event = ConjunctionEvent()
+    event.sat1_id, event.sat1_name = id1, name1
+    event.sat2_id, event.sat2_name = id2, name2
+    event.miss_distance_km = miss
+    event.relative_speed_kmh = float(np.linalg.norm(np.subtract(va, vb))) * 3600.0
+    event.tca_utc = (start + timedelta(seconds=t_best)).isoformat()
+    event.tca_hours = t_best / 3600.0
+    event.severity = classify_severity(miss)
+    event.covariance_ellipse = None
+    return event

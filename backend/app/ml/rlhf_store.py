@@ -1,5 +1,7 @@
 """
-rlhf_store.py — Persistent record of operator maneuver decisions.
+rlhf_store.py — Operator feedback log (persistent record of maneuver decisions).
+
+Not RLHF: nothing trains on these decisions. The module name is historical.
 
 Every decision posted to ``/api/feedback/maneuver`` is appended to a small
 SQLite table so the RLHF panel reports real counts instead of hardcoded zeros.

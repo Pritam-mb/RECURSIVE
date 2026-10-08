@@ -413,3 +413,33 @@
 .tq-dl dd.is-caution { color: var(--c-caution); }
 .tq-dl dd.is-nominal { color: var(--c-nominal); }
 .tq-bplane .tq-section-label { align-self: stretch; }
+
+/* ── Provenance chips (source badge, ML line, verification) ─────────── */
+.tq-src {
+  flex: 0 0 auto;
+  padding: 0 4px;
+  border: 1px solid var(--c-line-strong);
+  border-radius: var(--radius);
+  font-family: var(--font-label);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: var(--track-caps);
+  color: var(--c-text-dim);
+  line-height: 14px;
+}
+.tq-src.is-debris {
+  color: var(--c-caution);
+  border-style: dashed;
+  border-color: var(--c-caution);
+}
+.tq-dl dd.tq-dd-secondary { color: var(--c-text-dim); }
+.tq-verify {
+  margin-top: 6px;
+  font-family: var(--font-label);
+  font-size: var(--fs-micro);
+  font-weight: 600;
+  letter-spacing: var(--track-caps);
+  text-transform: uppercase;
+  color: var(--c-text-faint);
+}
+.tq-verify.is-verified { color: var(--c-nominal); }

@@ -79,12 +79,12 @@ try:
 except Exception as e:
     results.append(('ws_handler.py', False, str(e)))
 
-# Test 7: train_xgboost.py — importable
+# Test 7: train_risk_surrogate.py — importable (Pc surrogate on Foster labels)
 try:
-    from app.ml.train_xgboost import generate_training_dataset, load_or_train
-    results.append(('train_xgboost.py', True, 'importable'))
+    from app.ml.train_risk_surrogate import train, generate_encounters
+    results.append(('train_risk_surrogate.py', True, 'importable'))
 except Exception as e:
-    results.append(('train_xgboost.py', False, str(e)))
+    results.append(('train_risk_surrogate.py', False, str(e)))
 
 # Test 8: lstm_predictor.py — has train_on_buffer_data
 try:

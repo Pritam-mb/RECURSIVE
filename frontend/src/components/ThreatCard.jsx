@@ -1,75 +1,147 @@
 import { useState, memo } from 'react';
-import { useTCACountdown } from '../utils/tcaCountdown';
+import { formatTCA } from '../utils/tcaCountdown';
 import BPlaneDiagram from './BPlaneDiagram';
-import { severityLabel } from '../utils/severity';
+import { severityLabel, severityState } from '../utils/severity';
 import { apiPost } from '../utils/api';
 import useStore from '../store/useStore';
 import '../styles/threats.css';
 
-// Display state (warning / caution / nominal) from CPI, escalated by an
-// explicit backend severity when that is higher.
-function rowState(cpi, severity) {
-  if (cpi >= 8 || severity === 'CRITICAL') return 'warning';
-  if (cpi >= 5 || severity === 'WARNING') return 'caution';
-  return 'nominal';
+// Every value on this card comes from the alert payload. When the backend did
+// not compute a field we print "—" (or "not computed"), never a stand-in number.
+
+const DASH = '—';
+
+const PC_METHOD_LABEL = {
+  foster: 'Foster 2D',
+  chan: 'Chan series',
+  max_pc: 'Max Pc (Alfano)',
+};
+
+/** Finite number or null (null/undefined/''/NaN all mean "not provided"). */
+function num(v) {
+  if (v == null || v === '') return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+function fmt(v, digits, unit = '') {
+  const n = num(v);
+  return n == null ? DASH : `${n.toFixed(digits)}${unit}`;
 }
 
 function formatPc(pc) {
-  if (!pc || pc === 0) return '—';
-  const n = Number(pc);
-  if (!Number.isFinite(n)) return '—';
+  const n = num(pc);
+  if (n == null) return DASH;
+  if (n === 0) return '0';
   return n.toExponential(1);
+}
+
+function formatRsw(vec) {
+  if (!Array.isArray(vec) || vec.length !== 3 || vec.some((c) => num(c) == null)) return null;
+  const [r, s, w] = vec.map(Number);
+  return `R ${r.toFixed(3)} · S ${s.toFixed(3)} · W ${w.toFixed(3)}`;
 }
 
 function ThreatCard({ alert, isSelected, onDecision }) {
   const [expanded, setExpanded] = useState(false);
   const [showDvEditor, setShowDvEditor] = useState(false);
-  const [customDv, setCustomDv] = useState(0.1);
+  const [customDv, setCustomDv] = useState(null);
   const [submitting, setSubmitting] = useState(false);
   const [decisionError, setDecisionError] = useState(null);
   const addDecisionLogEntry = useStore((s) => s.addDecisionLogEntry);
   const setSelectedAlertId = useStore((s) => s.setSelectedAlertId);
+  // Simulation clock: the timestamp of the latest propagated frame.
+  const snapshotTimestamp = useStore((s) => s.snapshotTimestamp);
 
-  const cpi = Number(alert.cpi_score ?? 0);
   const severity = severityLabel(alert);
-  const state = rowState(cpi, severity);
-  const pc = Number(alert.p_collision ?? alert.probability_of_collision ?? 0);
-  const tcaHours = Number(alert.tca_hours ?? (Number(alert.tca_minutes ?? NaN) / 60));
-  const { formatted, urgent, critical } = useTCACountdown(tcaHours, alert.tca_utc);
-  // Time pressure only colours the timer when the conjunction itself is risky;
-  // a low-risk WATCH pair at closest approach right now is not an emergency.
-  const tcaState = state === 'nominal' ? '' : critical ? 'is-warning' : urgent ? 'is-caution' : '';
-  const tcaText = formatted === '00:00:00' ? 'NOW' : formatted;
+  const state = severityState(severity);
+  const cpi = num(alert.cpi_score);
 
+  // ── Probability of collision (physics) + ML surrogate (secondary) ─────────
+  const pc = num(alert.probability_of_collision ?? alert.p_collision);
+  const pcMethod = alert.pc_method ? (PC_METHOD_LABEL[alert.pc_method] ?? String(alert.pc_method)) : null;
+  const ml = alert.ml && typeof alert.ml === 'object' ? alert.ml : null;
+  const mlPc = num(ml?.pc_surrogate);
+  const mlAgreement = num(ml?.agreement);
+
+  // ── Time to closest approach, measured on the simulation clock ────────────
+  const tcaMs = alert.tca_utc ? Date.parse(alert.tca_utc) : NaN;
+  const simNowMs = snapshotTimestamp ? Date.parse(snapshotTimestamp) : NaN;
+  let tcaHours = null;
+  if (Number.isFinite(tcaMs) && Number.isFinite(simNowMs)) {
+    tcaHours = Math.max(0, (tcaMs - simNowMs) / 3_600_000);
+  } else if (num(alert.tca_hours) != null) {
+    tcaHours = num(alert.tca_hours);
+  } else if (num(alert.tca_minutes) != null) {
+    tcaHours = num(alert.tca_minutes) / 60;
+  }
+  const { formatted, urgent, critical } = formatTCA(tcaHours);
+  // Time pressure only colours the timer when the conjunction itself is risky.
+  const tcaState = state === 'nominal' ? '' : critical ? 'is-warning' : urgent ? 'is-caution' : '';
+  const tcaText = tcaHours == null ? DASH : formatted === '00:00:00' ? 'NOW' : formatted;
+
+  // ── Objects ────────────────────────────────────────────────────────────────
   const sat1 = alert.sat1 ?? {};
   const sat2 = alert.sat2 ?? {};
-  const sat1Name = sat1.name ?? `#${sat1.id}`;
-  const sat2Name = sat2.name ?? `#${sat2.id}`;
-  const missKm = Number(alert.miss_distance_km ?? 0);
-  const relVelKmh = Number(alert.relative_speed_kmh ?? alert.relative_speed_kh ?? 0);
-  const relVelKms = (relVelKmh / 3600).toFixed(2);
-  const cascadeCount = alert.cascade_depth ?? 0;
-  const btKm = Number(alert.bt_km ?? alert.b_plane_bt_km ?? 0);
-  const bnKm = Number(alert.bn_km ?? alert.b_plane_bn_km ?? 0);
+  const sat1Name = sat1.name ?? (sat1.id != null ? `#${sat1.id}` : DASH);
+  const sat2Name = sat2.name ?? (sat2.id != null ? `#${sat2.id}` : DASH);
+  const isDebris = alert.source === 'debris';
+  const parentEvent = alert.parent_event && typeof alert.parent_event === 'object' ? alert.parent_event : null;
+
+  // ── Encounter geometry ────────────────────────────────────────────────────
+  const missKm = num(alert.miss_distance_km);
+  const relVelKms = num(alert.relative_speed_kms)
+    ?? (num(alert.relative_speed_kmh) != null ? num(alert.relative_speed_kmh) / 3600 : null);
+  const btKm = num(alert.b_t_km ?? alert.bt_km);
+  const bnKm = num(alert.b_n_km ?? alert.bn_km);
   const cov = alert.covariance_ellipse ?? {};
-  const semiMajorM = Number(cov.a ?? 3000);
-  const semiMinorM = Number(cov.b ?? 1000);
-  const angleRad = Number(cov.angle ?? 0);
-  const hbrKm = 0.010;
+  const semiMajorM = num(cov.a);
+  const semiMinorM = num(cov.b);
+  const angleRad = num(cov.angle);
+  const hbrKm = num(alert.hbr_km);
+  const hasBPlane = [btKm, bnKm, semiMajorM, semiMinorM, hbrKm].every((v) => v != null)
+    && semiMajorM > 0 && semiMinorM > 0;
 
-  const recManeuver = alert.recommended_maneuver ?? {};
-  const newMissKm = Number(recManeuver.new_miss_distance_km ?? missKm * 3);
-  const newPc = recManeuver.new_pc_collision ?? null;
-  const deltaV = Number(recManeuver.delta_v_ms ?? 0.1);
-  const fuelCost = Number(recManeuver.fuel_cost_pct ?? 0.5);
+  // ── Cascade ───────────────────────────────────────────────────────────────
+  const cascadeDepth = num(alert.cascade_depth);
+  const downstream = Array.isArray(alert.downstream_ids) ? alert.downstream_ids : null;
 
-  const handleDecision = async (decision, dv) => {
+  // ── Recommended manoeuvre (computed by re-propagation on the backend) ─────
+  const rec = alert.recommended_maneuver && typeof alert.recommended_maneuver === 'object'
+    ? alert.recommended_maneuver
+    : null;
+  const recDv = num(rec?.delta_v_ms);
+  const recRsw = Array.isArray(rec?.delta_v_rsw_ms) ? rec.delta_v_rsw_ms.map(Number) : null;
+  const recRswText = formatRsw(rec?.delta_v_rsw_ms);
+  const maneuverSatId = rec?.sat_id ?? sat1.id;
+  const maneuverSat = String(maneuverSatId) === String(sat2.id) ? sat2 : sat1;
+  const otherSat = maneuverSat === sat1 ? sat2 : sat1;
+  const maneuverSatName = maneuverSat.name ?? (maneuverSatId != null ? `#${maneuverSatId}` : DASH);
+  const verified = rec?.verified_by === 'repropagation';
+  const canApprove = rec != null && recDv != null && maneuverSatId != null;
+  const dvValue = customDv ?? recDv ?? 0.1;
+
+  const handleDecision = async (decision, dvOverride) => {
+    let deltaV = 0;
+    let rsw = [0, 0, 0];
+    if (decision === 'APPROVE') {
+      deltaV = recDv;
+      rsw = recRsw ?? [0, recDv, 0];
+    } else if (decision === 'MODIFY') {
+      deltaV = dvOverride;
+      // Keep the computed burn direction, rescaled; prograde if none computed.
+      const norm = recRsw ? Math.hypot(...recRsw) : 0;
+      rsw = norm > 0 ? recRsw.map((c) => (c / norm) * dvOverride) : [0, dvOverride, 0];
+    }
     const payload = {
       alert_id: alert.id,
-      sat1_id: sat1.id,
-      sat2_id: sat2.id,
+      // The manoeuvring satellite goes first: the handler burns sat1_id.
+      sat1_id: maneuverSatId,
+      sat2_id: otherSat.id,
+      sat_id: maneuverSatId,
       decision,
-      delta_v_ms: dv ?? deltaV,
+      delta_v_ms: deltaV,
+      delta_v_rsw_ms: rsw,
     };
 
     setSubmitting(true);
@@ -88,7 +160,8 @@ function ThreatCard({ alert, isSelected, onDecision }) {
       time: new Date().toISOString(),
       decision,
       alert_id: alert.id,
-      sat: sat1.name ?? 'unknown',
+      sat: maneuverSat.name ?? 'unknown',
+      delta_v_ms: deltaV,
     });
     setSubmitting(false);
     onDecision?.(decision, alert);
@@ -127,31 +200,39 @@ function ThreatCard({ alert, isSelected, onDecision }) {
             <span className="tq-pair-sep">/</span>
             {sat2Name}
           </span>
+          <span
+            className={`tq-src${isDebris ? ' is-debris' : ''}`}
+            title={isDebris && parentEvent
+              ? `Fragment of event ${parentEvent.event_id ?? DASH}`
+              : 'Found by future-window screening'}
+          >
+            {isDebris ? 'DEBRIS' : 'SCREENING'}
+          </span>
           <span className={`tq-sev is-${state}`}>{severity}</span>
           <span className="tq-chev" aria-hidden="true">{expanded ? '−' : '+'}</span>
         </div>
 
         <div className="tq-row-sub">
           {(sat1.agency || sat2.agency) && (
-            <span className="tq-agency">{sat1.agency ?? '—'} / {sat2.agency ?? '—'}</span>
+            <span className="tq-agency">{sat1.agency ?? DASH} / {sat2.agency ?? DASH}</span>
           )}
           {alert.tca_utc && (
             <span className="tq-utc">
-              TCA {alert.tca_utc.replace('T', ' ').substring(0, 19)}Z
+              TCA {String(alert.tca_utc).replace('T', ' ').substring(0, 19)}Z
             </span>
           )}
         </div>
 
         <div className="tq-metrics">
           <span className={`tq-tca ${tcaState}`}>{tcaText}</span>
-          <span className="tq-num">{missKm.toFixed(1)}</span>
-          <span className="tq-num">{formatPc(pc)}</span>
-          <span className="tq-num">{cascadeCount}</span>
-          <span className={`tq-num tq-cpi is-${state}`}>{cpi.toFixed(1)}</span>
+          <span className="tq-num">{fmt(missKm, 1)}</span>
+          <span className="tq-num" title={pcMethod ? `Physics Pc · ${pcMethod}` : 'Physics Pc'}>{formatPc(pc)}</span>
+          <span className="tq-num">{cascadeDepth == null ? DASH : cascadeDepth}</span>
+          <span className={`tq-num tq-cpi is-${state}`}>{fmt(cpi, 1)}</span>
         </div>
 
         <div className={`tq-meter is-${state}`} aria-hidden="true">
-          <div className="tq-meter-fill" style={{ width: `${Math.min(Math.max(cpi, 0) / 10, 1) * 100}%` }} />
+          <div className="tq-meter-fill" style={{ width: `${Math.min(Math.max(cpi ?? 0, 0) / 10, 1) * 100}%` }} />
         </div>
       </div>
 
@@ -160,59 +241,102 @@ function ThreatCard({ alert, isSelected, onDecision }) {
         <div className="tq-detail">
           <div className="tq-bplane">
             <span className="ui-label tq-section-label">B-Plane Geometry</span>
-            <BPlaneDiagram
-              btKm={btKm}
-              bnKm={bnKm}
-              semiMajorM={semiMajorM}
-              semiMinorM={semiMinorM}
-              angleRad={angleRad}
-              hbrKm={hbrKm}
-            />
-            <div className="tq-bplane-caption">
-              σa {semiMajorM.toFixed(0)} m · σb {semiMinorM.toFixed(0)} m
-            </div>
+            {hasBPlane ? (
+              <>
+                <BPlaneDiagram
+                  btKm={btKm}
+                  bnKm={bnKm}
+                  semiMajorM={semiMajorM}
+                  semiMinorM={semiMinorM}
+                  angleRad={angleRad ?? 0}
+                  hbrKm={hbrKm}
+                />
+                <div className="tq-bplane-caption">
+                  σa {semiMajorM.toFixed(0)} m · σb {semiMinorM.toFixed(0)} m
+                  {alert.sigma_source ? ` · σ from ${alert.sigma_source}` : ''}
+                </div>
+              </>
+            ) : (
+              <div className="tq-note">B-plane geometry not computed for this pair</div>
+            )}
           </div>
 
           <div>
             <span className="ui-label tq-section-label">Encounter</span>
             <dl className="tq-dl">
-              <dt>TCA (est)</dt><dd>{tcaHours.toFixed(1)} h</dd>
-              <dt>Miss distance</dt><dd>{missKm.toFixed(3)} km</dd>
-              <dt>Rel velocity</dt><dd>{relVelKms} km/s</dd>
-              <dt>Combined HBR</dt><dd>{hbrKm.toFixed(3)} km</dd>
-              <dt>B-plane Bt</dt><dd>{btKm.toFixed(3)} km</dd>
-              <dt>B-plane Bn</dt><dd>{bnKm.toFixed(3)} km</dd>
-              <dt>Method</dt><dd>Foster 1992</dd>
+              <dt>Source</dt>
+              <dd>{isDebris ? 'Debris fragment' : 'Screening'}</dd>
+              {isDebris && (
+                <>
+                  <dt>Parent event</dt>
+                  <dd title={parentEvent?.collision_utc ?? ''}>{parentEvent?.event_id ?? DASH}</dd>
+                  <dt>Parents</dt>
+                  <dd>{Array.isArray(parentEvent?.parent_ids) ? parentEvent.parent_ids.join(' × ') : DASH}</dd>
+                  <dt>Fragments</dt>
+                  <dd>{num(parentEvent?.fragment_count) ?? DASH}</dd>
+                </>
+              )}
+              <dt>TCA (sim)</dt><dd>{tcaHours == null ? DASH : `T-${tcaHours.toFixed(2)} h`}</dd>
+              <dt>Miss distance</dt><dd>{fmt(missKm, 3, ' km')}</dd>
+              <dt>Rel velocity</dt><dd>{fmt(relVelKms, 2, ' km/s')}</dd>
+              <dt>Pc (physics)</dt><dd>{formatPc(pc)}</dd>
+              <dt>Pc method</dt><dd>{pcMethod ?? DASH}</dd>
+              <dt>ML surrogate</dt>
+              <dd className="tq-dd-secondary" title={ml?.model ? `Model: ${ml.model}` : 'ML scoring not attached'}>
+                {ml
+                  ? `${formatPc(mlPc)}${ml.risk_class ? ` · ${ml.risk_class}` : ''}${mlAgreement != null ? ` · agree ${(mlAgreement * 100).toFixed(0)}%` : ''}`
+                  : 'not computed'}
+              </dd>
+              <dt>σ source</dt><dd>{alert.sigma_source ?? DASH}</dd>
+              <dt>Combined HBR</dt><dd>{hbrKm == null ? DASH : `${(hbrKm * 1000).toFixed(1)} m`}</dd>
+              <dt>B-plane Bt</dt><dd>{fmt(btKm, 3, ' km')}</dd>
+              <dt>B-plane Bn</dt><dd>{fmt(bnKm, 3, ' km')}</dd>
             </dl>
           </div>
 
           <div>
             <span className="ui-label tq-section-label">Recommended Maneuver</span>
+            {rec ? (
+              <>
+                <dl className="tq-dl">
+                  <dt>Satellite</dt><dd title={maneuverSatName}>{maneuverSatName}</dd>
+                  <dt>Δv RSW (m/s)</dt><dd title={recRswText ?? ''}>{recRswText ?? DASH}</dd>
+                  <dt>|Δv|</dt><dd>{fmt(recDv, 3, ' m/s')}</dd>
+                  <dt>Fuel cost</dt>
+                  <dd title={rec.fuel_model ? `Model: ${rec.fuel_model}` : ''}>{fmt(rec.fuel_cost_pct, 2, ' %')}</dd>
+                  <dt>New miss</dt><dd className="is-nominal">{fmt(rec.new_miss_distance_km, 3, ' km')}</dd>
+                  <dt>New Pc</dt><dd className="is-nominal">{formatPc(rec.new_pc_collision)}</dd>
+                </dl>
+                <div className={`tq-verify${verified ? ' is-verified' : ''}`}>
+                  {verified ? 'Verified by re-propagation' : 'Not verified by re-propagation'}
+                </div>
+              </>
+            ) : (
+              <div className="tq-note">No manoeuvre computed for this conjunction</div>
+            )}
+          </div>
+
+          <div>
+            <span className="ui-label tq-section-label">Cascade Impact</span>
             <dl className="tq-dl">
-              <dt>Satellite</dt><dd title={sat1Name}>{sat1Name}</dd>
-              <dt>Delta-V</dt><dd>{deltaV.toFixed(2)} m/s prograde</dd>
-              <dt>Fuel cost</dt><dd>{fuelCost.toFixed(1)} %</dd>
-              <dt>New miss</dt><dd className="is-nominal">{newMissKm.toFixed(2)} km</dd>
-              {newPc != null && (
+              <dt>Cascade depth</dt><dd>{cascadeDepth == null ? DASH : cascadeDepth}</dd>
+              <dt>Downstream</dt>
+              <dd title={downstream ? downstream.join(', ') : ''}>
+                {downstream == null ? DASH : `${downstream.length} object${downstream.length === 1 ? '' : 's'}`}
+              </dd>
+              {alert.upstream_event && (
                 <>
-                  <dt>New Pc</dt><dd className="is-nominal">{formatPc(newPc)}</dd>
+                  <dt>Upstream</dt><dd>{alert.upstream_event}</dd>
                 </>
               )}
             </dl>
           </div>
 
-          {cascadeCount > 0 && (
-            <div>
-              <span className="ui-label tq-section-label">Cascade Impact</span>
-              <div className="tq-note">
-                Maneuver affects {cascadeCount} other satellite{cascadeCount !== 1 ? 's' : ''}
-              </div>
-            </div>
-          )}
-
           {showDvEditor && (
             <div className="tq-dv">
-              <label className="ui-label" htmlFor={`tq-dv-${alert.id ?? 'unknown'}`}>Custom Delta-V (m/s)</label>
+              <label className="ui-label" htmlFor={`tq-dv-${alert.id ?? 'unknown'}`}>
+                Custom Δv (m/s){recRsw ? ' · along computed direction' : ' · prograde'}
+              </label>
               <div className="tq-dv-row">
                 <input
                   id={`tq-dv-${alert.id ?? 'unknown'}`}
@@ -221,16 +345,16 @@ function ThreatCard({ alert, isSelected, onDecision }) {
                   min={0.01}
                   max={2.0}
                   step={0.01}
-                  value={customDv}
+                  value={dvValue}
                   onChange={(e) => setCustomDv(Number(e.target.value))}
                 />
-                <span className="tq-dv-value">{customDv.toFixed(2)} m/s</span>
+                <span className="tq-dv-value">{dvValue.toFixed(2)} m/s</span>
               </div>
               <button
                 type="button"
                 className="ui-btn ui-btn--primary"
-                disabled={submitting}
-                onClick={() => handleDecision('MODIFY', customDv)}
+                disabled={submitting || maneuverSatId == null}
+                onClick={() => handleDecision('MODIFY', dvValue)}
               >
                 {submitting ? 'Submitting…' : 'Execute Modified Maneuver'}
               </button>
@@ -243,7 +367,8 @@ function ThreatCard({ alert, isSelected, onDecision }) {
             <button
               type="button"
               className="ui-btn ui-btn--primary"
-              disabled={submitting}
+              disabled={submitting || !canApprove}
+              title={canApprove ? 'Execute the computed manoeuvre' : 'No computed manoeuvre to approve'}
               onClick={() => handleDecision('APPROVE')}
             >
               Approve

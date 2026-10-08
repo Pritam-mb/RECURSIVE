@@ -37,9 +37,6 @@ class MLRuntime:
         self.shadow.record_snapshot(states, timestamp)
         self.shadow.settle_actuals(states, timestamp)
 
-    def forecast_satellite(self, norad_id: int, steps_ahead: int = 10) -> list[dict]:
-        return self.trajectory.predict(norad_id, steps_ahead=steps_ahead)
-
     def get_anomalies(self) -> dict[int, dict[str, Any]]:
         return self.anomaly.get_latest()
 

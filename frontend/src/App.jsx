@@ -47,6 +47,7 @@ function App() {
   const setSelectedSatelliteId = useStore((s) => s.setSelectedSatelliteId);
   const agencyFilter      = useStore((s) => s.agencyFilter);
   const cascadeGraph      = useStore((s) => s.cascadeGraph);
+  const cascadePlan       = useStore((s) => s.cascadePlan);
   const wsConnected       = useStore((s) => s.wsConnected);
 
   // Orbit path for the selected satellite (drawn by both globes).
@@ -87,11 +88,11 @@ function App() {
             graph: data.graph || {},
             alerts: data.alerts || [],
             cascade_plan: data.cascade_plan || [],
-            total_delta_v_ms: data.total_delta_v_ms || 0,
-            cascade_depth: data.cascade_depth || 0,
+            total_delta_v_ms: data.total_delta_v_ms ?? null,
+            cascade_depth: data.cascade_depth ?? null,
             agencies_involved: data.agencies_involved || [],
             seed_satellites: data.seed_satellites || [],
-            cpi_threshold: data.cpi_threshold || 5.0,
+            cpi_threshold: data.cpi_threshold ?? null,
             node_probabilities: data.node_probabilities || {},
           });
           setRankerReview(data.ranker_review || {});
@@ -143,11 +144,11 @@ function App() {
                 graph: data.graph || {},
                 alerts: data.alerts || [],
                 cascade_plan: data.cascade_plan || [],
-                total_delta_v_ms: data.total_delta_v_ms || 0,
-                cascade_depth: data.cascade_depth || 0,
+                total_delta_v_ms: data.total_delta_v_ms ?? null,
+                cascade_depth: data.cascade_depth ?? null,
                 agencies_involved: data.agencies_involved || [],
                 seed_satellites: data.seed_satellites || [],
-                cpi_threshold: data.cpi_threshold || 5.0,
+                cpi_threshold: data.cpi_threshold ?? null,
                 node_probabilities: data.node_probabilities || {},
               });
               setRankerReview(data.ranker_review || {});
@@ -184,11 +185,11 @@ function App() {
     };
   }, [setSatellites, setSnapshotTimestamp, setAlerts, setCascadePlan, setHotspots, setDebrisClouds, setModelMetrics, setWsConnected, setRankerReview]);
 
-  // ── Build cascade graph whenever alerts change ─────────────────────────────
+  // ── Build cascade graph from alerts + backend cascade plan ─────────────────
   useEffect(() => {
-    const graph = buildCascadeGraph(alerts);
+    const graph = buildCascadeGraph(alerts, cascadePlan);
     setCascadeGraph(graph);
-  }, [alerts, setCascadeGraph]);
+  }, [alerts, cascadePlan, setCascadeGraph]);
 
   return (
     <div className={`sh-app${wsConnected ? '' : ' is-offline'}`}>

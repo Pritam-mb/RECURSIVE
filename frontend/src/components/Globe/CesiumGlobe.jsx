@@ -5,6 +5,9 @@ import useStore from '../../store/useStore';
 import useTestMode from '../../hooks/useTestMode';
 import { computeGmst, eciToCesiumCartesian } from '../../utils/coords';
 import {
+  cloudCentroid, cloudEpoch, cloudFragments, cloudLabel, cloudRadius,
+} from '../../utils/debrisCloud';
+import {
   CORRECTION_DECAY_S,
   MAX_EXTRAPOLATION_S,
   correctionFor,
@@ -50,6 +53,7 @@ const COLORS = {
   hotspotZone: css(PALETTE.warning, 0.07),
   debrisCore: css(PALETTE.caution, 0.95),
   debrisText: css(PALETTE.caution, 1),
+  debrisFragment: css(PALETTE.caution, 0.75),
   approach: {
     nominal: css(PALETTE.nominal, 0.8),
     caution: css(PALETTE.caution, 0.85),
@@ -103,6 +107,7 @@ function freshPrimitives() {
     hotspotEntities: [],
     hotspotKey: null,
     debrisEntities: [],
+    debrisPoints: null,
     debrisKey: null,
     focusedItem: null,
     map: new Map(),
@@ -226,6 +231,7 @@ const CesiumGlobe = ({ mode = 'live', alerts = EMPTY, onSatelliteSelect }) => {
       prims.labels = scene.primitives.add(new Cesium.LabelCollection());
       prims.orbitLines = scene.primitives.add(new Cesium.PolylineCollection());
       prims.hotspotPoints = scene.primitives.add(new Cesium.PointPrimitiveCollection());
+      prims.debrisPoints = scene.primitives.add(new Cesium.PointPrimitiveCollection());
 
       prims.focusLabel = prims.labels.add({
         show: false,
@@ -674,42 +680,53 @@ const CesiumGlobe = ({ mode = 'live', alerts = EMPTY, onSatelliteSelect }) => {
     if (!viewerReady || !viewer || viewer.isDestroyed()) return;
     const prims = primitivesRef.current;
 
+    // Geometry comes only from the backend cloud: fragment centroid, the
+    // percentile radius of the real fragment spread, and the fragments themselves.
     const clouds = [];
     for (const cloud of debrisClouds || EMPTY) {
-      const center = cloud.center_eci_km || {};
-      if (![center.x, center.y, center.z].every((v) => Number.isFinite(Number(v)))) continue;
-      const rawShells = Array.isArray(cloud.shells) && cloud.shells.length > 0
-        ? cloud.shells
-        : [{ label: 'now', radius_km: Number(cloud.radius_km_now ?? cloud.radius_km_at_tca ?? 0) }];
-      const radii = rawShells
-        .map((s) => Number(s.radius_km))
-        .filter((r) => Number.isFinite(r) && r > 0)
-        .sort((a, b) => a - b);
-      if (radii.length === 0) continue;
-      clouds.push({ cloud, center, radii });
+      const center = cloudCentroid(cloud);
+      if (!center) continue;
+      const radius = cloudRadius(cloud);
+      const shellRadii = Array.isArray(cloud.shells)
+        ? cloud.shells.map((sh) => Number(sh?.radius_km)).filter((r) => Number.isFinite(r) && r > 0)
+        : [];
+      const radii = (shellRadii.length > 0 ? shellRadii : radius ? [radius.km] : []).sort((a, b) => a - b);
+      const fragments = cloudFragments(cloud, 300);
+      clouds.push({ cloud, center, radii, fragments, label: cloudLabel(cloud) });
     }
-    const key = clouds.map(({ cloud, center, radii }) => (
-      `${cloud.id}:${cloud.tca_utc}:${Math.round(center.x)},${Math.round(center.y)},${Math.round(center.z)}:${radii.map((r) => r.toFixed(0)).join(',')}:${cloud.fragment_count}`
+    const key = clouds.map(({ cloud, center, radii, fragments, label }) => (
+      `${cloud.id}:${cloudEpoch(cloud)}:${Math.round(center.x)},${Math.round(center.y)},${Math.round(center.z)}:${radii.map((r) => r.toFixed(1)).join(',')}:${fragments.length}:${label}`
     )).join('|');
     if (key === prims.debrisKey) return;
     prims.debrisKey = key;
 
     for (const entity of prims.debrisEntities) viewer.entities.remove(entity);
     prims.debrisEntities = [];
+    if (prims.debrisPoints) prims.debrisPoints.removeAll();
 
     viewer.entities.suspendEvents();
     // The same event can arrive from both the forecast and fragment sources;
     // label it once so identical tags don't stack on top of each other.
     const labelled = new Set();
-    for (const { cloud, center, radii } of clouds) {
-      const date = cloud.tca_utc ? new Date(cloud.tca_utc) : new Date();
+    for (const { cloud, center, radii, fragments, label } of clouds) {
+      const epoch = cloudEpoch(cloud);
+      const date = epoch ? new Date(epoch) : new Date();
       const position = toCartesian3(center, date);
-      const outerKm = radii[radii.length - 1];
-      const labelText = `DEBRIS  ${cloud.fragment_count ?? 0} FRAG  R ${outerKm.toFixed(0)} KM`;
-      const showLabel = !labelled.has(labelText);
-      labelled.add(labelText);
+      const showLabel = !labelled.has(label);
+      labelled.add(label);
 
-      // Faint nested shells; innermost slightly denser.
+      // Real fragment positions (downsampled ≤ 300 by the backend / here).
+      if (prims.debrisPoints) {
+        for (const frag of fragments) {
+          prims.debrisPoints.add({
+            position: toCartesian3(frag, date),
+            pixelSize: 2,
+            color: COLORS.debrisFragment,
+          });
+        }
+      }
+
+      // Faint percentile shell(s); innermost slightly denser.
       radii.forEach((radiusKm, index) => {
         const t = radii.length > 1 ? 1 - (index / (radii.length - 1)) : 1;
         const r = radiusKm * 1000;
@@ -717,7 +734,7 @@ const CesiumGlobe = ({ mode = 'live', alerts = EMPTY, onSatelliteSelect }) => {
           position,
           ellipsoid: {
             radii: new Cesium.Cartesian3(r, r, r),
-            material: css(PALETTE.caution, 0.04 + (0.06 * t)),
+            material: css(PALETTE.caution, 0.03 + (0.04 * t)),
             outline: false,
             slicePartitions: 24,
             stackPartitions: 12,
@@ -734,7 +751,7 @@ const CesiumGlobe = ({ mode = 'live', alerts = EMPTY, onSatelliteSelect }) => {
           outlineWidth: 1,
         },
         label: showLabel ? {
-          text: labelText,
+          text: label,
           font: SMALL_LABEL_FONT,
           fillColor: COLORS.debrisText,
           style: Cesium.LabelStyle.FILL,

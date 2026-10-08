@@ -267,9 +267,12 @@ def load_or_train_trajectory_model(retrain: bool = False) -> RecurrentTrajectory
 
 class LSTMPredictor:
     """
-    Trajectory forecaster backed by a compact recurrent model trained on
-    synthetic orbital arcs. It keeps the existing interface stable while
-    replacing the linear extrapolation mock.
+    EXPERIMENTAL trajectory forecaster: a compact numpy tanh RNN (not an
+    LSTM) trained on synthetic circular arcs. On held-out arcs it is worse
+    than both persistence and linear extrapolation (see
+    artifacts/risk_model_card.json -> trajectory_model), so nothing in the
+    alert / Pc / manoeuvre path uses it; SGP4 is the propagator of record.
+    Only constructed when ENABLE_EXTENDED_PIPELINE=1.
     """
 
     def __init__(self, model_path: str = None):

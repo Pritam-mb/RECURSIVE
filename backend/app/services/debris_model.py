@@ -1,63 +1,62 @@
 """
-Debris cloud modeling for post-collision alerts.
-Uses a simple isotropic expansion model suitable for real-time risk messaging.
+Forecast debris clouds for predicted (not yet happened) high-risk conjunctions.
+
+For each hotspot above the CPI threshold whose two objects are present in
+``states`` (states propagated to the hotspot TCA by the caller), the NASA
+Standard Breakup Model (app.core.breakup) is run on the actual pair state:
+masses from SATCAT / documented defaults, relative velocity from the states.
+The expected SBM fragment count is reported, and a sample of fragments is
+propagated (RK4, two-body + J2 + drag) to measure the cloud's 90th-percentile
+radius at fixed times after the hypothetical breakup.  Nothing here is a
+constant presented as a result; every cloud is labelled ``kind: "forecast"``.
+
+Fragment clouds that exist because a breakup was simulated come from
+``app.core.debris_model`` (re-exported below for the contract).
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import zlib
 from datetime import datetime, timezone
 from typing import Any
 
 import numpy as np
-from scipy.integrate import solve_ivp
 from scipy.spatial import cKDTree
 
+from app.core import breakup as sbm
+from app.core.debris_model import (  # noqa: F401  (contract re-exports)
+    compute_debris_alerts,
+    debris_model,
+    get_frontend_debris_clouds,
+    object_physical_properties,
+    simulate_collision_from_pair,
+)
 
-@dataclass
-class DebrisCloud:
-    id: str
-    tca_utc: str
-    minutes_to_tca: float
-    center_eci_km: dict[str, float]
-    radius_km_now: float
-    radius_km_at_tca: float
-    max_radius_km: float
-    fragment_count: int
-    affected_satellites: list[dict[str, Any]]
-    affected_count: int
-    affected_high_risk: int
-    radius_timeline: list[dict[str, float]]
-    shells: list[dict[str, Any]]
+FORECAST_SAMPLE_FRAGMENTS = 300
+FORECAST_TIMELINE_MIN = (10.0, 45.0, 90.0)   # minutes after the hypothetical breakup
+MAX_FORECAST_CLOUDS = 8
 
 
 def _build_cpi_lookup(alerts: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:
     lookup: dict[int, dict[str, Any]] = {}
     for alert in alerts:
-        sat1 = alert.get("sat1", {})
-        sat2 = alert.get("sat2", {})
-        cpi_score = float(alert.get("cpi_score", 0.0))
+        cpi_score = float(alert.get("cpi_score", 0.0) or 0.0)
         severity = alert.get("severity", "none")
-
-        for sat in (sat1, sat2):
+        for sat in (alert.get("sat1", {}), alert.get("sat2", {})):
             sat_id = sat.get("id")
             if sat_id is None:
                 continue
             existing = lookup.get(sat_id)
             if existing is None or cpi_score > float(existing.get("cpi_score", 0.0)):
-                lookup[sat_id] = {
-                    "cpi_score": round(cpi_score, 2),
-                    "severity": severity,
-                }
+                lookup[sat_id] = {"cpi_score": round(cpi_score, 2), "severity": severity}
     return lookup
 
 
 def _parse_utc(value: str | None, fallback: datetime) -> datetime:
     if not value:
         return fallback
-    cleaned = value.replace("Z", "+00:00")
     try:
-        parsed = datetime.fromisoformat(cleaned)
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
     except ValueError:
         return fallback
     if parsed.tzinfo is None:
@@ -65,75 +64,34 @@ def _parse_utc(value: str | None, fallback: datetime) -> datetime:
     return parsed.astimezone(timezone.utc)
 
 
-def _radius_at_time(
-    seconds_since_collision: float,
-    base_radius_km: float,
-    expansion_rate_mps: float,
-    max_radius_km: float,
-) -> float:
-    radius_km = base_radius_km + max(0.0, seconds_since_collision) * (expansion_rate_mps / 1000.0)
-    return float(min(radius_km, max_radius_km))
-
-
-def _integrate_radius_rk45(
-    seconds: float,
-    base_radius_km: float,
-    expansion_rate_mps: float,
-    max_radius_km: float,
-    decay_tau_s: float,
-) -> float:
-    if seconds <= 0:
-        return float(base_radius_km)
-
-    v0_kms = max(0.0, expansion_rate_mps / 1000.0)
-
-    def dynamics(_t: float, y: np.ndarray) -> np.ndarray:
-        radius_km, velocity_kms = y
-        dv_dt = -velocity_kms / max(decay_tau_s, 1.0)
-        dr_dt = velocity_kms
-        return np.array([dr_dt, dv_dt], dtype=float)
-
-    y0 = np.array([base_radius_km, v0_kms], dtype=float)
-
-    try:
-        solution = solve_ivp(
-            dynamics,
-            (0.0, float(seconds)),
-            y0,
-            method="RK45",
-            t_eval=[float(seconds)],
-            rtol=1e-6,
-            atol=1e-8,
-        )
-        if solution.success and solution.y.shape[1] == 1:
-            radius = float(solution.y[0, 0])
-        else:
-            radius = _radius_at_time(seconds, base_radius_km, expansion_rate_mps, max_radius_km)
-    except Exception:
-        radius = _radius_at_time(seconds, base_radius_km, expansion_rate_mps, max_radius_km)
-
-    return float(min(radius, max_radius_km))
-
-
-def _build_radius_timeline(
-    checkpoints_minutes: list[float],
-    base_radius_km: float,
-    expansion_rate_mps: float,
-    max_radius_km: float,
-    decay_tau_s: float,
-) -> list[dict[str, float]]:
+def forecast_breakup_cloud(r_a, v_a, id_a, name_a, r_b, v_b, id_b, name_b, *, seed: int,
+                           sample: int = FORECAST_SAMPLE_FRAGMENTS,
+                           timeline_min=FORECAST_TIMELINE_MIN) -> dict[str, Any]:
+    """Run the SBM on a predicted pair state and measure the cloud spread."""
+    pa = object_physical_properties(id_a, name_a)
+    pb = object_physical_properties(id_b, name_b)
+    res = sbm.simulate_breakup(r_a, v_a, pa["mass_kg"], r_b, v_b, pb["mass_kg"], seed=seed,
+                               rocket_body_a=pa["object_type"] == "R/B",
+                               rocket_body_b=pb["object_type"] == "R/B",
+                               max_fragments=sample)
+    bc = sbm.DEFAULT_CD * res.am_m2_kg
+    r, v = res.r_km, res.v_kms
+    t_prev = 0.0
     timeline = []
-    for minutes in checkpoints_minutes:
-        seconds = max(0.0, float(minutes) * 60.0)
-        radius = _integrate_radius_rk45(
-            seconds,
-            base_radius_km,
-            expansion_rate_mps,
-            max_radius_km,
-            decay_tau_s,
-        )
-        timeline.append({"minutes": float(minutes), "radius_km": round(radius, 3)})
-    return timeline
+    for minutes in timeline_min:
+        r, v = sbm.propagate(r, v, bc, (minutes - t_prev) * 60.0, max_step_s=30.0)
+        t_prev = minutes
+        rn = np.linalg.norm(r, axis=1)
+        ok = np.isfinite(rn) & (rn - sbm.R_EARTH_KM > sbm.REENTRY_ALT_KM)
+        if ok.sum() >= 3:
+            c = r[ok].mean(axis=0)
+            d = np.linalg.norm(r[ok] - c, axis=1)
+            p90 = float(np.percentile(d, 90))
+            p50 = float(np.percentile(d, 50))
+        else:
+            p90 = p50 = 0.0
+        timeline.append({"minutes": float(minutes), "radius_km": round(p90, 3), "radius_p50_km": round(p50, 3)})
+    return {"result": res, "parents": [pa, pb], "timeline": timeline}
 
 
 def build_debris_alerts(
@@ -143,118 +101,97 @@ def build_debris_alerts(
     alerts: list[dict[str, Any]] | None = None,
     cpi_threshold: float = 7.0,
     max_tca_minutes: float = 180.0,
-    base_radius_km: float = 1.5,
-    expansion_rate_mps: float = 80.0,
-    max_radius_km: float = 1500.0,
-    fragment_count: int = 420,
-    integration_hours: float = 24.0,
-    decay_tau_s: float = 5400.0,
+    **_ignored: Any,
 ) -> list[dict[str, Any]]:
-    """Create debris cloud alerts from high-risk hotspots."""
-
+    """Forecast clouds for imminent high-CPI hotspots (signature kept for callers)."""
     if not hotspots or not states:
         return []
 
     now = _parse_utc(snapshot_timestamp, datetime.now(timezone.utc))
     cpi_lookup = _build_cpi_lookup(alerts or [])
 
-    # Build a KD-tree for current satellite positions to find affected neighbors.
-    positions = []
-    sat_meta = []
+    positions, velocities, meta, index = [], [], [], {}
     for state in states:
         if getattr(state, "error_code", 0) != 0:
             continue
+        index[int(state.norad_id)] = len(positions)
         positions.append([float(state.x), float(state.y), float(state.z)])
-        sat_meta.append({"norad_id": state.norad_id, "name": state.name})
-
+        velocities.append([float(state.vx), float(state.vy), float(state.vz)])
+        meta.append({"norad_id": state.norad_id, "name": state.name})
     if not positions:
         return []
+    positions = np.array(positions)
+    velocities = np.array(velocities)
+    tree = cKDTree(positions)
 
-    tree = cKDTree(np.array(positions, dtype=float))
-    cloud_alerts: list[dict[str, Any]] = []
-
-    for idx, hotspot in enumerate(hotspots[:8]):
-        cpi_score = float(hotspot.get("cpi_score", 0.0))
+    clouds: list[dict[str, Any]] = []
+    for hotspot in hotspots:
+        if len(clouds) >= MAX_FORECAST_CLOUDS:
+            break
+        cpi_score = float(hotspot.get("cpi_score", 0.0) or 0.0)
         tca_minutes = hotspot.get("tca_minutes")
         if cpi_score < cpi_threshold:
             continue
         if tca_minutes is not None and float(tca_minutes) > max_tca_minutes:
             continue
-
-        position = hotspot.get("position") or {}
-        center = {
-            "x": float(position.get("x", 0.0)),
-            "y": float(position.get("y", 0.0)),
-            "z": float(position.get("z", 0.0)),
-        }
-
-        tca_utc = hotspot.get("tca_utc")
-        tca_time = _parse_utc(tca_utc, now)
+        id_a = (hotspot.get("sat1") or {}).get("id")
+        id_b = (hotspot.get("sat2") or {}).get("id")
+        if id_a is None or id_b is None or int(id_a) not in index or int(id_b) not in index:
+            continue
+        ia, ib = index[int(id_a)], index[int(id_b)]
+        tca_time = _parse_utc(hotspot.get("tca_utc"), now)
         minutes_to_tca = max(0.0, (tca_time - now).total_seconds() / 60.0)
+        seed = zlib.crc32(f"forecast-{min(id_a, id_b)}-{max(id_a, id_b)}-{tca_time:%Y%m%dT%H%M}".encode())
+        fc = forecast_breakup_cloud(positions[ia], velocities[ia], int(id_a), meta[ia]["name"],
+                                    positions[ib], velocities[ib], int(id_b), meta[ib]["name"], seed=seed)
+        res = fc["result"]
+        timeline = fc["timeline"]
+        center_vec = res.impact_point_km
+        center = {"x": float(center_vec[0]), "y": float(center_vec[1]), "z": float(center_vec[2])}
+        radius_ref = timeline[1]["radius_km"] if len(timeline) > 1 else timeline[0]["radius_km"]
 
-        radius_now = _integrate_radius_rk45(0.0, base_radius_km, expansion_rate_mps, max_radius_km, decay_tau_s)
-        radius_at_tca = _integrate_radius_rk45(
-            minutes_to_tca * 60.0,
-            base_radius_km,
-            expansion_rate_mps,
-            max_radius_km,
-            decay_tau_s,
-        )
+        affected, high = [], 0
+        for hit in tree.query_ball_point(center_vec, r=max(radius_ref, 1.0)):
+            m = meta[hit]
+            if m["norad_id"] in (id_a, id_b):
+                continue
+            info = cpi_lookup.get(m["norad_id"], {})
+            cpi = float(info.get("cpi_score", 0.0))
+            band = "high" if cpi >= 7.0 else "medium" if cpi >= 5.0 else "low"
+            high += band == "high"
+            affected.append({**m, "cpi_score": round(cpi, 2), "severity": info.get("severity", "none"),
+                             "risk_band": band, "recommended_action": "fallback" if band == "high" else "monitor",
+                             "exposure_basis": f"inside p90 forecast radius at +{timeline[1]['minutes']:.0f} min"})
 
-        tca_minutes_safe = max(0.0, float(minutes_to_tca))
-        mid_minutes = tca_minutes_safe * 0.5
-        timeline_minutes = [0.0, mid_minutes, tca_minutes_safe]
-        radius_timeline = _build_radius_timeline(
-            timeline_minutes,
-            base_radius_km,
-            expansion_rate_mps,
-            max_radius_km,
-            decay_tau_s,
-        )
-
-        shells = [
-            {"label": "now", "minutes": radius_timeline[0]["minutes"], "radius_km": radius_timeline[0]["radius_km"]},
-            {"label": "mid", "minutes": radius_timeline[1]["minutes"], "radius_km": radius_timeline[1]["radius_km"]},
-            {"label": "tca", "minutes": radius_timeline[2]["minutes"], "radius_km": radius_timeline[2]["radius_km"]},
-        ]
-
-        affected_indices = tree.query_ball_point([center["x"], center["y"], center["z"]], r=radius_at_tca)
-        affected = []
-        high_risk_count = 0
-        for idx_hit in affected_indices:
-            meta = sat_meta[idx_hit]
-            cpi_info = cpi_lookup.get(meta["norad_id"], {})
-            cpi_score = float(cpi_info.get("cpi_score", 0.0))
-            risk_band = "high" if cpi_score >= 7.0 else "medium" if cpi_score >= 5.0 else "low"
-            recommended_action = "fallback" if risk_band == "high" else "monitor"
-            if risk_band == "high":
-                high_risk_count += 1
-            affected.append(
-                {
-                    **meta,
-                    "cpi_score": round(cpi_score, 2),
-                    "severity": cpi_info.get("severity", "none"),
-                    "risk_band": risk_band,
-                    "recommended_action": recommended_action,
-                }
-            )
-
-        cloud = DebrisCloud(
-            id=f"debris-{idx + 1}",
-            tca_utc=tca_time.isoformat(),
-            minutes_to_tca=round(minutes_to_tca, 2),
-            center_eci_km=center,
-            radius_km_now=round(radius_now, 3),
-            radius_km_at_tca=round(radius_at_tca, 3),
-            max_radius_km=max_radius_km,
-            fragment_count=fragment_count,
-            affected_satellites=affected,
-            affected_count=len(affected),
-            affected_high_risk=high_risk_count,
-            radius_timeline=radius_timeline,
-            shells=shells,
-        )
-
-        cloud_alerts.append(cloud.__dict__)
-
-    return cloud_alerts
+        clouds.append({
+            "id": f"forecast-{min(id_a, id_b)}-{max(id_a, id_b)}",
+            "kind": "forecast",
+            "tca_utc": tca_time.isoformat(),
+            "epoch_utc": tca_time.isoformat(),
+            "minutes_to_tca": round(minutes_to_tca, 2),
+            "center_eci_km": center,
+            "centroid_eci_km": center,
+            "radius_km_now": 0.0,
+            "radius_km_at_tca": radius_ref,
+            "radius_p90_km": radius_ref,
+            "percentile_radius_km": radius_ref,
+            "radius_percentile": 90,
+            "radius_reference_minutes_after_breakup": timeline[1]["minutes"] if len(timeline) > 1 else timeline[0]["minutes"],
+            "max_radius_km": timeline[-1]["radius_km"],
+            "fragment_count": res.n_total,
+            "fragment_count_basis": "expected SBM N(>=10 cm) if this pair collides",
+            "is_catastrophic": res.catastrophic,
+            "emr_j_per_g": round(res.emr_j_per_g, 2),
+            "parent_ids": [int(id_a), int(id_b)],
+            "parent_mass_kg": [fc["parents"][0]["mass_kg"], fc["parents"][1]["mass_kg"]],
+            "mass_source": [fc["parents"][0]["mass_source"], fc["parents"][1]["mass_source"]],
+            "seed": res.seed,
+            "fragments": [],
+            "affected_satellites": affected,
+            "affected_count": len(affected),
+            "affected_high_risk": int(high),
+            "radius_timeline": timeline,
+            "shells": [{"label": f"+{t['minutes']:.0f}m", "minutes": t["minutes"], "radius_km": max(t["radius_km"], 1.0)}
+                       for t in timeline],
+        })
+    return clouds

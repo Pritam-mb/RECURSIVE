@@ -9,7 +9,7 @@ import logging
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
@@ -17,12 +17,12 @@ from dotenv import load_dotenv
 from app.core.sgp4_propagator import SGP4Propagator
 from app.core.agency import infer_agency
 from app.core import sim_clock
-from app.core.conjunction import screen_conjunctions
+from app.core.screening import screen as screen_alerts, set_default_propagator
 from app.core.state_cache import (
     get_latest_snapshot,
     set_latest_alerts,
     set_latest_snapshot,
-    get_all_kalman_states,
+    get_all_kalman_states,  # noqa: F401  (diagnostics only; never used for Pc)
 )
 from app.data.tle_fetcher import fetch_tles
 from app.simulation.sim_engine import SimEngine
@@ -182,181 +182,237 @@ def _alert_pair_key(alert: dict) -> tuple:
     return (sat1, sat2) if sat1 <= sat2 else (sat2, sat1)
 
 
-def _normalize_screened_alert(alert: dict) -> dict:
-    """Project a screened ConjunctionAlert onto the richer graph-edge shape.
+# Fields computed by physics (screening / debris propagation). When the cascade
+# planner returns its own alert for the same pair, these values are NOT
+# overwritten; the planner only adds enrichment (cascade depth, manoeuvre...).
+_PHYSICS_KEYS = frozenset({
+    "id", "source", "sat1", "sat2", "tca_utc", "tca_hours", "tca_minutes",
+    "miss_distance_km", "relative_speed_kmh", "relative_speed_kms",
+    "probability_of_collision", "p_collision", "pc_method", "hbr_km",
+    "covariance_ellipse", "b_t_km", "b_n_km", "bt_km", "bn_km", "sigma_source",
+    "severity", "cpi_score", "tle_age_days", "short_encounter_valid",
+    "parent_event", "fragment_id", "tca_position_km",
+})
 
-    The cascade planner emits graph alerts that carry predicted TCA, CPI,
-    p_collision, hotspot score and a hotspot position. Screened alerts carry the
-    measured miss distance, real collision probability, TCA and severity but no
-    hotspot geometry. The frontend reads the graph shape (with fallbacks), so
-    screened alerts are projected onto it before being emitted.
+
+def _tca_hours_from_utc(tca_utc, reference: datetime | None):
+    if not tca_utc or reference is None:
+        return None
+    try:
+        tca_dt = datetime.fromisoformat(str(tca_utc))
+        if tca_dt.tzinfo is None:
+            tca_dt = tca_dt.replace(tzinfo=timezone.utc)
+        ref = reference if reference.tzinfo else reference.replace(tzinfo=timezone.utc)
+        return max(0.0, (tca_dt - ref).total_seconds() / 3600.0)
+    except Exception:
+        return None
+
+
+def _normalize_screened_alert(alert: dict, reference: datetime | None = None) -> dict:
+    """Project a physics alert (screening or debris) onto the graph-edge shape.
+
+    All computed fields are preserved verbatim. tca_hours is never invented:
+    if absent it is derived from tca_utc against the simulation epoch, else
+    left as None. Graph-only fields get neutral defaults, and the hotspot
+    position is the computed midpoint of the two objects at TCA when known.
     """
-    tca_utc = alert.get("tca_utc")
-    tca_hours = alert.get("tca_hours")
+    out = dict(alert)
+    tca_hours = out.get("tca_hours")
     if tca_hours is None:
-        tca_hours = 12.0
-    tca_hours = float(tca_hours)
-    tca_minutes = alert.get("tca_minutes")
-    if tca_minutes is None:
-        tca_minutes = tca_hours * 60.0
-    tca_minutes = float(tca_minutes)
-    p_collision = alert.get("probability_of_collision", 0.0)
-
-    return {
-        "id": alert.get("id"),
-        "sat1": alert.get("sat1", {}),
-        "sat2": alert.get("sat2", {}),
-        "miss_distance_km": alert.get("miss_distance_km"),
-        "relative_speed_kmh": alert.get("relative_speed_kmh"),
-        "tca_utc": tca_utc,
-        "tca_hours": round(tca_hours, 3),
-        "tca_minutes": round(tca_minutes, 2),
-        "severity": alert.get("severity", "none"),
-        "cpi_score": alert.get("cpi_score", 0.0),
-        "p_collision": p_collision,
-        "probability_of_collision": p_collision,
-        "hotspot_score": 0.0,
-        "influence_weight": 0.0,
-        "position": None,
-        "zone_radius_km": 100.0,
-        "covariance_ellipse": alert.get("covariance_ellipse"),
-        "source": "screening",
-    }
+        tca_hours = _tca_hours_from_utc(out.get("tca_utc"), reference)
+    if tca_hours is not None:
+        tca_hours = float(tca_hours)
+        out["tca_hours"] = round(tca_hours, 4)
+        if out.get("tca_minutes") is None:
+            out["tca_minutes"] = round(tca_hours * 60.0, 2)
+    else:
+        out["tca_hours"] = None
+        out.setdefault("tca_minutes", None)
+    pc = out.get("probability_of_collision", out.get("p_collision", 0.0))
+    out["probability_of_collision"] = pc
+    out["p_collision"] = pc
+    out.setdefault("severity", "WATCH")
+    out.setdefault("cpi_score", 0.0)
+    out.setdefault("hotspot_score", 0.0)
+    out.setdefault("influence_weight", 0.0)
+    pos = out.get("position")
+    if pos is None and out.get("tca_position_km"):
+        x, y, z = out["tca_position_km"]
+        pos = {"x": x, "y": y, "z": z}
+    out["position"] = pos
+    out.setdefault("zone_radius_km", 100.0)
+    out.setdefault("covariance_ellipse", None)
+    out.setdefault("source", "screening")
+    return out
 
 
 def merge_alert_sources(
     graph_alerts: list[dict] | None,
     screened_alerts: list[dict] | None,
+    reference: datetime | None = None,
 ) -> list[dict]:
-    """Combine graph-edge alerts and screened alerts into one consistent list.
+    """Union physics alerts (screening + debris) with cascade-graph alerts.
 
-    Screening uses the wider WATCH_DISTANCE_KM (500 km) while the cascade graph
-    only keeps pairs inside DEFAULT_INFLUENCE_RADIUS_KM (200 km). Returning only
-    the graph list therefore hid every conjunction between 200 km and 500 km,
-    and the response reported a `count` derived from screening next to a list
-    derived from the graph. The two sources are now unioned, graph entries win
-    on duplicate pairs, and the caller can derive `count` from the result.
+    One entry per pair. Physics alerts are authoritative for every computed
+    field (_PHYSICS_KEYS); a cascade-graph alert for the same pair contributes
+    only its enrichment fields (cascade_depth, downstream_ids,
+    recommended_maneuver, hotspot geometry, ...). Graph-only pairs are kept
+    with source "cascade_graph".
     """
     merged: list[dict] = []
-    seen: set[tuple] = set()
+    index: dict[tuple, int] = {}
+
+    for alert in screened_alerts or []:
+        key = _alert_pair_key(alert) or (alert.get("id"),)
+        if key in index:
+            continue
+        index[key] = len(merged)
+        merged.append(_normalize_screened_alert(alert, reference))
 
     for alert in graph_alerts or []:
         key = _alert_pair_key(alert)
-        if key in seen:
+        if key and key in index:
+            target = merged[index[key]]
+            for k, v in alert.items():
+                if k not in _PHYSICS_KEYS and (k not in target or target.get(k) in (None, 0.0, [], {})):
+                    target[k] = v
             continue
-        seen.add(key)
+        if key:
+            index[key] = len(merged)
         merged.append({**alert, "source": alert.get("source", "cascade_graph")})
-
-    for alert in screened_alerts or []:
-        key = _alert_pair_key(alert)
-        if key in seen:
-            continue
-        seen.add(key)
-        merged.append(_normalize_screened_alert(alert))
 
     return merged
 
 
-async def refresh_alerts_once():
-    """Refresh conjunction alerts at a slower cadence to avoid blocking startup.
+def _compute_debris_alerts(states, sim_now):
+    """Agent B's fragment-vs-catalogue alerts (feature-detected)."""
+    for mod_name in ("app.services.debris_model", "app.core.debris_model"):
+        try:
+            mod = __import__(mod_name, fromlist=["compute_debris_alerts"])
+        except Exception:
+            continue
+        fn = getattr(mod, "compute_debris_alerts", None)
+        if fn is None:
+            obj = getattr(mod, "debris_model", None)
+            fn = getattr(obj, "compute_debris_alerts", None)
+        if fn is not None:
+            return list(fn(states, sim_now) or [])
+    return []
 
-    ENABLE_EXTENDED_PIPELINE gates only the optional heavy ML runtime and the
-    Kafka publisher. Conjunction screening, cascade planning, hotspot generation
-    and debris building are core product behaviour and always run.
+
+def _attach_ml(alerts: list[dict]) -> None:
+    """Agent D's ML surrogate (never replaces the physics Pc)."""
+    try:
+        from app.ml.risk_api import score_alert
+    except Exception:
+        for a in alerts:
+            a.setdefault("ml", None)
+        return
+    for a in alerts:
+        try:
+            a["ml"] = score_alert(a)
+        except Exception as exc:
+            logger.debug("score_alert failed for %s: %s", a.get("id"), exc)
+            a["ml"] = None
+
+
+async def refresh_alerts_once():
+    """Refresh conjunction alerts at a slower cadence (ALERT_REFRESH_SECONDS).
+
+    Screens ALL tracked objects (catalogue + injected scenario objects) over a
+    future window on the SIMULATION clock (app.core.screening.screen), adds
+    debris-fragment alerts (agent B), ML surrogate scores (agent D), then runs
+    the cascade planner (agent C) and publishes. Heavy work runs in threads.
+    ENABLE_EXTENDED_PIPELINE gates only the optional ML runtime and Kafka.
     """
-    max_alert_states = 250
     try:
         snapshot = get_latest_snapshot()
         states = snapshot.get("states", [])
-        alerts = []
-        sampled_states = []
-        cascade_summary = {
-            "graph": {"node_count": 0, "edge_count": 0, "influence_radius_km": 200.0},
-            "alerts": [],
-            "cascade_plan": [],
-            "total_delta_v_ms": 0.0,
-            "cascade_depth": 0,
-            "agencies_involved": [],
-            "seed_satellites": [],
-            "cpi_threshold": 5.0,
-            "node_probabilities": {},
+        if not states:
+            return
+        stamp = snapshot.get("timestamp")
+        sim_now = datetime.fromisoformat(stamp) if stamp else sim_clock.simulation_now()
+        if sim_now.tzinfo is None:
+            sim_now = sim_now.replace(tzinfo=timezone.utc)
+
+        screen_stats: dict = {}
+        screened = await asyncio.to_thread(
+            screen_alerts, states, sim_now, propagator=propagator, stats=screen_stats,
+        )
+        screened = list(screened or [])
+
+        debris_alerts: list[dict] = []
+        try:
+            debris_alerts = await asyncio.to_thread(_compute_debris_alerts, states, sim_now)
+        except Exception as exc:
+            logger.warning("compute_debris_alerts failed: %s", exc)
+
+        physics_alerts = screened + debris_alerts
+        _attach_ml(physics_alerts)
+
+        cascade_summary = await asyncio.to_thread(
+            cascade_planner.analyze_snapshot,
+            states,
+            physics_alerts,
+            propagator,
+            sim_now,
+        )
+
+        merged_alerts = merge_alert_sources(
+            cascade_summary.get("alerts", []),
+            physics_alerts,
+            reference=sim_now,
+        )
+
+        debris_context_states = states
+        top_hotspot_tca = None
+        for hotspot in cascade_summary.get("hotspots", []):
+            if hotspot.get("tca_utc"):
+                top_hotspot_tca = hotspot["tca_utc"]
+                break
+        if top_hotspot_tca:
+            debris_context_states = await asyncio.to_thread(
+                propagate_states_to, propagator, states, top_hotspot_tca,
+            )
+
+        debris_clouds = build_debris_alerts(
+            cascade_summary.get("hotspots", []),
+            debris_context_states,
+            stamp,
+            alerts=merged_alerts,
+            cpi_threshold=cascade_summary.get("cpi_threshold", 5.0),
+        )
+        hotspots = cascade_summary.get("hotspots", [])
+        enrich_payload_with_geodetic({"hotspots": hotspots, "debris_clouds": debris_clouds}, sim_now)
+
+        alerts_payload = {
+            "type": "alerts",
+            "timestamp": stamp,
+            "alerts": merged_alerts,
+            "count": len(merged_alerts),
+            "screened_count": len(screened),
+            "debris_alert_count": len(debris_alerts),
+            "graph_alert_count": len(cascade_summary.get("alerts", [])),
+            "screening": screen_stats,
+            "hotspots": hotspots,
+            "graph": cascade_summary.get("graph", {}),
+            "cascade_plan": cascade_summary.get("cascade_plan", []),
+            "cascade_depth": cascade_summary.get("cascade_depth", 0),
+            "total_delta_v_ms": cascade_summary.get("total_delta_v_ms", 0.0),
+            "agencies_involved": cascade_summary.get("agencies_involved", []),
+            "seed_satellites": cascade_summary.get("seed_satellites", []),
+            "cpi_threshold": cascade_summary.get("cpi_threshold", 5.0),
+            "node_probabilities": cascade_summary.get("node_probabilities", {}),
+            "ranker_review": cascade_summary.get("ranker_review", {}),
+            "debris_clouds": debris_clouds,
         }
-
-        if states:
-            if len(states) > max_alert_states:
-                step = max(1, len(states) // max_alert_states)
-                sampled_states = states[::step][:max_alert_states]
-            else:
-                sampled_states = states
-
-            kalman_states = get_all_kalman_states()
-            alerts = await asyncio.to_thread(screen_conjunctions, sampled_states, kalman_states=kalman_states, propagator=propagator)
-            cascade_summary = await asyncio.to_thread(
-                cascade_planner.analyze_snapshot,
-                sampled_states,
-                [alert.to_dict() for alert in alerts],
-                propagator,
-                snapshot.get("timestamp") and datetime.fromisoformat(snapshot["timestamp"]),
-            )
-
-            debris_context_states = sampled_states
-            top_hotspot_tca = None
-            for hotspot in cascade_summary.get("hotspots", []):
-                if hotspot.get("tca_utc"):
-                    top_hotspot_tca = hotspot["tca_utc"]
-                    break
-            if top_hotspot_tca:
-                debris_context_states = await asyncio.to_thread(
-                    propagate_states_to,
-                    propagator,
-                    sampled_states,
-                    top_hotspot_tca,
-                )
-
-            merged_alerts = merge_alert_sources(
-                cascade_summary.get("alerts", []),
-                [a.to_dict() for a in alerts],
-            )
-
-            debris_clouds = build_debris_alerts(
-                cascade_summary.get("hotspots", []),
-                debris_context_states if states else [],
-                snapshot.get("timestamp"),
-                alerts=merged_alerts,
-                cpi_threshold=cascade_summary.get("cpi_threshold", 5.0),
-            )
-            hotspots = cascade_summary.get("hotspots", [])
-            enrich_payload_with_geodetic(
-                {"hotspots": hotspots, "debris_clouds": debris_clouds},
-                datetime.fromisoformat(snapshot["timestamp"]),
-            )
-
-            alerts_payload = {
-                "type": "alerts",
-                "timestamp": snapshot.get("timestamp"),
-                "alerts": merged_alerts,
-                "count": len(merged_alerts),
-                "screened_count": len(alerts),
-                "graph_alert_count": len(cascade_summary.get("alerts", [])),
-                "hotspots": hotspots,
-                "graph": cascade_summary.get("graph", {}),
-                "cascade_plan": cascade_summary.get("cascade_plan", []),
-                "cascade_depth": cascade_summary.get("cascade_depth", 0),
-                "total_delta_v_ms": cascade_summary.get("total_delta_v_ms", 0.0),
-                "agencies_involved": cascade_summary.get("agencies_involved", []),
-                "seed_satellites": cascade_summary.get("seed_satellites", []),
-                "cpi_threshold": cascade_summary.get("cpi_threshold", 5.0),
-                "node_probabilities": cascade_summary.get("node_probabilities", {}),
-                "ranker_review": cascade_summary.get("ranker_review", {}),
-                "debris_clouds": debris_clouds,
-            }
-            set_latest_alerts(alerts_payload)
-            if kafka_adapter is not None:
-                kafka_adapter.publish_alerts(alerts_payload)
-            if ml_runtime is not None:
-                ml_runtime.log_risk_samples(alerts_payload.get("alerts", []))
+        set_latest_alerts(alerts_payload)
+        if kafka_adapter is not None:
+            kafka_adapter.publish_alerts(alerts_payload)
+        if ml_runtime is not None:
+            ml_runtime.log_risk_samples(alerts_payload.get("alerts", []))
     except Exception as error:
-        logger.error(f"Alert refresh error: {error}")
+        logger.exception(f"Alert refresh error: {error}")
 
 
 async def refresh_alerts_loop():
@@ -426,6 +482,7 @@ async def lifespan(app: FastAPI):
     max_sats = int(os.getenv("MAX_SATS", "500"))
     tles = await fetch_tles(max_sats=max_sats)
     propagator.load_tles(tles)
+    set_default_propagator(propagator)
     logger.info(f"Tracking {propagator.satellite_count} satellites from current TLE source")
 
     now = sim_clock.simulation_now()

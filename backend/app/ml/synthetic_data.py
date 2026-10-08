@@ -14,68 +14,6 @@ def sigmoid(values: np.ndarray | float) -> np.ndarray | float:
     return 1.0 / (1.0 + np.exp(-values))
 
 
-def generate_risk_dataset(
-    sample_count: int = 4096,
-    seed: int = 7,
-) -> tuple[np.ndarray, np.ndarray, list[str]]:
-    rng = np.random.default_rng(seed)
-
-    miss_distance_km = rng.uniform(0.5, 1200.0, sample_count)
-    relative_speed_kmh = rng.uniform(0.0, 28000.0, sample_count)
-    sat1_altitude_km = rng.uniform(160.0, 2200.0, sample_count)
-    sat2_altitude_km = rng.uniform(160.0, 2200.0, sample_count)
-    tca_minutes = rng.uniform(0.0, 720.0, sample_count)
-    sat1_size_m = rng.uniform(0.2, 25.0, sample_count)
-    sat2_size_m = rng.uniform(0.2, 25.0, sample_count)
-    uncertainty_km = rng.uniform(0.0, 35.0, sample_count)
-
-    feature_matrix = np.column_stack(
-        [
-            miss_distance_km,
-            relative_speed_kmh,
-            sat1_altitude_km,
-            sat2_altitude_km,
-            tca_minutes,
-            sat1_size_m,
-            sat2_size_m,
-            uncertainty_km,
-        ]
-    )
-
-    avg_altitude_km = 0.5 * (sat1_altitude_km + sat2_altitude_km)
-    size_term = np.clip((sat1_size_m + sat2_size_m) / 20.0, 0.0, 1.5)
-    distance_term = np.exp(-miss_distance_km / 160.0)
-    speed_term = np.clip(relative_speed_kmh / 22000.0, 0.0, 1.25)
-    time_term = np.exp(-tca_minutes / 90.0)
-    altitude_term = np.clip(1.0 - (avg_altitude_km / 2400.0), 0.0, 1.0)
-    uncertainty_term = np.clip(uncertainty_km / 20.0, 0.0, 1.5)
-
-    logit = (
-        -3.2
-        + 3.8 * distance_term
-        + 1.5 * speed_term
-        + 0.95 * time_term
-        + 0.7 * size_term
-        + 0.55 * uncertainty_term
-        + 0.45 * altitude_term
-    )
-    probability = sigmoid(logit)
-    noise = rng.normal(0.0, 0.035, sample_count)
-    target = np.clip(probability + noise, 0.0, 1.0)
-
-    feature_names = [
-        "miss_distance_km",
-        "relative_speed_kmh",
-        "sat1_altitude_km",
-        "sat2_altitude_km",
-        "tca_minutes",
-        "sat1_size_m",
-        "sat2_size_m",
-        "uncertainty_km",
-    ]
-    return feature_matrix.astype(float), target.astype(float), feature_names
-
-
 def _rotate_z(vec: np.ndarray, angle: float) -> np.ndarray:
     c = math.cos(angle)
     s = math.sin(angle)

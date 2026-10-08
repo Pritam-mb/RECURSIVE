@@ -1,54 +1,73 @@
 """
 agency_authority.py — Per-agency session authority model for satellite commanding.
 
-Replaces the hardcoded `agency_auth = True` in sim_engine.py with a real
-authority enforcement model. Each agency has a session that expires after
-8 hours; the session ID is checked before any maneuver is authorised.
+Ownership comes from the single shared attribution in app.core.agency
+(CelesTrak SATCAT owner first, operator name patterns second), so the agency
+shown in the UI and the agency that is allowed to command an object are the
+same thing by construction.
 
-DEMO_SESSION: A special session that can command any satellite. This is
-the session used when the frontend does not specify a session_id, ensuring
-the demo always works while the authority model is real.
+Rules (check_authority / explain_authority):
+  1. DEMO_SESSION is an explicit demo super-user. It is honoured only while
+     demo mode is enabled (env ORBIT_SENTINEL_DEMO_SESSION, default "1"); set
+     it to "0" in any real deployment. Its decisions are tagged "demo_session".
+  2. Unknown / expired sessions are refused.
+  3. Objects SATCAT (or the name) classifies as DEB or R/B carry no propulsion
+     and cannot be commanded by agency sessions.
+  4. Session agency "ALL" (admin) may command any manoeuvrable object.
+  5. A session may command objects whose controlling agency matches its own
+     (legacy names such as ROSCOSMOS / CNSA / ISS/NASA are mapped onto the
+     SATCAT-derived labels).
+  6. Unknown owner: a REAL catalogued object (SATCAT or bundled TLE) with an
+     unresolved owner is NOT commandable by agency sessions. Only synthetic
+     objects that exist in no catalogue (scenario injections) may be commanded
+     by any valid session.
 
 Usage:
     from app.core.agency_authority import authority_manager
-
-    # Check authority
-    ok = authority_manager.check_authority("DEMO_SESSION", norad_id, sat_name)
-
-    # Create agency-specific session
+    ok = authority_manager.check_authority(session_id, norad_id, sat_name)
     session_id = authority_manager.create_session("SpaceX")
 """
 
 from __future__ import annotations
 
 import logging
+import os
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from app.core.agency import UNKNOWN_AGENCY, canonical_agencies, infer_agency
+
 logger = logging.getLogger(__name__)
 
-# ── Agency → satellite name pattern mapping ───────────────────────────────────
-# Each agency controls satellites whose names contain any of the listed patterns.
-# Patterns are checked case-insensitively.
+DEMO_SESSION_ID = "DEMO_SESSION"
 
-AGENCY_SATELLITE_PATTERNS: dict[str, list[str]] = {
-    "SpaceX":        ["STARLINK", "DRAGON", "SPACEX"],
-    "ESA":           ["SENTINEL", "GAIA", "XMM", "ENVISAT", "ERS", "METEOSAT"],
-    "ISRO":          ["GSAT", "INSAT", "CARTOSAT", "RESOURCESAT", "RISAT", "IRNSS"],
-    "ISS/NASA":      ["ISS", "ZARYA", "ZVEZDA", "UNITY", "DESTINY"],
-    "ROSCOSMOS":     ["COSMOS", "GLONASS", "RESURS", "METEOR", "ELEKTRO"],
-    "CNSA":          ["FENGYUN", "YAOGAN", "TIANGONG", "BEIDOU", "SHIYAN"],
-    "US Space Force": ["NAVSTAR", "GPS", "MILSTAR", "MUOS", "WGS", "SBIRS"],
-    "NOAA":          ["NOAA", "GOES", "POES", "SUOMI"],
-    "NASA":          ["HUBBLE", "TERRA", "AQUA", "AURA", "LANDSAT", "SWIFT"],
-    "Iridium":       ["IRIDIUM"],
-    "OneWeb":        ["ONEWEB"],
-    "Amazon":        ["KUIPER"],
-}
 
-# Agencies that are known but control no active TLEs — can only observe
-_OBSERVER_AGENCIES = {"UNKNOWN"}
+def demo_session_enabled() -> bool:
+    return os.getenv("ORBIT_SENTINEL_DEMO_SESSION", "1") == "1"
+
+
+def _object_facts(norad_id: int | None, satellite_name: str) -> dict[str, Any]:
+    """Controlling agency, object type and catalogue status for one object."""
+    object_type = None
+    catalogued = False
+    try:
+        from app.core import satcat
+
+        rec = satcat.lookup(norad_id) if norad_id is not None else None
+        if rec is not None:
+            object_type = rec.get("object_type")
+            catalogued = True  # SATCAT entry or present in the bundled TLE catalogue
+        if object_type in (None, "UNK"):
+            object_type = satcat.object_type_from_name(satellite_name) if satellite_name else object_type
+    except Exception:  # pragma: no cover - satcat data missing
+        pass
+    return {
+        "controlling_agency": infer_agency(satellite_name, norad_id),
+        "object_type": object_type or "UNK",
+        "catalogued": catalogued,
+    }
+
 
 # Session expiry duration
 _SESSION_DURATION_HOURS = 8
@@ -73,8 +92,8 @@ class AgencyAuthorityManager:
 
     def _create_demo_session(self):
         """Create the permanent DEMO_SESSION used by the frontend."""
-        self.sessions["DEMO_SESSION"] = {
-            "session_id": "DEMO_SESSION",
+        self.sessions[DEMO_SESSION_ID] = {
+            "session_id": DEMO_SESSION_ID,
             "agency": "ALL",
             "authorized_at": datetime.now(timezone.utc).isoformat(),
             # Year 9999 — effectively never expires
@@ -91,20 +110,9 @@ class AgencyAuthorityManager:
 
     # ── Public API ─────────────────────────────────────────────────────────────
 
-    def get_controlling_agency(self, satellite_name: str) -> str:
-        """
-        Determine which agency controls a satellite by its TLE name.
-
-        Returns the controlling agency name, or "UNKNOWN" if no pattern matches.
-        """
-        if not satellite_name:
-            return "UNKNOWN"
-        upper_name = satellite_name.upper()
-        for agency, patterns in AGENCY_SATELLITE_PATTERNS.items():
-            for pattern in patterns:
-                if pattern.upper() in upper_name:
-                    return agency
-        return "UNKNOWN"
+    def get_controlling_agency(self, satellite_name: str, norad_id: int | None = None) -> str:
+        """Controlling agency from the shared SATCAT-first attribution (app.core.agency)."""
+        return infer_agency(satellite_name or "", norad_id)
 
     def create_session(self, agency_name: str) -> str:
         """
@@ -125,83 +133,86 @@ class AgencyAuthorityManager:
         logger.info("Created session %s for agency '%s' (expires %s)", session_id, agency_name, expires.isoformat())
         return session_id
 
+    def explain_authority(
+        self,
+        session_id: str,
+        norad_id: int | None,
+        satellite_name: str,
+    ) -> dict[str, Any]:
+        """Authority decision with the rule that produced it (see module docstring)."""
+        facts = _object_facts(norad_id, satellite_name)
+        decision = {"allowed": False, "rule": "", "session_agency": None, **facts}
+
+        if session_id == DEMO_SESSION_ID:
+            decision["session_agency"] = "ALL"
+            if demo_session_enabled():
+                decision.update(allowed=True, rule="demo_session")
+            else:
+                decision["rule"] = "demo_session_disabled"
+            return decision
+
+        session = self.sessions.get(session_id)
+        if session is None:
+            decision["rule"] = "session_not_found"
+            return decision
+        if self._is_expired(session):
+            decision["rule"] = "session_expired"
+            return decision
+
+        session_agency = session.get("agency", UNKNOWN_AGENCY)
+        decision["session_agency"] = session_agency
+
+        if facts["object_type"] in ("DEB", "R/B"):
+            decision["rule"] = "object_not_manoeuvrable"
+            return decision
+        if session_agency == "ALL":
+            decision.update(allowed=True, rule="admin_session")
+            return decision
+
+        controlling = facts["controlling_agency"]
+        if controlling != UNKNOWN_AGENCY and controlling in canonical_agencies(session_agency):
+            decision.update(allowed=True, rule="agency_match")
+            return decision
+        if controlling == UNKNOWN_AGENCY:
+            if facts["catalogued"]:
+                decision["rule"] = "catalogued_owner_unresolved"
+            else:
+                decision.update(allowed=True, rule="synthetic_object_no_owner")
+            return decision
+
+        decision["rule"] = "agency_mismatch"
+        return decision
+
     def check_authority(
         self,
         session_id: str,
         norad_id: int,
         satellite_name: str,
     ) -> bool:
-        """
-        Check whether a session has authority to command a satellite.
-
-        Rules (in order):
-          1. DEMO_SESSION → always True (demo mode)
-          2. Session not found → False
-          3. Session expired → False
-          4. Session agency == "ALL" → True (admin)
-          5. Session agency == satellite controlling agency → True
-          6. Satellite controlling agency == "UNKNOWN" → True
-             (uncontrolled debris / uncatalogued objects can be maneuvered by anyone)
-          7. Otherwise → False
-        """
-        # Always allow DEMO_SESSION
-        if session_id == "DEMO_SESSION":
-            return True
-
-        session = self.sessions.get(session_id)
-        if session is None:
-            logger.warning("Authority check: session '%s' not found", session_id)
-            return False
-
-        if self._is_expired(session):
-            logger.warning("Authority check: session '%s' expired", session_id)
-            return False
-
-        session_agency = session.get("agency", "UNKNOWN")
-
-        # Admin / all-agency session
-        if session_agency == "ALL":
-            return True
-
-        controlling_agency = self.get_controlling_agency(satellite_name)
-
-        # Session agency matches satellite controlling agency
-        if session_agency == controlling_agency:
-            return True
-
-        # Uncontrolled object — anyone can maneuver
-        if controlling_agency == "UNKNOWN":
-            return True
-
-        logger.info(
-            "Authority denied: session agency='%s', satellite='%s' controlled by '%s'",
-            session_agency, satellite_name, controlling_agency,
-        )
-        return False
+        """True when the session may command the object (rules in module docstring)."""
+        decision = self.explain_authority(session_id, norad_id, satellite_name)
+        if not decision["allowed"]:
+            logger.info(
+                "Authority denied (%s): session agency='%s', object='%s' (NORAD %s) controlled by '%s'",
+                decision["rule"], decision["session_agency"], satellite_name, norad_id,
+                decision["controlling_agency"],
+            )
+        return bool(decision["allowed"])
 
     def get_session_satellites(
         self,
         session_id: str,
         all_satellite_names: list[str],
+        norad_ids: list[int] | None = None,
     ) -> list[str]:
-        """
-        Return the list of satellite names this session can command.
-
-        For DEMO_SESSION or ALL-agency sessions, returns all satellites.
-        For agency-specific sessions, returns matching satellites plus
-        all UNKNOWN satellites.
-        """
+        """Names of the objects this session may command (ids improve attribution)."""
         session = self.sessions.get(session_id)
         if session is None or self._is_expired(session):
             return []
-
-        agency = session.get("agency", "UNKNOWN")
-        if agency in ("ALL",):
-            return list(all_satellite_names)
-
+        ids = norad_ids if norad_ids is not None else [None] * len(all_satellite_names)
         return [
-            name for name in all_satellite_names
-            if self.get_controlling_agency(name) in (agency, "UNKNOWN")
+            name for name, nid in zip(all_satellite_names, ids)
+            if self.check_authority(session_id, nid, name)
         ]
 
     def get_session_info(self, session_id: str) -> dict | None:

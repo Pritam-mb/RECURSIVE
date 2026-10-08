@@ -10,7 +10,6 @@ import numpy as np
 
 from app.core.sgp4_propagator import SatelliteState
 from .shadow_logger import get_shadow_logger
-from .xgboost_scorer import XGBoostScorer, train_risk_model_from_samples
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +23,6 @@ class ShadowMode:
         self.min_risk_batch = int(os.getenv("SHADOW_MIN_RISK_BATCH", "300"))
         self.predictor = predictor
         self.logger = get_shadow_logger()
-        self.risk_scorer = XGBoostScorer()
         self.last_retrain: str | None = None
         self.last_result: dict | None = None
         self._retrain_lock = threading.Lock()
@@ -64,14 +62,12 @@ class ShadowMode:
             self.logger.settle_actuals(state.norad_id, timestamp, actual)
 
     def log_risk_samples(self, alerts: list[dict]):
-        if not self.enabled:
-            return
-
-        now = datetime.now(timezone.utc)
-        for alert in alerts:
-            features = self.risk_scorer.extract_features(alert)
-            target = float(alert.get("p_collision", 0.0))
-            self.logger.log_risk_sample(features, target, logged_at=now)
+        """No-op. Risk samples used to be logged with the alert's own p_collision
+        as the label, so "retraining" on them taught the model its own output.
+        There is no independent ground truth for collision risk in live data, so
+        nothing is logged; the Pc surrogate is trained offline on Foster labels
+        (app.ml.train_risk_surrogate)."""
+        return None
 
     def retrain_lstm(self) -> dict[str, float]:
         batch = self.logger.get_trajectory_batch(limit=max(self.min_lstm_batch, 200))
@@ -84,15 +80,12 @@ class ShadowMode:
         self.predictor.save_model()
         return {"status": "ok", "loss": float(loss), "count": float(len(batch))}
 
-    def retrain_risk(self) -> dict[str, float]:
-        batch = self.logger.get_risk_batch(limit=max(self.min_risk_batch, 300))
-        if len(batch) < self.min_risk_batch:
-            return {"status": "skipped", "reason": "insufficient_data", "count": float(len(batch))}
-
-        features = np.asarray([row[0] for row in batch], dtype=float)
-        targets = np.asarray([row[1] for row in batch], dtype=float)
-        train_risk_model_from_samples(features, targets)
-        return {"status": "ok", "count": float(len(batch))}
+    def retrain_risk(self) -> dict[str, float | str]:
+        return {
+            "status": "disabled",
+            "reason": "no independent ground truth in live data; retrain offline with "
+                      "python -m app.ml.train_risk_surrogate",
+        }
 
     def retrain_all(self) -> dict[str, dict[str, float]]:
         if not self.enabled:

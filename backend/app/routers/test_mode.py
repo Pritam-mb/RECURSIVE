@@ -15,6 +15,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field, model_validator
 
 from app.core.sgp4_propagator import SGP4Propagator
+from app.core import sim_clock
 from app.core.state_cache import set_latest_alerts
 from app.services.conjunction_solver import (
     CONJUNCTION_REPORT_DISTANCE_M,
@@ -89,7 +90,7 @@ def init_test_mode(propagator: SGP4Propagator):
 
 def _parse_epoch(value: Optional[str], fallback: Optional[datetime] = None) -> datetime:
     if not value:
-        return fallback or datetime.now(timezone.utc)
+        return fallback or sim_clock.simulation_now()
 
     cleaned = value.strip()
     if cleaned.endswith("Z"):
@@ -304,7 +305,7 @@ async def get_separation():
         sat_a = _session.satellite_a
         sat_b = _session.satellite_b
 
-    now = datetime.now(timezone.utc)
+    now = sim_clock.simulation_now()
     pos_a, vel_a = _resolve_satellite_state(sat_a, now)
     pos_b, vel_b = _resolve_satellite_state(sat_b, now)
 

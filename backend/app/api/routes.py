@@ -256,25 +256,23 @@ async def get_satellite_detail(norad_id: int):
 
 
 def _fallback_telemetry(norad_id: int, satellite_name: str) -> dict:
-    """Deterministic telemetry used only when the state tracker is unavailable.
+    """Telemetry used only when the state tracker is unavailable.
 
-    Values are seeded from the NORAD id so repeated calls for the same
-    satellite return identical numbers instead of fresh random noise.
+    There is no telemetry source in that case, so every housekeeping value is
+    reported as missing rather than invented.
     """
-    import random
-
-    rng = random.Random(int(norad_id))
     return {
         "norad_id": norad_id,
         "satellite_name": satellite_name,
-        "fuel_remaining_pct": round(max(0.0, 85.0 + rng.uniform(-5, 10)), 2),
-        "battery_pct": round(88.0 + rng.uniform(-3, 3), 2),
-        "temperature_c": round(-10.0 + rng.uniform(-8, 8), 2),
-        "signal_strength_dbm": round(-65.0 + rng.uniform(-5, 5), 2),
-        "solar_power_w": round(1200.0 + rng.uniform(-100, 100), 1),
+        "telemetry_available": False,
+        "fuel_remaining_pct": None,
+        "battery_pct": None,
+        "temperature_c": None,
+        "signal_strength_dbm": None,
+        "solar_power_w": None,
         "total_delta_v_used_ms": 0.0,
         "maneuver_count": 0,
-        "telemetry_source": "deterministic_fallback",
+        "telemetry_source": "unavailable",
     }
 
 
@@ -905,7 +903,7 @@ async def trigger_scenario(
             snapshot = _build_snapshot(_propagator, sim_clock.simulation_now())
             set_latest_snapshot(snapshot)
         return {"status": "LOADED", **result}
-    except FileNotFoundError as e:
+    except (FileNotFoundError, ValueError) as e:
         return {"status": "ERROR", "message": str(e)}
 
 
@@ -918,32 +916,84 @@ async def clear_scenario(session_id: str = Depends(resolve_session_id)):
     return {"status": "CLEARED"}
 
 
+class DebrisSimulateRequest(BaseModel):
+    sat_a: int | None = None
+    sat_b: int | None = None
+    tca_utc: str | None = None
+    window_hours: float = 24.0
+
+
+def _default_debris_pair() -> tuple[int, int, str | None, str]:
+    """Scenario pair if a computed crossing is loaded, else the highest-Pc alert."""
+    pair = getattr(_sim_engine, "scenario_pair", None) if _sim_engine else None
+    if pair:
+        return int(pair[0]), int(pair[1]), None, "scenario_pair"
+    tracked = set(_propagator.norad_ids) if _propagator else set()
+    best = None
+    for alert in (get_latest_alerts() or {}).get("alerts", []) or []:
+        if alert.get("source") == "debris":
+            continue
+        a = (alert.get("sat1") or {}).get("id")
+        b = (alert.get("sat2") or {}).get("id")
+        if a not in tracked or b not in tracked:
+            continue
+        pc = float(alert.get("probability_of_collision", alert.get("p_collision", 0.0)) or 0.0)
+        if best is None or pc > best[0]:
+            best = (pc, int(a), int(b), alert.get("tca_utc"))
+    if best is None:
+        raise HTTPException(status_code=409, detail="No pair given, no scenario loaded and no screened alert available")
+    return best[1], best[2], best[3], "highest_pc_alert"
+
+
 @router.post("/debris/simulate")
-async def simulate_collision_event(session_id: str = Depends(resolve_session_id)):
-    """Trigger a demo collision event."""
+async def simulate_collision_event(
+    req: DebrisSimulateRequest | None = None,
+    session_id: str = Depends(resolve_session_id),
+):
+    """Break up a catalogue pair at its predicted TCA (NASA SBM).
+
+    Body (optional): {sat_a, sat_b, tca_utc?}. Default pair: the loaded
+    computed-crossing scenario pair, else the highest-Pc screened alert.
+    """
     if _propagator is None:
         raise HTTPException(status_code=503, detail="Propagator not initialized")
 
     _require_valid_session(session_id)
 
     from app.core.debris_model import debris_model
-    # Simulate a catastrophic collision in LEO
-    pos_a = [6778.0, 0.0, 0.0]
-    vel_a = [0.0, 7.7, 0.0]
-    cloud = debris_model.simulate_collision(
-        collision_point_eci_km=pos_a,
-        collision_velocity_eci_kms=vel_a,
-        mass_p_kg=500.0,
-        mass_q_kg=500.0,
-        rel_vel_kms=10.0,
-        max_fragments_simulated=100,
-        event_id="demo_collision_1"
-    )
-    
-    snapshot = _build_snapshot(_propagator, sim_clock.simulation_now())
+    req = req or DebrisSimulateRequest()
+    if req.sat_a is not None and req.sat_b is not None:
+        sat_a, sat_b, hint, pair_source = int(req.sat_a), int(req.sat_b), req.tca_utc, "request"
+    else:
+        sat_a, sat_b, hint, pair_source = _default_debris_pair()
+
+    now = sim_clock.simulation_now()
+    try:
+        event = await run_in_threadpool(
+            debris_model.simulate_collision_from_pair, sat_a, sat_b, _propagator, now,
+            tca_hint_utc=hint, window_hours=req.window_hours,
+        )
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+
+    snapshot = _build_snapshot(_propagator, now)
     set_latest_snapshot(snapshot)
-    
-    return {"status": "SUCCESS", "fragments_generated": len(cloud.fragments)}
+    # Populate fragment-vs-satellite exposure immediately (also refreshed by the alert loop).
+    debris_alerts = await run_in_threadpool(debris_model.compute_debris_alerts, snapshot.get("states", []), now)
+    snapshot = _build_snapshot(_propagator, now)
+    set_latest_snapshot(snapshot)
+
+    return {
+        "status": "SUCCESS",
+        "pair_source": pair_source,
+        "event": event,
+        "fragments_generated": event["simulated_fragments"],
+        "total_fragments": event["total_fragments"],
+        "debris_alerts": len(debris_alerts),
+        "debris_screening": debris_model.last_screen_meta,
+    }
 
 
 @router.delete("/debris/active")

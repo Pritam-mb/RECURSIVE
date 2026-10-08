@@ -118,7 +118,7 @@ class TestMlStatusShape:
 
         scorer = scorer_module.XGBoostScorer()
         scorer.score(0.9)
-        scorer.score(0.1)
+        scorer.score(1e-7)  # surrogate Pc below the 1e-4 high-risk threshold
         scorer.score(0.7, record=False)  # evaluation path is not counted
 
         xgb = client.get("/api/ml/status").json()["xgboost"]
@@ -180,18 +180,19 @@ class TestRlhfCounter:
         assert rlhf_store.get_stats()["decisions"] == 0
 
 
-class TestDeterministicTelemetry:
-    def test_fallback_is_stable_per_satellite(self, client, fake_routes, monkeypatch):
+class TestTelemetryFallback:
+    def test_fallback_reports_missing_not_invented(self, client, fake_routes, monkeypatch):
+        """Without the tracker there is no telemetry source: values must be
+        null, never synthesised numbers."""
         monkeypatch.setattr(routes, "_TRACKER_AVAILABLE", False)
         monkeypatch.setattr(routes, "satellite_tracker", None)
 
-        first = client.get("/api/satellites/25544/telemetry").json()
-        second = client.get("/api/satellites/25544/telemetry").json()
-        other = client.get("/api/satellites/43013/telemetry").json()
+        body = client.get("/api/satellites/25544/telemetry").json()
 
-        assert first == second
-        assert first["telemetry_source"] == "deterministic_fallback"
-        assert first["fuel_remaining_pct"] != other["fuel_remaining_pct"]
+        assert body["telemetry_source"] == "unavailable"
+        assert body["telemetry_available"] is False
+        for key in ("fuel_remaining_pct", "battery_pct", "temperature_c", "signal_strength_dbm"):
+            assert body[key] is None
 
     def test_tracker_module_imports_cleanly(self):
         from app.core.satellite_state_tracker import satellite_tracker

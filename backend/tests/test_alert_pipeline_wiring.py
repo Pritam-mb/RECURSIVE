@@ -75,7 +75,7 @@ class TestAlertPipelineNotFlagGated:
 
         calls: dict[str, int] = {"screen": 0, "cascade": 0, "debris": 0}
 
-        def fake_screen(states, **kwargs):
+        def fake_screen(states, sim_time, **kwargs):
             calls["screen"] += 1
             return []
 
@@ -99,7 +99,7 @@ class TestAlertPipelineNotFlagGated:
             calls["debris"] += 1
             return []
 
-        monkeypatch.setattr(app_module, "screen_conjunctions", fake_screen)
+        monkeypatch.setattr(app_module, "screen_alerts", fake_screen)
         monkeypatch.setattr(app_module, "cascade_planner", _Planner())
         monkeypatch.setattr(app_module, "build_debris_alerts", fake_debris)
         monkeypatch.setattr(
@@ -120,7 +120,7 @@ class TestAlertPipelineNotFlagGated:
     def test_alert_cache_is_written_when_flag_is_off(self, app_module, monkeypatch):
         """A populated alert payload must land in the cache, not the stub."""
         monkeypatch.setattr(app_module, "ENABLE_EXTENDED_PIPELINE", False)
-        monkeypatch.setattr(app_module, "screen_conjunctions", lambda s, **k: [])
+        monkeypatch.setattr(app_module, "screen_alerts", lambda s, t, **k: [])
         monkeypatch.setattr(app_module, "get_all_kalman_states", lambda: {})
 
         class _Planner:
@@ -200,7 +200,7 @@ class TestAlertListIsSelfConsistent:
 
         # Screening finds one alert; the graph finds nothing (empty edges).
         monkeypatch.setattr(
-            app_module, "screen_conjunctions", lambda s, **k: [_Alert(1, 2)]
+            app_module, "screen_alerts", lambda s, t, **k: [_Alert(1, 2).to_dict()]
         )
 
         class _Planner:
@@ -235,7 +235,7 @@ class TestAlertListIsSelfConsistent:
         assert cached["count"] == 1, "a screened conjunction was dropped from the API"
         assert cached["alerts"][0]["source"] == "screening"
 
-    def test_graph_alerts_win_on_duplicate_pairs(self, app_module):
+    def test_physics_alert_wins_and_graph_only_enriches(self, app_module):
         graph_alerts = [
             {
                 "id": "1-2",
@@ -262,7 +262,11 @@ class TestAlertListIsSelfConsistent:
         merged = app_module.merge_alert_sources(graph_alerts, screened_alerts)
 
         assert len(merged) == 1, "pair emitted twice in both orientations"
-        assert merged[0]["cpi_score"] == 9.0
+        # Physics (screening) values are authoritative ...
+        assert merged[0]["cpi_score"] == 1.0
+        assert merged[0]["p_collision"] == 1e-9
+        # ... the cascade graph only contributes enrichment it alone computes.
+        assert merged[0]["position"] == {"x": 1.0, "y": 2.0, "z": 3.0}
 
     def test_screened_alert_is_normalized_to_the_graph_shape(self, app_module):
         screened = [

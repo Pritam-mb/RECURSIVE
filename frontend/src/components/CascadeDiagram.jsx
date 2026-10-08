@@ -10,13 +10,16 @@ const SEVERITY_CLASS = {
   WATCH: 'an-sev-watch',
   NOMINAL: 'an-sev-nominal',
   CASCADE: 'an-sev-cascade',
+  EVENT: 'an-sev-event',
 };
-const LEGEND = ['CRITICAL', 'WARNING', 'WATCH', 'NOMINAL'];
+const LEGEND = ['EVENT', 'CRITICAL', 'WARNING', 'WATCH', 'NOMINAL'];
 
 const EDGE_CLASS = {
   active: 'an-edge--active',
   cascade: 'an-edge--cascade',
   resolved: 'an-edge--resolved',
+  debris: 'an-edge--debris',
+  breakup: 'an-edge--breakup',
 };
 
 const EMPTY_GRAPH = { nodes: [], edges: [] };
@@ -31,7 +34,7 @@ const SETTLE_VELOCITY = 0.02;
 const PAD_X = 48; // room for node labels
 const LABEL_CHAR_W = 6; // ~10px mono glyph width
 const LABEL_H = 12;
-const SEVERITY_RANK = { CRITICAL: 3, WARNING: 2, WATCH: 1 };
+const SEVERITY_RANK = { EVENT: 4, CRITICAL: 3, WARNING: 2, WATCH: 1 };
 
 function shortLabel(text) {
   if (!text) return '';
@@ -127,9 +130,15 @@ function computeLayout(graph) {
 
 const formatDistance = (km) => (km < 1 ? `${(km * 1000).toFixed(0)} m` : `${km.toFixed(1)} km`);
 
+const formatPc = (p) => (p == null || !Number.isFinite(Number(p)) ? null : Number(p) === 0 ? '0' : Number(p).toExponential(1));
+
 const edgeLabel = (e) => {
   const parts = [];
-  if (e.miss_distance > 0) parts.push(formatDistance(e.miss_distance));
+  if (e.kind === 'breakup') return 'parent';
+  if (e.kind === 'debris' && e.count > 1) parts.push(`${e.count} frag`);
+  if (e.miss_distance != null && e.miss_distance > 0) parts.push(formatDistance(e.miss_distance));
+  const pc = formatPc(e.p_collision);
+  if (pc) parts.push(`Pc ${pc}`);
   if (e.tca_hours != null && e.tca_hours > 0) {
     parts.push(e.tca_hours < 1 ? `T-${(e.tca_hours * 60).toFixed(0)}m` : `T-${e.tca_hours.toFixed(1)}h`);
   } else if (e.tca_utc) {
@@ -203,9 +212,14 @@ export default function CascadeDiagram({ graph = EMPTY_GRAPH }) {
       x: evt.clientX - rect.left + 12,
       y: evt.clientY - rect.top - 8,
       label: n.label,
+      kind: n.kind,
       agency: n.agency,
+      objectType: n.object_type,
       cpi: n.cpi,
       severity: n.severity,
+      probability: n.probability,
+      depth: n.cascade_depth,
+      event: n.event,
     });
   }, []);
 
@@ -251,11 +265,11 @@ export default function CascadeDiagram({ graph = EMPTY_GRAPH }) {
                 <g
                   className="an-edge-group"
                   key={e.id}
-                  onClick={() => setSelectedAlertId(e.id)}
+                  onClick={() => setSelectedAlertId(e.alert_id ?? e.id)}
                 >
                   <line className="an-edge-hit" x1={src.x} y1={src.y} x2={tgt.x} y2={tgt.y} />
                   <line
-                    className={`an-edge ${EDGE_CLASS[e.status] ?? EDGE_CLASS.active}${selectedAlertId === e.id ? ' is-selected' : ''}`}
+                    className={`an-edge ${EDGE_CLASS[e.status] ?? EDGE_CLASS.active}${selectedAlertId != null && (selectedAlertId === e.id || selectedAlertId === e.alert_id) ? ' is-selected' : ''}`}
                     x1={src.x}
                     y1={src.y}
                     x2={tgt.x}
@@ -265,7 +279,7 @@ export default function CascadeDiagram({ graph = EMPTY_GRAPH }) {
               ))}
             </g>
             <g>
-              {view.edges.map(({ e, src, tgt, label }) => (label && selectedAlertId === e.id ? (
+              {view.edges.map(({ e, src, tgt, label }) => (label && selectedAlertId != null && (selectedAlertId === e.id || selectedAlertId === e.alert_id) ? (
                 <text
                   key={`l-${e.id}`}
                   className="an-edge-label"
@@ -286,20 +300,33 @@ export default function CascadeDiagram({ graph = EMPTY_GRAPH }) {
                   <g
                     key={nodeKey(n.id)}
                     className={`an-node ${sevClass}`}
-                    onClick={() => setSelectedSatId(n.id)}
+                    onClick={() => { if (n.kind !== 'event') setSelectedSatId(n.id); }}
                     onMouseMove={(evt) => showTooltip(evt, n)}
                     onMouseLeave={() => setTooltip(null)}
                   >
                     <circle cx={n.x} cy={n.y} r={n.r + 5} fill="transparent" />
                     {selected && <circle className="an-node-ring" cx={n.x} cy={n.y} r={n.r + 3} />}
-                    <circle
-                      className="an-node-dot"
-                      cx={n.x}
-                      cy={n.y}
-                      r={n.r}
-                      fill="currentColor"
-                      stroke="currentColor"
-                    />
+                    {n.kind === 'event' ? (
+                      <rect
+                        className="an-node-dot an-node-event"
+                        x={n.x - 6}
+                        y={n.y - 6}
+                        width={12}
+                        height={12}
+                        transform={`rotate(45 ${n.x} ${n.y})`}
+                        fill="currentColor"
+                        stroke="currentColor"
+                      />
+                    ) : (
+                      <circle
+                        className="an-node-dot"
+                        cx={n.x}
+                        cy={n.y}
+                        r={n.r}
+                        fill="currentColor"
+                        stroke="currentColor"
+                      />
+                    )}
                     {label && (
                       <text className="an-node-label" x={n.x} y={n.y + n.r + 11} textAnchor="middle">
                         {label}
@@ -322,14 +349,45 @@ export default function CascadeDiagram({ graph = EMPTY_GRAPH }) {
         {tooltip && (
           <div className="an-tooltip" style={{ left: Math.max(4, Math.min(tooltip.x, size.w - 170)), top: Math.max(4, tooltip.y) }}>
             <div className="an-tooltip-name">{tooltip.label}</div>
-            <span className="an-tooltip-k">CPI</span>
-            <span className="an-tooltip-v">{(tooltip.cpi ?? 0).toFixed(1)}</span>
-            <span className="an-tooltip-k">State</span>
-            <span className={`an-tooltip-v ${SEVERITY_CLASS[tooltip.severity] ?? 'an-sev-unknown'}`}>{tooltip.severity}</span>
-            {tooltip.agency && (
+            {tooltip.kind === 'event' ? (
               <>
-                <span className="an-tooltip-k">Agency</span>
-                <span className="an-tooltip-v">{tooltip.agency}</span>
+                <span className="an-tooltip-k">Event</span>
+                <span className="an-tooltip-v an-sev-event">Collision</span>
+                <span className="an-tooltip-k">Parents</span>
+                <span className="an-tooltip-v">
+                  {Array.isArray(tooltip.event?.parent_ids) ? tooltip.event.parent_ids.join(' × ') : '—'}
+                </span>
+                <span className="an-tooltip-k">Fragments</span>
+                <span className="an-tooltip-v">{tooltip.event?.fragment_count ?? '—'}</span>
+                {tooltip.event?.collision_utc && (
+                  <>
+                    <span className="an-tooltip-k">UTC</span>
+                    <span className="an-tooltip-v">{String(tooltip.event.collision_utc).slice(0, 19).replace('T', ' ')}</span>
+                  </>
+                )}
+              </>
+            ) : (
+              <>
+                <span className="an-tooltip-k">CPI</span>
+                <span className="an-tooltip-v">{tooltip.cpi == null ? '—' : Number(tooltip.cpi).toFixed(1)}</span>
+                <span className="an-tooltip-k">State</span>
+                <span className={`an-tooltip-v ${SEVERITY_CLASS[tooltip.severity] ?? 'an-sev-unknown'}`}>{tooltip.severity}</span>
+                <span className="an-tooltip-k">Man. prob</span>
+                <span className="an-tooltip-v">{tooltip.probability == null ? '—' : Number(tooltip.probability).toFixed(3)}</span>
+                <span className="an-tooltip-k">Depth</span>
+                <span className="an-tooltip-v">{tooltip.depth ?? '—'}</span>
+                {tooltip.objectType && (
+                  <>
+                    <span className="an-tooltip-k">Type</span>
+                    <span className="an-tooltip-v">{tooltip.objectType}</span>
+                  </>
+                )}
+                {tooltip.agency && (
+                  <>
+                    <span className="an-tooltip-k">Agency</span>
+                    <span className="an-tooltip-v">{tooltip.agency}</span>
+                  </>
+                )}
               </>
             )}
           </div>

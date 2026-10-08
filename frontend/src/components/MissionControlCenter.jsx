@@ -7,6 +7,7 @@ import { markEdgeResolved } from '../utils/cascadeGraph';
 import '../styles/threats.css';
 
 const TABS = ['ALL', 'CRITICAL', 'WARNING', 'WATCH'];
+const SEV_RANK = { CRITICAL: 3, WARNING: 2, WATCH: 1 };
 
 function SysCell({ label, state, title }) {
   return (
@@ -32,7 +33,9 @@ export default function MissionControlCenter({ alerts = [] }) {
           if (activeTab === 'ALL') return true;
           return severityLabel(a) === activeTab;
         })
-        .sort((a, b) => Number(b.cpi_score ?? 0) - Number(a.cpi_score ?? 0)),
+        // Backend tier first (Pc / miss based), then CPI within a tier.
+        .sort((a, b) => (SEV_RANK[severityLabel(b)] - SEV_RANK[severityLabel(a)])
+          || (Number(b.cpi_score ?? 0) - Number(a.cpi_score ?? 0))),
     [alerts, activeTab]
   );
 

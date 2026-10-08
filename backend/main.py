@@ -557,7 +557,7 @@ app.include_router(predict_router)
 
 # Analytics (PCA / correlation / SHAP) and physics cross-validation routers.
 # Registered defensively so the API still starts while they are being built.
-for _router_module in ("app.routers.analytics", "app.routers.physics"):
+for _router_module in ("app.routers.analytics", "app.routers.physics", "app.routers.debris_viz"):
     try:
         app.include_router(__import__(_router_module, fromlist=["router"]).router)
     except Exception as _router_error:  # pragma: no cover - startup guard

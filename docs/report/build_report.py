@@ -448,7 +448,7 @@ def fig_agencies(agencies, satcat_rows, sats_live):
     c.bar(xs - 0.2, [100 * cat_types.get(t, 0) / tot_c for t in tl], 0.38, color=MUTED, label=f"SATCAT ({tot_c:,})")
     c.bar(xs + 0.2, [100 * live_types.get(t, 0) / tot_l for t in tl], 0.38, color=NAVY, label=f"live ({tot_l})")
     c.set_xticks(xs, tl); c.set_ylabel("% of objects"); c.set_title("Object types")
-    c.legend(loc="upper left"); c.grid(axis="x", visible=False)
+    c.legend(loc="upper right"); c.set_ylim(0, 80); c.grid(axis="x", visible=False)
     fig.tight_layout(w_pad=1.2)
     return save(fig, "03_agencies", "Left: GET /api/agencies (SATCAT owner + operator-pattern attribution, "
                 f"attribution sources {agencies.get('attribution_sources')}). Middle/right: satcat_snapshot.csv "
@@ -516,31 +516,32 @@ def fig_bplane(alert):
     hbr = alert["hbr_km"]
     lim = ce["a"] * 1.08
     pcs = alert.get("pc_checks") or {}
-    fig, axes = plt.subplots(1, 3, figsize=(7.2, 2.75), gridspec_kw={"width_ratios": [1.25, 1, 1.05]})
-    a = axes[0]
+    fig, (a, zi) = plt.subplots(1, 2, figsize=(7.2, 2.3), gridspec_kw={"width_ratios": [2.6, 1]})
     for kk, alpha in ((3, 0.12), (2, 0.18), (1, 0.28)):
         a.add_patch(Ellipse((0, 0), 2 * kk * sa * 1000, 2 * kk * sb * 1000, angle=math.degrees(ang),
                             fc=BLUE, alpha=alpha, ec=BLUE, lw=0.6))
     a.annotate("", xy=(b[0] * 1000, b[1] * 1000), xytext=(0, 0),
                arrowprops=dict(arrowstyle="-|>", color=BAD, lw=1.2))
     a.add_patch(Circle((b[0] * 1000, b[1] * 1000), max(hbr * 1000, 1), fc=BAD, ec=BAD))
-    a.text(-lim * 0.95, -lim * 0.62, f"miss {np.linalg.norm(b)*1000:.0f} m, HBR {hbr*1000:.1f} m",
-           fontsize=6.0, color=BAD)
-    lim = ce["a"] * 1.08
-    a.set_xlim(-lim, lim); a.set_ylim(-lim * 0.75, lim * 0.75); a.set_aspect("equal")
-    zi = a.inset_axes([0.64, 0.62, 0.34, 0.36])
+    a.text(-lim * 0.95, -lim * 0.36, f"miss {np.linalg.norm(b)*1000:.0f} m, HBR {hbr*1000:.1f} m",
+           fontsize=6.3, color=BAD)
+    a.set_xlim(-lim, lim); a.set_ylim(-lim * 0.45, lim * 0.45); a.set_aspect("equal")
     zl = max(2.5 * np.linalg.norm(b) * 1000, 4 * hbr * 1000, 1.0)
     zi.add_patch(Ellipse((0, 0), 2 * sa * 1000, 2 * sb * 1000, angle=math.degrees(ang), fc=BLUE, alpha=0.15, ec=BLUE, lw=0.5))
     zi.annotate("", xy=(b[0] * 1000, b[1] * 1000), xytext=(0, 0), arrowprops=dict(arrowstyle="-|>", color=BAD, lw=1))
     zi.add_patch(Circle((b[0] * 1000, b[1] * 1000), hbr * 1000, fc=BAD, alpha=0.5, ec=BAD))
     zi.scatter([0], [0], s=6, color=INK)
     zi.set_xlim(-zl, zl); zi.set_ylim(-zl, zl); zi.set_aspect("equal")
-    zi.tick_params(labelsize=4.5); zi.set_title(f"zoom ±{zl:.0f} m", fontsize=5.5, loc="center")
+    zi.tick_params(labelsize=6); zi.set_title(f"Zoom on the hard body (±{zl:.0f} m)", fontsize=7.5)
+    zi.set_xlabel("T [m]")
     a.set_xlabel("B-plane T [m]"); a.set_ylabel("B-plane N [m]")
-    a.set_title("Encounter B-plane (1/2/3σ)")
-    a.text(-lim * 0.95, -lim * 0.71, f"1σ = {sa*1000:.0f} × {sb*1000:.0f} m", fontsize=6.0, color=INK2)
+    a.set_title("Encounter B-plane, true scale (1/2/3σ)")
+    a.text(-lim * 0.95, -lim * 0.42, f"1σ = {sa*1000:.0f} × {sb*1000:.0f} m", fontsize=6.3, color=INK2)
+    fig.tight_layout(w_pad=1.5)
+    save(fig, "05_bplane", f"Alert {alert['id']} ({alert['sat1']['name']} × {alert['sat2']['name']}) from GET /api/alerts "
+         "during the cascade_demo run: b_t_km/b_n_km, covariance_ellipse (a, b, angle at sigma_level) and hbr_km.")
+    fig, (c, d) = plt.subplots(1, 2, figsize=(7.2, 2.4))
     # methods
-    c = axes[1]
     meths = [("Foster", pcs.get("foster"), BLUE), ("Chan", pcs.get("chan"), CAT[2]),
              ("Monte Carlo", pcs.get("monte_carlo"), CAT[6]), ("Alfano max", pcs.get("alfano_max"), CAT[1])]
     labs, vals, cols = [], [], []
@@ -560,7 +561,6 @@ def fig_bplane(alert):
     c.set_xlabel("log10 Pc"); c.set_title("Four independent Pc methods")
     c.grid(axis="y", visible=False)
     # dilution curve
-    d = axes[2]
     ks = np.logspace(-3, 2, 101)
     pk = [foster_pc(b, (kk ** 2) * C2, hbr) for kk in ks]
     d.plot(ks, pk, color=BLUE, lw=1.8)
@@ -572,10 +572,40 @@ def fig_bplane(alert):
     d.set_ylim(max(min(pk), 1e-12), max(pk) * 5)
     d.set_xlabel("covariance scale k (C → k²C)"); d.set_ylabel("Foster Pc")
     d.set_title("Covariance dilution")
-    fig.tight_layout(w_pad=1.0)
-    return save(fig, "05_bplane", f"Alert {alert['id']} ({alert['sat1']['name']} × {alert['sat2']['name']}) from "
-                "GET /api/alerts during the cascade_demo run: b_t/b_n, covariance_ellipse, hbr_km and pc_checks. "
-                "Right: app.core.screening.foster_pc re-evaluated on the same B-plane with the covariance scaled by k².")
+    fig.tight_layout(w_pad=1.5)
+    return save(fig, "05b_methods", f"Left: alert.pc_checks of {alert['id']} (app/core/pc_methods.py; MC with "
+                f"{pcs.get('mc_samples')} samples). Right: app.core.screening.foster_pc re-evaluated on the same B-plane "
+                "with the covariance scaled by k² (Alfano's maximum is the peak).")
+
+
+def fig_pcchecks(alerts):
+    rows = [a.get("pc_checks") for a in alerts if a.get("pc_checks")]
+    rows = [r for r in rows if r.get("foster") and r.get("chan") and r["foster"] > 1e-30 and r["chan"] > 1e-30]
+    if not rows:
+        return None
+    fo = np.array([r["foster"] for r in rows]); ch = np.array([r["chan"] for r in rows])
+    al = np.array([r.get("alfano_max") or np.nan for r in rows])
+    fig, axes = plt.subplots(1, 2, figsize=(7.2, 2.6))
+    a = axes[0]
+    a.scatter(fo, ch, s=12, color=CAT[2], edgecolor="white", lw=0.3, zorder=3)
+    lo, hi = min(fo.min(), ch.min()) / 3, max(fo.max(), ch.max()) * 3
+    a.plot([lo, hi], [lo, hi], color=BAD, lw=0.8, ls="--")
+    a.set_xscale("log"); a.set_yscale("log"); a.set_xlim(lo, hi); a.set_ylim(lo, hi)
+    a.set_xlabel("Foster Pc"); a.set_ylabel("Chan series Pc")
+    sp = np.abs(np.log10(fo) - np.log10(ch))
+    a.set_title(f"Foster vs Chan on {len(rows)} live alerts")
+    a.text(0.04, 0.9, f"median |Δlog10| = {np.median(sp):.1e}\nmax = {sp.max():.2f} decades", transform=a.transAxes,
+           fontsize=6.3, color=INK2, va="top")
+    b = axes[1]
+    ratio = np.log10(al / fo)
+    ratio = ratio[np.isfinite(ratio)]
+    b.hist(ratio, bins=30, color=CAT[1], edgecolor="white", lw=0.4)
+    b.set_xlabel("log10 (Alfano max Pc / Foster Pc)"); b.set_ylabel("alerts")
+    b.set_title("Head-room if the covariance size is wrong")
+    b.axvline(0, color=INK, lw=0.8)
+    fig.tight_layout(w_pad=1.5)
+    return save(fig, "05c_pcchecks", "alert.pc_checks of every screened alert in GET /api/alerts (cascade_demo run); "
+                "Alfano ≥ Foster by construction (upper bound).")
 
 
 def fig_tle_sigma(alerts):
@@ -858,7 +888,7 @@ def fig_options(rm, alert):
     a.set_title(f"Options ({rm.get('candidates_evaluated', '?')} candidates evaluated)")
     a.scatter([], [], color=GOOD, label="cascade-safe"); a.scatter([], [], color=BAD, label="hampers others")
     a.scatter([], [], marker="*", color=MUTED, s=80, label="chosen")
-    a.legend(fontsize=6, loc="center right")
+    a.legend(fontsize=6, loc="lower right")
     b = axes[1]
     from app.core import analytic_checks as ac
     chk = rm.get("analytic_check") or {}
@@ -989,7 +1019,7 @@ def fig_debris_alerts(alerts_deb):
     for a in deb:
         by_sat[(a["sat1"]["id"], a["sat1"]["name"], a["sat1"].get("agency", "?"))].append(a)
     items = sorted(by_sat.items(), key=lambda kv: -max(x["probability_of_collision"] for x in kv[1]))
-    fig, axes = plt.subplots(1, 2, figsize=(7.2, 2.5), gridspec_kw={"width_ratios": [1.45, 1]})
+    fig, axes = plt.subplots(1, 2, figsize=(7.2, 2.5), gridspec_kw={"width_ratios": [1.2, 1]})
     a = axes[0]
     ys = np.arange(len(items))[::-1]
     for y, ((sid, name, ag), lst) in zip(ys, items):
@@ -1008,7 +1038,7 @@ def fig_debris_alerts(alerts_deb):
         b.scatter([x["tca_minutes"] for x in lst], [x["miss_distance_km"] for x in lst], s=22,
                   color=CAT[i % len(CAT)], edgecolor="white", lw=0.4, label=f"#{sid}", zorder=3)
     b.axhline(5, color=INK2, ls=":", lw=0.8)
-    b.text(2, 5.1, "5 km screening threshold", fontsize=5.6, color=INK2, va="bottom")
+    b.text(0.02, 5.1, "5 km screening threshold", fontsize=5.6, color=INK2, va="bottom", transform=b.get_yaxis_transform())
     b.set_xlabel("minutes from now to fragment TCA"); b.set_ylabel("miss distance [km]")
     b.set_ylim(0, 6.2); b.set_title("When and how close")
     b.legend(fontsize=5.4, ncol=2, loc="lower right")
@@ -1077,14 +1107,14 @@ def fig_cascade(alerts_deb, node_prob):
                 lab += f"\nP(hit) {p:.1e}"
         ax.text(x, y - (0.3 if d["layer"] != 1 else 0.22), lab, ha="center", va="top", fontsize=5.0 if d["layer"] == 1 else 5.5,
                 color=INK, linespacing=1.05, bbox=dict(fc="white", ec="none", alpha=0.75, pad=0.3) if d["layer"] in (2, 3) else None)
-    for L, t in enumerate(["collision event", "fragments (depth 1)", "threatened satellites (depth 2)",
-                           "their conjunctions (depth 3)", "agencies (SATCAT)"]):
+    top_y = max(p[1] for p in pos.values()) + 0.6
+    for L, t in enumerate(["collision\nevent", "fragments\n(depth 1)", "threatened satellites\n(depth 2)",
+                           "their conjunctions\n(depth 3)", "agencies\n(SATCAT owner)"]):
         if L in layers:
-            ys = [pos[n][1] for n in layers[L]]
-            ax.text(L, max(ys) + 0.55 + (0.45 if L % 2 else 0), t, ha="center", fontsize=6.6, weight="bold", color=lcol[L])
+            ax.text(L, top_y, t, ha="center", va="bottom", fontsize=6.6, weight="bold", color=lcol[L], linespacing=1.0)
     ax.axis("off")
     allys = [p[1] for p in pos.values()]
-    ax.set_ylim(min(allys) - 1.4, max(allys) + 1.2); ax.set_xlim(-0.5, 4.5)
+    ax.set_ylim(min(allys) - 1.4, max(allys) + 1.5); ax.set_xlim(-0.5, 4.5)
     return save(fig, "20_cascade", "Graph built from GET /api/alerts after the debris recompute: debris alerts give "
                 "event → fragment → satellite edges, screening alerts give the satellites' own conjunctions (top 8 by Pc), "
                 "agency from alert.sat1.agency; P(hit) from node_probabilities.")
@@ -1727,6 +1757,7 @@ def main():
             mk("options", fig_options, scen_alert["recommended_maneuver"], scen_alert)
             mk("engines", fig_engines, scen_alert["recommended_maneuver"])
     mk("tle_sigma", fig_tle_sigma, alerts)
+    mk("pcchecks", fig_pcchecks, [a for a in (scen_alerts or alerts) if a.get("source", "screening") == "screening"])
     if an.get("correlation"):
         mk("corr", fig_corr, an)
         mk("pca", fig_pca, an)
@@ -1960,6 +1991,7 @@ def main():
         "σ<sub>R,T,N</sub>(age) = σ<sub>0</sub> + g · |TCA − epoch|,  σ<sub>0</sub> = (0.10, 0.50, 0.15) km,  g = (0.10, 1.00, 0.10) km/day"],
         "HBR = sum of per-object radii (SATCAT RCS class, else type default; ISS 55 m).")
     S += figure("05_bplane")
+    S += figure("05b_methods")
     if scen_alert:
         pcs = scen_alert.get("pc_checks", {})
         mc_txt = (f"gives {fmt(pcs.get('monte_carlo'))}" if pcs.get("monte_carlo") else
@@ -1981,6 +2013,9 @@ def main():
                colWidths=[TW * 0.52, TW * 0.48])
     t2.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP"), ("LEFTPADDING", (0, 0), (-1, -1), 0)]))
     S.append(t2)
+    S.append(Spacer(1, 6))
+    S.append(P("Do the methods agree on every alert, not just the demo?", "h2"))
+    S += figure("05c_pcchecks")
     S.append(PageBreak())
 
     # 5 ML

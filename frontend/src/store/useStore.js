@@ -41,6 +41,39 @@ const useStore = create((set, get) => ({
   rankerReview: {},
   decisionLog: [],
 
+  // ── Sprint 3: globe layers + debris impact replay (shared by both globes) ──
+  layers: {
+    satellites: true,
+    selectedOrbit: true,
+    conjunctionLines: true,
+    labels: true,
+    hotspots: true,
+    parentTracks: true,
+    fragments: true,
+    fragmentTrails: false,
+    debrisEnvelope: true,
+    threatened: true,
+  },
+  fragmentColorMode: 'parent', // 'parent' | 'size' | 'dv'
+  // tRelS: seconds relative to collision (sim time); speed: sim s per wall s.
+  // While playing, tRelS is published at <= 10 Hz; renderers that need a
+  // smooth playhead read Impact/impactClock.playheadNow() instead.
+  impact: {
+    eventId: null,
+    playing: false,
+    tRelS: -900,
+    speed: 60,
+    replay: null,
+  },
+
+  setLayer: (key, value) =>
+    set((state) => ({ layers: { ...state.layers, [key]: !!value } })),
+
+  setFragmentColorMode: (fragmentColorMode) => set({ fragmentColorMode }),
+
+  setImpact: (partial) =>
+    set((state) => ({ impact: { ...state.impact, ...partial } })),
+
   // ── Existing actions ─────────────────────────────────────────────────────────
   setSatellites: (sats) => set({ satellites: sats }),
 

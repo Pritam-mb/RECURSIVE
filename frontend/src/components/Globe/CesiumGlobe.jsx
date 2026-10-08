@@ -15,6 +15,8 @@ import {
   extrapolate,
   observeActivity,
 } from '../../utils/motion';
+import ImpactScene from '../Impact/impactScene';
+import { onFlyTo } from '../Impact/impactClock';
 
 // Only talk to Cesium Ion when a token is configured. Nothing below needs Ion
 // (no base layer, no geocoder, ellipsoid terrain), so without a token the app
@@ -40,6 +42,8 @@ const css = (hex, alpha = 1) => Cesium.Color.fromCssColorString(hex).withAlpha(a
 const COLORS = {
   void: css(PALETTE.void),
   satNominal: css(PALETTE.text, 0.5),
+  // Impact replay: live dots sit at sim-now, not at the playhead — recede them.
+  satReplay: css(PALETTE.text, 0.18),
   satHover: css(PALETTE.bright, 1),
   satSelected: css(PALETTE.accent, 1),
   satSelectedA: css(PALETTE.accent, 1),
@@ -117,11 +121,36 @@ function segmentClearsEarth(a, b) {
   return Math.sqrt((px * px) + (py * py) + (pz * pz)) > EARTH_RADIUS_KM;
 }
 
+// Live-mode layer visibility. In impact mode the replay owns fragments /
+// envelope, so the live debris layer steps aside (CONTRACT3).
+function applyLiveLayers(prims, layers, impactActive) {
+  const on = (key) => {
+    const v = layers?.[key];
+    return typeof v === 'boolean' ? v : key !== 'fragmentTrails';
+  };
+  if (prims.billboards) prims.billboards.show = on('satellites');
+  if (prims.orbitLines) prims.orbitLines.show = on('selectedOrbit');
+  if (prims.conjLines) prims.conjLines.show = on('conjunctionLines');
+  if (prims.labels) prims.labels.show = on('labels');
+  if (prims.hotspotPoints) prims.hotspotPoints.show = on('hotspots');
+  for (const e of prims.hotspotEntities) e.show = on('hotspots');
+  if (prims.debrisPoints) prims.debrisPoints.show = on('fragments') && !impactActive;
+  if (prims.debrisCore) prims.debrisCore.show = on('debrisEnvelope') && !impactActive;
+  for (const e of prims.debrisEntities) e.show = on('debrisEnvelope') && !impactActive;
+  for (const l of prims.debrisLabels) l.show = !impactActive;
+}
+
+function applyLiveLayersFromStore(prims) {
+  const st = useStore.getState();
+  applyLiveLayers(prims, st.layers, st.impact?.replay != null);
+}
+
 function freshPrimitives() {
   return {
     billboards: null,
     labels: null,
     orbitLines: null,
+    conjLines: null,
     focusLabel: null,
     orbitPolyline: null,
     orbitSegmentPolylines: [],
@@ -133,6 +162,7 @@ function freshPrimitives() {
     hotspotKey: null,
     debrisEntities: [],
     debrisPoints: null,
+    debrisCore: null,
     debrisLabels: [],
     debrisKey: null,
     focusedItem: null,
@@ -155,6 +185,7 @@ const CesiumGlobe = ({ mode = 'live', alerts = EMPTY, onSatelliteSelect }) => {
   const viewerRef = useRef(null);
   const motionRef = useRef(freshMotion());
   const primitivesRef = useRef(freshPrimitives());
+  const impactRef = useRef(null);
   const onSelectRef = useRef(onSatelliteSelect);
   onSelectRef.current = onSatelliteSelect;
   // Flips once the viewer exists so data effects re-run against it.
@@ -170,6 +201,7 @@ const CesiumGlobe = ({ mode = 'live', alerts = EMPTY, onSatelliteSelect }) => {
     let pickTimer = null;
     let removePreUpdate = null;
     let clearHover = null;
+    let removeFlyTo = null;
 
     // Defer one frame so the CSS grid has committed its layout; Cesium reads
     // the container size at construction.
@@ -262,6 +294,13 @@ const CesiumGlobe = ({ mode = 'live', alerts = EMPTY, onSatelliteSelect }) => {
       prims.orbitLines = scene.primitives.add(new Cesium.PolylineCollection());
       prims.hotspotPoints = scene.primitives.add(new Cesium.PointPrimitiveCollection());
       prims.debrisPoints = scene.primitives.add(new Cesium.PointPrimitiveCollection());
+      prims.debrisCore = scene.primitives.add(new Cesium.PointPrimitiveCollection());
+      prims.conjLines = scene.primitives.add(new Cesium.PolylineCollection());
+      // Debris impact replay layers (own collections; idle until a replay loads).
+      impactRef.current = new ImpactScene(scene);
+      removeFlyTo = onFlyTo((target) => {
+        if (viewer && !viewer.isDestroyed()) impactRef.current?.flyTo(viewer.camera, target);
+      });
 
       prims.focusLabel = prims.labels.add({
         show: false,
@@ -290,7 +329,7 @@ const CesiumGlobe = ({ mode = 'live', alerts = EMPTY, onSatelliteSelect }) => {
         arcType: Cesium.ArcType.NONE,
         id: 'selected-orbit',
       });
-      prims.approachLine = prims.orbitLines.add({
+      prims.approachLine = prims.conjLines.add({
         show: false,
         positions: [],
         width: 1,
@@ -303,6 +342,10 @@ const CesiumGlobe = ({ mode = 'live', alerts = EMPTY, onSatelliteSelect }) => {
       // render loop instead of a separate rAF. preUpdate fires before the
       // request-render check, so requesting here renders this same frame.
       removePreUpdate = scene.preUpdate.addEventListener(() => {
+        // Impact replay: interpolate at the smooth playhead; render only while
+        // the playhead moves, the flash runs or threat rings pulse.
+        if (impactRef.current?.update()) scene.requestRender();
+
         const motion = motionRef.current;
         const { map, focusedItem, focusLabel } = primitivesRef.current;
         if (motion.lastSnapshotTimestampMs == null || map.size === 0) return;
@@ -391,6 +434,8 @@ const CesiumGlobe = ({ mode = 'live', alerts = EMPTY, onSatelliteSelect }) => {
       if (pickTimer != null) clearTimeout(pickTimer);
       if (stopActivity) stopActivity();
       if (removePreUpdate) removePreUpdate();
+      if (removeFlyTo) removeFlyTo();
+      impactRef.current = null;
       if (viewer && !viewer.isDestroyed()) {
         if (clearHover) viewer.scene.canvas.removeEventListener('mouseleave', clearHover);
         if (handler && !handler.isDestroyed()) handler.destroy();
@@ -413,6 +458,10 @@ const CesiumGlobe = ({ mode = 'live', alerts = EMPTY, onSatelliteSelect }) => {
   const hotspots = useStore((s) => s.hotspots);
   const debrisClouds = useStore((s) => s.debrisClouds);
   const snapshotTimestamp = useStore((s) => s.snapshotTimestamp);
+  const layers = useStore((s) => s.layers);
+  const fragmentColorMode = useStore((s) => s.fragmentColorMode);
+  const impactReplay = useStore((s) => s.impact?.replay ?? null);
+  const impactActive = impactReplay != null;
   const testActive = useTestMode((s) => s.testActive);
   const testSatellites = useTestMode((s) => s.testSatellites);
   const testSim = useTestMode((s) => s.sim);
@@ -578,7 +627,7 @@ const CesiumGlobe = ({ mode = 'live', alerts = EMPTY, onSatelliteSelect }) => {
       else if (threat === THREAT_WARNING) bb.color = COLORS.satWarning;
       else if (threat === THREAT_CAUTION) bb.color = COLORS.satCaution;
       else if (isHovered) bb.color = COLORS.satHover;
-      else bb.color = COLORS.satNominal;
+      else bb.color = impactActive ? COLORS.satReplay : COLORS.satNominal;
 
       bb.scale = (isA || isB || isSelected)
         ? SATELLITE_SELECTED_SCALE
@@ -595,7 +644,7 @@ const CesiumGlobe = ({ mode = 'live', alerts = EMPTY, onSatelliteSelect }) => {
       focusLabel.show = false;
     }
     viewer.scene.requestRender();
-  }, [viewerReady, visibleSats, hoveredSatelliteId, selectedSatelliteId, selectedAId, selectedBId, threatLevels]);
+  }, [viewerReady, visibleSats, hoveredSatelliteId, selectedSatelliteId, selectedAId, selectedBId, threatLevels, impactActive]);
 
   // ── Selected orbit ──────────────────────────────────────────────────────
   useEffect(() => {
@@ -730,6 +779,7 @@ const CesiumGlobe = ({ mode = 'live', alerts = EMPTY, onSatelliteSelect }) => {
       }));
     }
     viewer.entities.resumeEvents();
+    applyLiveLayersFromStore(prims);
     viewer.scene.requestRender();
   }, [viewerReady, hotspots]);
 
@@ -779,6 +829,7 @@ const CesiumGlobe = ({ mode = 'live', alerts = EMPTY, onSatelliteSelect }) => {
     for (const entity of prims.debrisEntities) viewer.entities.remove(entity);
     prims.debrisEntities = [];
     if (prims.debrisPoints) prims.debrisPoints.removeAll();
+    if (prims.debrisCore) prims.debrisCore.removeAll();
     if (prims.labels) for (const l of prims.debrisLabels) prims.labels.remove(l);
     prims.debrisLabels = [];
 
@@ -820,7 +871,7 @@ const CesiumGlobe = ({ mode = 'live', alerts = EMPTY, onSatelliteSelect }) => {
         }));
       });
 
-      prims.debrisPoints?.add({
+      prims.debrisCore?.add({
         position,
         pixelSize: 6,
         color: COLORS.debrisCore,
@@ -846,8 +897,34 @@ const CesiumGlobe = ({ mode = 'live', alerts = EMPTY, onSatelliteSelect }) => {
       }
     }
     viewer.entities.resumeEvents();
+    applyLiveLayersFromStore(prims);
     viewer.scene.requestRender();
   }, [viewerReady, debrisClouds]);
+
+  // ── Layers: show/hide whole collections (no rebuilds) ───────────────────
+  useEffect(() => {
+    const viewer = viewerRef.current;
+    if (!viewerReady || !viewer || viewer.isDestroyed()) return;
+    applyLiveLayers(primitivesRef.current, layers, impactActive);
+    impactRef.current?.setLayers(layers);
+    viewer.scene.requestRender();
+  }, [viewerReady, layers, impactActive]);
+
+  useEffect(() => {
+    if (!viewerReady) return;
+    impactRef.current?.setColorMode(fragmentColorMode);
+  }, [viewerReady, fragmentColorMode]);
+
+  // ── Impact replay payload (parsed once per payload) ─────────────────────
+  useEffect(() => {
+    const viewer = viewerRef.current;
+    if (!viewerReady || !viewer || viewer.isDestroyed() || !impactRef.current) return;
+    const imp = impactRef.current;
+    imp.setReplay(impactReplay, useStore.getState().satellites);
+    imp.setLayers(useStore.getState().layers);
+    imp.setColorMode(useStore.getState().fragmentColorMode);
+    viewer.scene.requestRender();
+  }, [viewerReady, impactReplay]);
 
   // ── Test-mode approach line ─────────────────────────────────────────────
   useEffect(() => {

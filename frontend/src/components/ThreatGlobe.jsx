@@ -47,6 +47,46 @@ const EARTH_RADIUS_KM = 6378.137;
 // A debris ring bigger than this would cover a large part of the disc.
 const MAX_RING_KM = 500;
 const aboveSurface = (p) => !!p && Math.hypot(p.x, p.y, p.z) > EARTH_RADIUS_KM;
+const RAD2DEG = 180 / Math.PI;
+
+// ── Hand navigation ──────────────────────────────────────────────────────
+const DEFAULT_LON = 80;
+const MAX_TILT_DEG = 70;
+const ZOOM_MIN = 0.6;
+const ZOOM_MAX = 2.2;
+const DRAG_THRESHOLD_PX = 4;
+const INERTIA_DECAY_PER_S = 2.4; // velocity *= exp(-k·dt): gentle glide
+const MAX_SPIN_DEG_PER_S = 240;
+const AUTO_RESUME_MS = 6000;
+const HINT_TEXT = 'drag to rotate · scroll to zoom · double-click to reset';
+
+// ── Layers (shared store, CONTRACT3) — safe defaults before the store has them
+const DEFAULT_LAYERS = {
+  satellites: true,
+  selectedOrbit: true,
+  conjunctionLines: true,
+  labels: true,
+  hotspots: true,
+  parentTracks: true,
+  fragments: true,
+  fragmentTrails: false,
+  debrisEnvelope: true,
+  threatened: true,
+};
+const layerOn = (layers, key) => (layers && typeof layers[key] === 'boolean' ? layers[key] : DEFAULT_LAYERS[key]);
+const MAX_HOTSPOTS = 24;
+
+// ── Impact replay ────────────────────────────────────────────────────────
+// Fragment colour ramps (caution amber family, dark → light = small → large).
+const FRAG_RAMP = ['#8a6418', '#c48d1f', '#f0b429', '#ffe3a0'];
+const FRAG_PARENT = ['#f0b429', '#ff8a3d', '#c48d1f'];
+const SIZE_EDGES_M = [0.1, 0.3, 1.0];
+const DV_EDGES_MS = [50, 150, 300];
+const TRAIL_SAMPLES = 8;
+const FLASH_MS = 2000;
+const MAX_THREAT_CALLOUTS = 3;
+const SIZE_LEGEND = ['<0.1 M', '0.1–0.3 M', '0.3–1 M', '≥1 M'];
+const DV_LEGEND = ['<50 M/S', '50–150', '150–300', '≥300 M/S'];
 
 // Simplified coastline data as lat/lon polylines (very compressed)
 // Each sub-array is a connected polyline [[lat,lon],...]
@@ -102,23 +142,30 @@ const GRID_UNIT = (() => {
 })();
 
 /**
- * Orthographic view state for one frame. Rotating the globe is a rotation
- * about the polar axis, so a unit vector (ux, uy, uz) projects to
- *   sx = cx + (uy·cosV − ux·sinV)·R,  sy = cy − uz·R,  depth = ux·cosV + uy·sinV
+ * Orthographic view state for one frame. The view is a rotation about the
+ * polar axis by the view longitude V, then a tilt T about the screen's
+ * horizontal axis (T > 0 = looking down from the north). With
+ *   d0 = ux·cosV + uy·sinV   (depth before tilt)
+ * a unit vector (ux, uy, uz) projects to
+ *   sx = cx + (uy·cosV − ux·sinV)·R
+ *   sy = cy − (uz·cosT − d0·sinT)·R
+ *   depth = d0·cosT + uz·sinT   (≥ 0 → near hemisphere)
  */
-const view = { cx: 0, cy: 0, R: 1, cosV: 1, sinV: 0 };
+const view = { cx: 0, cy: 0, R: 1, cosV: 1, sinV: 0, cosT: 1, sinT: 0 };
 
 function strokeUnitPolylines(ctx, lines) {
-  const { cx, cy, R, cosV, sinV } = view;
+  const { cx, cy, R, cosV, sinV, cosT, sinT } = view;
   ctx.beginPath();
   for (const arr of lines) {
     let penDown = false;
     for (let i = 0; i < arr.length; i += 3) {
       const ux = arr[i];
       const uy = arr[i + 1];
-      if ((ux * cosV) + (uy * sinV) < 0) { penDown = false; continue; }
+      const uz = arr[i + 2];
+      const d0 = (ux * cosV) + (uy * sinV);
+      if ((d0 * cosT) + (uz * sinT) < 0) { penDown = false; continue; }
       const sx = cx + (((uy * cosV) - (ux * sinV)) * R);
-      const sy = cy - (arr[i + 2] * R);
+      const sy = cy - (((uz * cosT) - (d0 * sinT)) * R);
       if (penDown) ctx.lineTo(sx, sy);
       else { ctx.moveTo(sx, sy); penDown = true; }
     }
@@ -144,13 +191,14 @@ function projectEci(x, y, z, out) {
   const ux = x / r;
   const uy = y / r;
   const uz = z / r;
-  const { cx, cy, R, cosV, sinV } = view;
+  const { cx, cy, R, cosV, sinV, cosT, sinT } = view;
   const k = R * displayScale(r);
+  const d0 = (ux * cosV) + (uy * sinV);
   const px = ((uy * cosV) - (ux * sinV)) * k;
-  const py = uz * k;
+  const py = ((uz * cosT) - (d0 * sinT)) * k;
   out.sx = cx + px;
   out.sy = cy - py;
-  out.visible = (ux * cosV) + (uy * sinV) >= 0 || Math.hypot(px, py) > R + 1;
+  out.visible = (d0 * cosT) + (uz * sinT) >= 0 || Math.hypot(px, py) > R + 1;
   return out;
 }
 
@@ -244,10 +292,186 @@ function drawCallout(ctx, anchor, text, color, W, H) {
   return false;
 }
 
+// ── Impact replay preparation (once per payload, never per frame) ─────────
+const finiteOr = (v, d) => {
+  const n = Number(v);
+  return v != null && Number.isFinite(n) ? n : d;
+};
+function bucketOf(v, edges) {
+  const n = Number(v);
+  if (v == null || !Number.isFinite(n)) return 2; // unknown → base amber
+  let b = 0;
+  while (b < edges.length && n >= edges[b]) b += 1;
+  return b;
+}
+function readXyz(p, out, k) {
+  if (!Array.isArray(p) || p.length < 3) return false;
+  const x = Number(p[0]); const y = Number(p[1]); const z = Number(p[2]);
+  if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) return false;
+  out[k] = x; out[k + 1] = y; out[k + 2] = z;
+  return true;
+}
+
+/**
+ * Flattens a replay payload (CONTRACT3) into typed arrays so the render loop
+ * only does index arithmetic. Positions are the backend's propagated samples;
+ * between samples the globe interpolates linearly (labelled on canvas).
+ */
+function prepareReplay(replay) {
+  const tArr = replay?.t_rel_s;
+  if (!Array.isArray(tArr) || tArr.length === 0) return null;
+  const nS = tArr.length;
+  const t = Float64Array.from(tArr, (v) => finiteOr(v, 0));
+  const frags = replay.fragments || {};
+  const fRows = Array.isArray(frags.positions) ? frags.positions : [];
+  const firstRow = fRows.find((row) => Array.isArray(row) && row.length > 0);
+  const nF = Math.min(400, Array.isArray(frags.ids) ? frags.ids.length : (firstRow?.length ?? 0));
+  const fragPos = new Float32Array(nS * nF * 3);
+  const fragOk = new Uint8Array(nS * nF);
+  for (let si = 0; si < nS && si < fRows.length; si += 1) {
+    const row = fRows[si];
+    if (!Array.isArray(row)) continue;
+    for (let f = 0; f < nF; f += 1) {
+      const k = (si * nF) + f;
+      if (readXyz(row[f], fragPos, k * 3)) fragOk[k] = 1;
+    }
+  }
+
+  const parentsObj = replay.parents || {};
+  const declared = Array.isArray(replay.parent_ids) ? replay.parent_ids.map(String) : [];
+  const parentKeys = declared.filter((id) => parentsObj[id]);
+  for (const id of Object.keys(parentsObj)) if (!parentKeys.includes(id)) parentKeys.push(id);
+  const parents = parentKeys.slice(0, 2).map((id, idx) => {
+    const src = parentsObj[id] || {};
+    const pos = new Float32Array(nS * 3);
+    const ok = new Uint8Array(nS);
+    const rows = Array.isArray(src.positions) ? src.positions : [];
+    for (let si = 0; si < nS && si < rows.length; si += 1) if (readXyz(rows[si], pos, si * 3)) ok[si] = 1;
+    return {
+      id: Number(id), name: src.name || `#${id}`, color: idx === 0 ? PALETTE.accent : PALETTE.info,
+      pos, ok, cur: { x: 0, y: 0, z: 0, ok: false }, proj: { sx: 0, sy: 0, visible: false },
+    };
+  });
+
+  const parentOf = Array.isArray(frags.parent_of) ? frags.parent_of : [];
+  const bucket = { parent: new Uint8Array(nF), size: new Uint8Array(nF), dv: new Uint8Array(nF) };
+  for (let f = 0; f < nF; f += 1) {
+    const po = Number(parentOf[f]);
+    bucket.parent[f] = parents[0] && po === parents[0].id ? 0 : parents[1] && po === parents[1].id ? 1 : 2;
+    bucket.size[f] = bucketOf(frags.size_m?.[f], SIZE_EDGES_M);
+    bucket.dv[f] = bucketOf(frags.dv_ms?.[f], DV_EDGES_MS);
+  }
+
+  const env = Array.isArray(replay.envelope) ? replay.envelope : [];
+  const envC = new Float32Array(nS * 3);
+  const envR = new Float32Array(nS);
+  const envOk = new Uint8Array(nS);
+  for (let si = 0; si < nS && si < env.length; si += 1) {
+    const e = env[si];
+    const r90 = Number(e?.p90_km);
+    if (e && readXyz(e.centroid, envC, si * 3) && Number.isFinite(r90) && r90 > 0) {
+      envR[si] = r90;
+      envOk[si] = 1;
+    }
+  }
+
+  // Collision point: backend value if given, else the parents' mean at t≈0.
+  const collision = new Float32Array(3);
+  let hasCollision = readXyz(replay.collision_point_eci_km, collision, 0);
+  if (!hasCollision && parents.length > 0) {
+    let best = 0;
+    for (let si = 1; si < nS; si += 1) if (Math.abs(t[si]) < Math.abs(t[best])) best = si;
+    let n = 0;
+    for (const par of parents) {
+      if (!par.ok[best]) continue;
+      collision[0] += par.pos[best * 3]; collision[1] += par.pos[(best * 3) + 1]; collision[2] += par.pos[(best * 3) + 2];
+      n += 1;
+    }
+    if (n > 0) { collision[0] /= n; collision[1] /= n; collision[2] /= n; hasCollision = true; }
+  }
+
+  return {
+    nS, nF, t, fragPos, fragOk, parents, bucket, envC, envR, envOk,
+    collision, hasCollision,
+    stepS: finiteOr(replay.step_s, nS > 1 ? t[1] - t[0] : 0),
+    threatened: Array.isArray(replay.threatened) ? replay.threatened : EMPTY,
+    // Per-frame scratch (reused).
+    i0: 0, i1: 0, a: 0,
+    cur: new Float32Array(nF * 3),
+    curOk: new Uint8Array(nF),
+    curSx: new Float32Array(nF),
+    curSy: new Float32Array(nF),
+    curVis: new Uint8Array(nF),
+    alive: 0,
+  };
+}
+
+/** Locates the bracketing samples for tRel (binary search, no allocation). */
+function locateSample(prep, tRel) {
+  const { t, nS } = prep;
+  if (!(tRel > t[0])) { prep.i0 = 0; prep.i1 = 0; prep.a = 0; return; }
+  if (tRel >= t[nS - 1]) { prep.i0 = nS - 1; prep.i1 = nS - 1; prep.a = 0; return; }
+  let lo = 0;
+  let hi = nS - 1;
+  while (hi - lo > 1) {
+    const mid = (lo + hi) >> 1;
+    if (t[mid] <= tRel) lo = mid; else hi = mid;
+  }
+  prep.i0 = lo;
+  prep.i1 = hi;
+  prep.a = (tRel - t[lo]) / (t[hi] - t[lo] || 1);
+}
+
+/** Linear interpolation of fragments + parents between real samples. */
+function interpolateReplay(prep) {
+  const { nF, fragPos, fragOk, cur, curOk, i0, i1, a } = prep;
+  const b = 1 - a;
+  let alive = 0;
+  for (let f = 0; f < nF; f += 1) {
+    const k0 = (i0 * nF) + f;
+    const k1 = (i1 * nF) + f;
+    // Strict: both bracketing samples must exist (no fragment before breakup
+    // or after decay), except exactly on a sample.
+    const ok = fragOk[k0] && (a === 0 || fragOk[k1]);
+    curOk[f] = ok ? 1 : 0;
+    if (!ok) continue;
+    const o = f * 3;
+    const p0 = k0 * 3;
+    const p1 = k1 * 3;
+    cur[o] = (fragPos[p0] * b) + (fragPos[p1] * a);
+    cur[o + 1] = (fragPos[p0 + 1] * b) + (fragPos[p1 + 1] * a);
+    cur[o + 2] = (fragPos[p0 + 2] * b) + (fragPos[p1 + 2] * a);
+    alive += 1;
+  }
+  prep.alive = alive;
+  for (const par of prep.parents) {
+    const ok = par.ok[i0] && (a === 0 || par.ok[i1]);
+    par.cur.ok = !!ok;
+    if (!ok) continue;
+    const p0 = i0 * 3;
+    const p1 = i1 * 3;
+    par.cur.x = (par.pos[p0] * b) + (par.pos[p1] * a);
+    par.cur.y = (par.pos[p0 + 1] * b) + (par.pos[p1 + 1] * a);
+    par.cur.z = (par.pos[p0 + 2] * b) + (par.pos[p1 + 2] * a);
+  }
+}
+
+function formatTRel(s) {
+  const sign = s < 0 ? '−' : '+';
+  const v = Math.abs(Math.round(s));
+  const h = Math.floor(v / 3600);
+  const m = Math.floor((v % 3600) / 60);
+  const sec = v % 60;
+  const mm = String(m).padStart(2, '0');
+  const ss = String(sec).padStart(2, '0');
+  return h > 0 ? `T${sign}${h}:${mm}:${ss}` : `T${sign}${mm}:${ss}`;
+}
+
 const testPosA = { sx: 0, sy: 0, visible: false };
 const testPosB = { sx: 0, sy: 0, visible: false };
 const scratchProj = { sx: 0, sy: 0, visible: false };
 const fragAnchor = { sx: 0, sy: 0, visible: true };
+const midpoint = { sx: 0, sy: 0 };
 const placedBoxes = [];
 
 export default function ThreatGlobe({ alerts = EMPTY, satellites = EMPTY, selectedSatId }) {
@@ -341,7 +565,24 @@ export default function ThreatGlobe({ alerts = EMPTY, satellites = EMPTY, select
     let running = false;
     let lastFrameMs = 0;
     let lastTickMs = 0;
-    let viewLon = 80;
+
+    // View navigation state (hand-driven + auto-rotation + inertia).
+    const nav = {
+      lon: DEFAULT_LON, lat: 0, zoom: 1,
+      vLon: 0, vLat: 0,
+      lastInteractMs: -Infinity,
+      autoBlend: 1,
+      resetting: false,
+    };
+    // Pointer state (declared before the loop reads it).
+    const pointers = new Map();
+    const drag = { active: false, moved: false, startX: 0, startY: 0, lastX: 0, lastY: 0, lastT: 0 };
+    const pinch = { active: false, dist: 1, zoom: 1 };
+    // Impact replay state carried between frames.
+    let prep = null;
+    let prepFor = null;
+    let prevTRel = Number.NaN;
+    let flashStartMs = -Infinity;
 
     // Backing store sized only on resize, DPR capped.
     const resize = () => {
@@ -358,6 +599,38 @@ export default function ThreatGlobe({ alerts = EMPTY, satellites = EMPTY, select
     ro.observe(canvas);
     resize();
 
+    const drawCompass = (W) => {
+      // Tiny orientation indicator: equator ellipse squashed by the tilt,
+      // the north pole's position, and the view-centre longitude / tilt.
+      const r = 12;
+      const x = W - 24;
+      const y = 24;
+      ctx.lineWidth = 1;
+      ctx.strokeStyle = PALETTE.lineStrong;
+      ctx.beginPath();
+      ctx.arc(x, y, r, 0, TWO_PI);
+      ctx.stroke();
+      ctx.strokeStyle = PALETTE.dim;
+      ctx.beginPath();
+      ctx.ellipse(x, y, r, Math.max(0.5, r * Math.abs(view.sinT)), 0, 0, TWO_PI);
+      ctx.stroke();
+      ctx.fillStyle = PALETTE.info;
+      ctx.beginPath();
+      ctx.arc(x, y - (r * view.cosT), view.sinT >= 0 ? 2 : 1.25, 0, TWO_PI);
+      ctx.fill();
+      ctx.font = MONO_9;
+      ctx.textAlign = 'right';
+      ctx.textBaseline = 'middle';
+      ctx.fillStyle = PALETTE.dim;
+      const lon = ((((nav.lon + 180) % 360) + 360) % 360) - 180;
+      const lonTxt = `${Math.abs(lon).toFixed(0).padStart(3, '0')}°${lon >= 0 ? 'E' : 'W'}`;
+      const tiltTxt = `${nav.lat >= 0 ? '+' : '−'}${Math.abs(nav.lat).toFixed(0)}°`;
+      ctx.fillText(lonTxt, x - r - 6, y - 5);
+      ctx.fillText(`TILT ${tiltTxt}`, x - r - 6, y + 6);
+      if (nav.zoom < 0.99 || nav.zoom > 1.01) ctx.fillText(`×${nav.zoom.toFixed(2)}`, x - r - 6, y + 17);
+      ctx.textAlign = 'left';
+    };
+
     const draw = (nowMs) => {
       const W = size.w;
       const H = size.h;
@@ -368,12 +641,46 @@ export default function ThreatGlobe({ alerts = EMPTY, satellites = EMPTY, select
         testSatellites: tSats, computed: comp, debrisClouds: clouds, selectedOrbit: orbit,
       } = propsRef.current;
       const motion = motionRef.current;
+      // Shared store keys (CONTRACT3) read per frame — no React re-render.
+      const st = useStore.getState();
+      const layers = st.layers;
+      const impact = st.impact;
+      const colorMode = st.fragmentColorMode === 'size' || st.fragmentColorMode === 'dv' ? st.fragmentColorMode : 'parent';
+      const showSats = layerOn(layers, 'satellites');
+      const showOrbit = layerOn(layers, 'selectedOrbit');
+      const showLinks = layerOn(layers, 'conjunctionLines');
+      const showLabels = layerOn(layers, 'labels');
+      const showHotspots = layerOn(layers, 'hotspots');
+      const showFrags = layerOn(layers, 'fragments');
+      const showEnvelope = layerOn(layers, 'debrisEnvelope');
+      const showThreatened = layerOn(layers, 'threatened');
+      const showParents = layerOn(layers, 'parentTracks');
+      const showTrails = layerOn(layers, 'fragmentTrails');
+
+      const replay = impact?.replay ?? null;
+      if (replay !== prepFor) {
+        prepFor = replay;
+        prep = replay ? prepareReplay(replay) : null;
+        prevTRel = Number.NaN;
+        flashStartMs = -Infinity;
+      }
+      const tRel = finiteOr(impact?.tRelS, 0);
+      if (prep) {
+        if (prevTRel < 0 && tRel >= 0) flashStartMs = nowMs; // crossed the collision
+        prevTRel = tRel;
+        locateSample(prep, tRel);
+        interpolateReplay(prep);
+      }
 
       view.cx = W / 2;
       view.cy = H / 2;
-      view.R = Math.min(W, H) * 0.40;
-      view.cosV = Math.cos(viewLon * DEG);
-      view.sinV = Math.sin(viewLon * DEG);
+      // Zoom scales the disc but always leaves a margin on the long side so
+      // callouts (which never sit on the disc) still have somewhere to go.
+      view.R = Math.max(20, Math.min(Math.min(W, H) * 0.40 * nav.zoom, (Math.max(W, H) / 2) - 70));
+      view.cosV = Math.cos(nav.lon * DEG);
+      view.sinV = Math.sin(nav.lon * DEG);
+      view.cosT = Math.cos(nav.lat * DEG);
+      view.sinT = Math.sin(nav.lat * DEG);
       const { cx, cy, R } = view;
 
       placedBoxes.length = 0;
@@ -401,8 +708,39 @@ export default function ThreatGlobe({ alerts = EMPTY, satellites = EMPTY, select
       // Orbital objects sit above the surface and may extend past the limb.
       ctx.restore();
 
-      // ── Debris clouds: thin dashed rings, slow breathing opacity ───────
-      if (clouds && clouds.length > 0) {
+      // ── Conjunction hotspots (screened TCA locations) ──────────────────
+      const hotspots = st.hotspots;
+      if (showHotspots && Array.isArray(hotspots) && hotspots.length > 0) {
+        ctx.strokeStyle = PALETTE.warning;
+        ctx.fillStyle = PALETTE.warning;
+        ctx.lineWidth = 1;
+        const n = Math.min(hotspots.length, MAX_HOTSPOTS);
+        for (let i = 0; i < n; i += 1) {
+          const pos = hotspots[i]?.position;
+          if (!aboveSurface(pos)) continue;
+          const p = projectEci(pos.x, pos.y, pos.z, scratchProj);
+          if (!p.visible) continue;
+          const zone = Number(hotspots[i].zone_radius_km);
+          const rr = Math.max(4, Math.min(Number.isFinite(zone) ? zone * (R / 6371.0) : 4, 18));
+          ctx.globalAlpha = 0.45;
+          ctx.beginPath();
+          ctx.arc(p.sx, p.sy, rr, 0, TWO_PI);
+          ctx.stroke();
+          ctx.globalAlpha = 0.9;
+          ctx.beginPath();
+          ctx.moveTo(p.sx, p.sy - 2.5);
+          ctx.lineTo(p.sx + 2.5, p.sy);
+          ctx.lineTo(p.sx, p.sy + 2.5);
+          ctx.lineTo(p.sx - 2.5, p.sy);
+          ctx.closePath();
+          ctx.fill();
+        }
+        ctx.globalAlpha = 1;
+      }
+
+      // ── Debris clouds (live): fragments + dashed envelope ring ─────────
+      // While an impact replay is loaded, the replay owns the debris layers.
+      if (!prep && clouds && clouds.length > 0 && (showFrags || showEnvelope || showLabels)) {
         ctx.font = MONO_9;
         ctx.setLineDash([3, 3]);
         ctx.strokeStyle = PALETTE.caution;
@@ -424,7 +762,7 @@ export default function ThreatGlobe({ alerts = EMPTY, satellites = EMPTY, select
             if (!aboveSurface(f)) continue;
             const fp = projectEci(f.x, f.y, f.z, scratchProj);
             if (!fp.visible) continue;
-            ctx.rect(fp.sx - 0.75, fp.sy - 0.75, 1.5, 1.5);
+            if (showFrags) ctx.rect(fp.sx - 0.75, fp.sy - 0.75, 1.5, 1.5);
             const d2 = ((f.x - c.x) ** 2) + ((f.y - c.y) ** 2) + ((f.z - c.z) ** 2);
             if (d2 < nearestD2) { nearestD2 = d2; hasAnchor = true; fragAnchor.sx = fp.sx; fragAnchor.sy = fp.sy; }
           }
@@ -445,15 +783,17 @@ export default function ThreatGlobe({ alerts = EMPTY, satellites = EMPTY, select
           }
           // Percentile radius of the real fragment spread; a dot when absent.
           const radiusPx = compact && radius ? Math.max(3, radius.km * (R / 6371.0)) : 3;
-          ctx.strokeStyle = PALETTE.caution;
-          ctx.globalAlpha = breathe;
-          ctx.beginPath();
-          ctx.arc(p.sx, p.sy, radiusPx, 0, TWO_PI);
-          ctx.stroke();
+          if (showEnvelope) {
+            ctx.strokeStyle = PALETTE.caution;
+            ctx.globalAlpha = breathe;
+            ctx.beginPath();
+            ctx.arc(p.sx, p.sy, radiusPx, 0, TWO_PI);
+            ctx.stroke();
+          }
           ctx.globalAlpha = 1;
           ctx.setLineDash([]);
           const text = cloudLabel(cloud);
-          if (seenLabels.has(text)) { ctx.setLineDash([3, 3]); continue; }
+          if (!showLabels || seenLabels.has(text)) { ctx.setLineDash([3, 3]); continue; }
           seenLabels.add(text);
           const tw = ctx.measureText(text).width + 10;
           const bx = p.sx - (tw / 2);
@@ -512,7 +852,7 @@ export default function ThreatGlobe({ alerts = EMPTY, satellites = EMPTY, select
       const cpiOf = (id) => ((id === testIdA || id === testIdB) ? 10 : (cpiById.get(id) ?? 0));
 
       // ── Selected satellite's orbit: near side only, hidden behind the globe ─
-      if (orbit && orbit.length > 1 && selectedId != null) {
+      if (showOrbit && orbit && orbit.length > 1 && selectedId != null) {
         ctx.strokeStyle = PALETTE.accent;
         ctx.globalAlpha = 0.75;
         ctx.lineWidth = 1.25;
@@ -532,16 +872,194 @@ export default function ThreatGlobe({ alerts = EMPTY, satellites = EMPTY, select
       }
 
       // Nominal satellites: one batched path of tiny dim dots.
-      ctx.fillStyle = PALETTE.dim;
-      ctx.globalAlpha = 0.7;
-      ctx.beginPath();
-      for (const [id, entry] of motion.sats) {
-        const p = entry.proj;
-        if (!p.visible || threatColor(cpiOf(id))) continue;
-        ctx.rect(p.sx - 0.75, p.sy - 0.75, 1.5, 1.5);
+      if (showSats) {
+        ctx.fillStyle = PALETTE.dim;
+        ctx.globalAlpha = 0.7;
+        ctx.beginPath();
+        for (const [id, entry] of motion.sats) {
+          const p = entry.proj;
+          if (!p.visible || threatColor(cpiOf(id))) continue;
+          ctx.rect(p.sx - 0.75, p.sy - 0.75, 1.5, 1.5);
+        }
+        ctx.fill();
+        ctx.globalAlpha = 1;
       }
-      ctx.fill();
-      ctx.globalAlpha = 1;
+
+      // ── Impact replay: parents, fragments, envelope, flash ─────────────
+      if (prep) {
+        const { i0, nF, cur, curOk, curSx, curSy, curVis, bucket } = prep;
+        // Parent tracks (full propagated window) + moving dots.
+        if (showParents) {
+          for (const par of prep.parents) {
+            ctx.strokeStyle = par.color;
+            ctx.lineWidth = 1.25;
+            for (let pass = 0; pass < 2; pass += 1) {
+              // pass 0: pre-collision (solid); pass 1: post-collision (dashed, faint)
+              ctx.setLineDash(pass === 0 ? [] : [2, 4]);
+              ctx.globalAlpha = pass === 0 ? 0.6 : 0.25;
+              ctx.beginPath();
+              let penDown = false;
+              for (let si = 0; si < prep.nS; si += 1) {
+                const ts = prep.t[si];
+                if ((pass === 0 && ts > 0) || (pass === 1 && ts < 0) || !par.ok[si]) { penDown = false; continue; }
+                const o = si * 3;
+                const p = projectEci(par.pos[o], par.pos[o + 1], par.pos[o + 2], scratchProj);
+                if (!p.visible) { penDown = false; continue; }
+                if (penDown) ctx.lineTo(p.sx, p.sy);
+                else { ctx.moveTo(p.sx, p.sy); penDown = true; }
+              }
+              ctx.stroke();
+            }
+            ctx.setLineDash([]);
+            ctx.globalAlpha = 1;
+            par.proj.visible = false;
+            if (!par.cur.ok) continue;
+            projectEci(par.cur.x, par.cur.y, par.cur.z, par.proj);
+            if (!par.proj.visible) continue;
+            ctx.fillStyle = par.color;
+            ctx.strokeStyle = par.color;
+            ctx.beginPath();
+            ctx.arc(par.proj.sx, par.proj.sy, 3, 0, TWO_PI);
+            if (tRel < 0) {
+              ctx.fill();
+            } else {
+              // After breakup the intact parent no longer exists: hollow marker.
+              ctx.globalAlpha = 0.45;
+              ctx.stroke();
+              ctx.globalAlpha = 1;
+            }
+          }
+          ctx.lineWidth = 1;
+        }
+
+        // Project current fragment positions once (reused by trails/threat lines).
+        for (let f = 0; f < nF; f += 1) {
+          curVis[f] = 0;
+          if (!curOk[f]) continue;
+          const o = f * 3;
+          const p = projectEci(cur[o], cur[o + 1], cur[o + 2], scratchProj);
+          if (!p.visible) continue;
+          curVis[f] = 1;
+          curSx[f] = p.sx;
+          curSy[f] = p.sy;
+        }
+        const buckets = colorMode === 'parent' ? bucket.parent : colorMode === 'size' ? bucket.size : bucket.dv;
+        const colors = colorMode === 'parent' ? FRAG_PARENT : FRAG_RAMP;
+
+        // Short trails: the last TRAIL_SAMPLES real samples → current position.
+        if (showTrails && showFrags) {
+          const first = Math.max(0, i0 - TRAIL_SAMPLES);
+          ctx.lineWidth = 1;
+          ctx.globalAlpha = 0.35;
+          for (let b = 0; b < colors.length; b += 1) {
+            ctx.strokeStyle = colors[b];
+            ctx.beginPath();
+            for (let f = 0; f < nF; f += 1) {
+              if (buckets[f] !== b || !curVis[f]) continue;
+              let penDown = false;
+              for (let si = first; si <= i0; si += 1) {
+                const k = (si * nF) + f;
+                if (!prep.fragOk[k]) { penDown = false; continue; }
+                const o = k * 3;
+                const p = projectEci(prep.fragPos[o], prep.fragPos[o + 1], prep.fragPos[o + 2], scratchProj);
+                if (!p.visible) { penDown = false; continue; }
+                if (penDown) ctx.lineTo(p.sx, p.sy);
+                else { ctx.moveTo(p.sx, p.sy); penDown = true; }
+              }
+              if (penDown) ctx.lineTo(curSx[f], curSy[f]);
+            }
+            ctx.stroke();
+          }
+          ctx.globalAlpha = 1;
+        }
+
+        // Debris envelope: p90 ring around the interpolated centroid.
+        if (showEnvelope && tRel >= 0) {
+          const { i1, a, envOk, envC, envR } = prep;
+          if (envOk[i0] && (a === 0 || envOk[i1])) {
+            const b0 = 1 - a;
+            const o0 = i0 * 3;
+            const o1 = i1 * 3;
+            const ex = (envC[o0] * b0) + (envC[o1] * a);
+            const ey = (envC[o0 + 1] * b0) + (envC[o1 + 1] * a);
+            const ez = (envC[o0 + 2] * b0) + (envC[o1 + 2] * a);
+            const rKm = (envR[i0] * b0) + (envR[i1] * a);
+            const p = projectEci(ex, ey, ez, scratchProj);
+            // A p90 spread of thousands of km (diverged streams) is not a ring.
+            if (p.visible && rKm <= MAX_RING_KM * 4) {
+              ctx.setLineDash([3, 3]);
+              ctx.strokeStyle = PALETTE.caution;
+              ctx.globalAlpha = 0.55;
+              ctx.beginPath();
+              ctx.arc(p.sx, p.sy, Math.max(4, rKm * (R / 6371.0)), 0, TWO_PI);
+              ctx.stroke();
+              ctx.setLineDash([]);
+              ctx.globalAlpha = 1;
+            }
+          }
+        }
+
+        // Fragments: one batched path per colour bucket.
+        if (showFrags) {
+          ctx.globalAlpha = 0.9;
+          for (let b = 0; b < colors.length; b += 1) {
+            ctx.fillStyle = colors[b];
+            ctx.beginPath();
+            for (let f = 0; f < nF; f += 1) {
+              if (buckets[f] !== b || !curVis[f]) continue;
+              ctx.rect(curSx[f] - 1, curSy[f] - 1, 2, 2);
+            }
+            ctx.fill();
+          }
+          ctx.globalAlpha = 1;
+        }
+
+        // Collision marker (after breakup) and the flash / shockwave.
+        if (prep.hasCollision) {
+          const c = prep.collision;
+          const p = projectEci(c[0], c[1], c[2], scratchProj);
+          if (p.visible) {
+            const age = nowMs - flashStartMs;
+            if (age >= 0 && age < FLASH_MS) {
+              const k = age / FLASH_MS;
+              const ease = 1 - ((1 - k) ** 3);
+              const fade = 1 - k;
+              const scale = Math.max(0.6, R / 300);
+              const rCore = (10 + (ease * 34)) * scale;
+              const g = ctx.createRadialGradient(p.sx, p.sy, 0, p.sx, p.sy, rCore);
+              g.addColorStop(0, `rgba(255,248,235,${(0.95 * fade).toFixed(3)})`);
+              g.addColorStop(0.35, `rgba(255,214,140,${(0.7 * fade).toFixed(3)})`);
+              g.addColorStop(1, 'rgba(240,180,41,0)');
+              ctx.fillStyle = g;
+              ctx.beginPath();
+              ctx.arc(p.sx, p.sy, rCore, 0, TWO_PI);
+              ctx.fill();
+              ctx.strokeStyle = PALETTE.caution;
+              ctx.lineWidth = (2 * fade) + 0.5;
+              ctx.globalAlpha = fade;
+              ctx.beginPath();
+              ctx.arc(p.sx, p.sy, (6 + (ease * 90)) * scale, 0, TWO_PI);
+              ctx.stroke();
+              ctx.globalAlpha = fade * 0.5;
+              ctx.lineWidth = 1;
+              ctx.beginPath();
+              ctx.arc(p.sx, p.sy, (4 + (ease * 55)) * scale, 0, TWO_PI);
+              ctx.stroke();
+              ctx.globalAlpha = 1;
+            }
+            if (tRel >= 0) {
+              ctx.strokeStyle = PALETTE.bright;
+              ctx.globalAlpha = 0.8;
+              ctx.lineWidth = 1;
+              ctx.beginPath();
+              ctx.moveTo(p.sx - 3, p.sy - 3); ctx.lineTo(p.sx + 3, p.sy + 3);
+              ctx.moveTo(p.sx + 3, p.sy - 3); ctx.lineTo(p.sx - 3, p.sy + 3);
+              ctx.stroke();
+              ctx.globalAlpha = 1;
+            }
+          }
+        }
+      }
 
       // ── Conjunction lines (+ a pill for the top few) ───────────────────
       ctx.font = MONO_9;
@@ -558,7 +1076,7 @@ export default function ThreatGlobe({ alerts = EMPTY, satellites = EMPTY, select
         if (id === testIdB) return testB.position;
         return motion.sats.get(id)?.render ?? null;
       };
-      for (const alert of ranked) {
+      for (const alert of showLinks ? ranked : EMPTY) {
         const isDebris = alert.source === 'debris';
         const idA = Number(alert.sat1?.id);
         const idB = Number(alert.sat2?.id);
@@ -597,7 +1115,7 @@ export default function ThreatGlobe({ alerts = EMPTY, satellites = EMPTY, select
       // ── Threatened + selected satellites ───────────────────────────────
       const drawThreatDot = (id, p) => {
         if (!p || !p.visible) return;
-        const color = threatColor(cpiOf(id));
+        const color = showSats ? threatColor(cpiOf(id)) : null;
         if (color) {
           ctx.fillStyle = color;
           ctx.beginPath();
@@ -635,37 +1153,99 @@ export default function ThreatGlobe({ alerts = EMPTY, satellites = EMPTY, select
         drawThreatDot(sid, posOf(sid));
       }
 
-      // ── Limb + readout ─────────────────────────────────────────────────
+      // ── Limb ───────────────────────────────────────────────────────────
       ctx.beginPath();
       ctx.arc(cx, cy, R + 0.5, 0, TWO_PI);
       ctx.strokeStyle = PALETTE.lineStrong;
       ctx.lineWidth = 1;
       ctx.stroke();
 
-      // ── Callout labels, outside the disc (near-side objects only) ──────
+      // ── Impact: satellites threatened by this event's fragments ────────
+      // Red pulse ring + dashed line to the nearest live (interpolated) fragment.
       ctx.font = MONO_9;
       ctx.textBaseline = 'middle';
-      const midpoint = { sx: 0, sy: 0 };
-      for (let i = 0; i < pills.length; i += 3) {
-        const alert = pills[i];
-        const pA = pills[i + 1];
-        const pB = pills[i + 2];
-        const missKm = alert.miss_distance_km == null ? null : Number(alert.miss_distance_km);
-        const miss = formatMiss(Number.isFinite(missKm) ? missKm : null);
-        const tca = formatTca(alert);
-        const core = miss && tca ? `${miss}  ${tca}` : (miss || tca);
-        if (!core) continue;
-        const text = alert.source === 'debris' ? `DEB  ${core}` : core;
-        midpoint.sx = (pA.sx + pB.sx) / 2;
-        midpoint.sy = (pA.sy + pB.sy) / 2;
-        drawCallout(ctx, midpoint, text, threatColor(alertLevel(alert)) || PALETTE.text, W, H);
+      if (prep && showThreatened && prep.threatened.length > 0) {
+        const phase = (nowMs % 1400) / 1400;
+        const { nF, cur, curOk, curVis, curSx, curSy } = prep;
+        let threatCallouts = 0;
+        for (const th of prep.threatened) {
+          const entry = motion.sats.get(Number(th?.sat_id));
+          if (!entry || !entry.proj.visible) continue;
+          const p = entry.proj;
+          const r = entry.render;
+          let best = -1;
+          let bestD2 = Infinity;
+          for (let f = 0; f < nF; f += 1) {
+            if (!curOk[f]) continue;
+            const o = f * 3;
+            const dx = cur[o] - r.x;
+            const dy = cur[o + 1] - r.y;
+            const dz = cur[o + 2] - r.z;
+            const d2 = (dx * dx) + (dy * dy) + (dz * dz);
+            if (d2 < bestD2) { bestD2 = d2; best = f; }
+          }
+          if (best >= 0 && curVis[best]) {
+            ctx.strokeStyle = PALETTE.warning;
+            ctx.globalAlpha = 0.6;
+            ctx.setLineDash([2, 3]);
+            ctx.lineWidth = 1;
+            ctx.beginPath();
+            ctx.moveTo(p.sx, p.sy);
+            ctx.lineTo(curSx[best], curSy[best]);
+            ctx.stroke();
+            ctx.setLineDash([]);
+          }
+          ctx.globalAlpha = 1;
+          ctx.fillStyle = PALETTE.warning;
+          ctx.beginPath();
+          ctx.arc(p.sx, p.sy, 2.75, 0, TWO_PI);
+          ctx.fill();
+          ctx.strokeStyle = PALETTE.warning;
+          ctx.lineWidth = 1.25;
+          ctx.globalAlpha = 1 - phase;
+          ctx.beginPath();
+          ctx.arc(p.sx, p.sy, 4 + (phase * 9), 0, TWO_PI);
+          ctx.stroke();
+          ctx.globalAlpha = 1;
+          ctx.lineWidth = 1;
+          if (showLabels && threatCallouts < MAX_THREAT_CALLOUTS) {
+            const miss = formatMiss(Number(th.miss_km));
+            const name = String(th.name ?? entry.name ?? `#${th.sat_id}`).slice(0, 14).toUpperCase();
+            if (drawCallout(ctx, p, miss ? `${name}  ${miss}` : name, PALETTE.warning, W, H)) threatCallouts += 1;
+          }
+        }
       }
-      if (selectedId != null) {
-        const sid = Number(selectedId);
-        const p = posOf(sid);
-        if (p && p.visible) {
-          const name = sid === testIdA ? testA.name : sid === testIdB ? testB.name : motion.sats.get(sid)?.name;
-          drawCallout(ctx, p, (name ?? `#${sid}`).slice(0, 18).toUpperCase(), PALETTE.bright, W, H);
+
+      // ── Callout labels, outside the disc (near-side objects only) ──────
+      if (showLabels) {
+        if (prep && showParents) {
+          for (const par of prep.parents) {
+            if (par.cur.ok && par.proj.visible) {
+              drawCallout(ctx, par.proj, String(par.name).slice(0, 16).toUpperCase(), par.color, W, H);
+            }
+          }
+        }
+        for (let i = 0; i < pills.length; i += 3) {
+          const alert = pills[i];
+          const pA = pills[i + 1];
+          const pB = pills[i + 2];
+          const missKm = alert.miss_distance_km == null ? null : Number(alert.miss_distance_km);
+          const miss = formatMiss(Number.isFinite(missKm) ? missKm : null);
+          const tca = formatTca(alert);
+          const core = miss && tca ? `${miss}  ${tca}` : (miss || tca);
+          if (!core) continue;
+          const text = alert.source === 'debris' ? `DEB  ${core}` : core;
+          midpoint.sx = (pA.sx + pB.sx) / 2;
+          midpoint.sy = (pA.sy + pB.sy) / 2;
+          drawCallout(ctx, midpoint, text, threatColor(alertLevel(alert)) || PALETTE.text, W, H);
+        }
+        if (selectedId != null) {
+          const sid = Number(selectedId);
+          const p = posOf(sid);
+          if (p && p.visible) {
+            const name = sid === testIdA ? testA.name : sid === testIdB ? testB.name : motion.sats.get(sid)?.name;
+            drawCallout(ctx, p, (name ?? `#${sid}`).slice(0, 18).toUpperCase(), PALETTE.bright, W, H);
+          }
         }
       }
 
@@ -675,7 +1255,41 @@ export default function ThreatGlobe({ alerts = EMPTY, satellites = EMPTY, select
       ctx.textBaseline = 'alphabetic';
       ctx.fillText(`${cpiById.size} AT RISK`, 10, H - 24);
       ctx.fillText(`${alertCount} CONJUNCTIONS`, 10, H - 10);
+
+      // Impact replay readout + colour legend (top-left, under the panel label).
+      if (prep) {
+        ctx.fillStyle = tRel >= 0 ? PALETTE.caution : PALETTE.text;
+        ctx.fillText(`IMPACT REPLAY  ${formatTRel(tRel)}`, 10, 44);
+        if ('letterSpacing' in ctx) ctx.letterSpacing = '0px';
+        ctx.font = MONO_9;
+        ctx.fillStyle = PALETTE.dim;
+        ctx.fillText(`${prep.alive}/${prep.nF} FRAGMENTS · ${colorMode.toUpperCase()} COLOUR`, 10, 58);
+        ctx.fillText(`LINEAR INTERP. BETWEEN ${Math.round(prep.stepS)} S PROPAGATED SAMPLES`, 10, 70);
+        const cols = colorMode === 'parent' ? FRAG_PARENT : FRAG_RAMP;
+        const n = colorMode === 'parent' ? Math.min(2, prep.parents.length || 2) : FRAG_RAMP.length;
+        let lx = 10;
+        for (let i = 0; i < n; i += 1) {
+          const txt = colorMode === 'parent'
+            ? `${String(prep.parents[i]?.name ?? (i === 0 ? 'A' : 'B')).slice(0, 12).toUpperCase()} FRAG`
+            : (colorMode === 'size' ? SIZE_LEGEND : DV_LEGEND)[i];
+          ctx.fillStyle = cols[i];
+          ctx.fillRect(lx, 79, 6, 6);
+          ctx.fillStyle = PALETTE.dim;
+          ctx.fillText(txt, lx + 9, 85);
+          lx += ctx.measureText(txt).width + 20;
+        }
+      }
       if ('letterSpacing' in ctx) ctx.letterSpacing = '0px';
+
+      // Interaction hint (bottom-right, dim) + orientation indicator.
+      ctx.font = MONO_9;
+      ctx.textAlign = 'right';
+      ctx.fillStyle = PALETTE.dim;
+      ctx.globalAlpha = 0.6;
+      ctx.fillText(HINT_TEXT, W - 10, H - 10);
+      ctx.globalAlpha = 1;
+      ctx.textAlign = 'left';
+      drawCompass(W);
     };
 
     const tick = (nowMs) => {
@@ -684,10 +1298,33 @@ export default function ThreatGlobe({ alerts = EMPTY, satellites = EMPTY, select
       rafId = requestAnimationFrame(tick);
       if (nowMs - lastFrameMs < FRAME_INTERVAL_MS - 1) return; // ~30 fps cap
       lastFrameMs = nowMs;
-      // Time-based rotation, independent of frame rate and pauses.
+      // Time-based motion, independent of frame rate and pauses.
       const dt = Math.min((nowMs - lastTickMs) / 1000, 0.1);
       lastTickMs = nowMs;
-      viewLon = (viewLon + (ROTATION_DEG_PER_S * dt)) % 360;
+      if (!drag.active) {
+        // Inertia glide after a fling (gentle exponential decay).
+        nav.lon += nav.vLon * dt;
+        nav.lat = Math.max(-MAX_TILT_DEG, Math.min(MAX_TILT_DEG, nav.lat + (nav.vLat * dt)));
+        const decay = Math.exp(-INERTIA_DECAY_PER_S * dt);
+        nav.vLon *= decay;
+        nav.vLat *= decay;
+        if (Math.abs(nav.vLon) < 0.05) nav.vLon = 0;
+        if (Math.abs(nav.vLat) < 0.05) nav.vLat = 0;
+      }
+      if (nav.resetting) {
+        const k = 1 - Math.exp(-8 * dt);
+        nav.lat += (0 - nav.lat) * k;
+        nav.zoom += (1 - nav.zoom) * k;
+        if (Math.abs(nav.lat) < 0.05 && Math.abs(nav.zoom - 1) < 0.002) {
+          nav.lat = 0;
+          nav.zoom = 1;
+          nav.resetting = false;
+        }
+      }
+      // Auto-rotation pauses while interacting and eases back in after idle.
+      const target = nowMs - nav.lastInteractMs > AUTO_RESUME_MS ? 1 : 0;
+      nav.autoBlend += (target - nav.autoBlend) * Math.min(1, dt * 1.2);
+      nav.lon = (nav.lon + (ROTATION_DEG_PER_S * nav.autoBlend * dt)) % 360;
       draw(nowMs);
     };
 
@@ -704,6 +1341,122 @@ export default function ThreatGlobe({ alerts = EMPTY, satellites = EMPTY, select
       rafId = 0;
     };
 
+    // ── Pointer interaction: drag rotate, pinch/wheel zoom, click select ──
+    const markInteract = () => {
+      nav.lastInteractMs = performance.now();
+      nav.autoBlend = 0;
+      nav.resetting = false;
+    };
+    const localX = (evt) => evt.clientX - canvas.getBoundingClientRect().left;
+    const localY = (evt) => evt.clientY - canvas.getBoundingClientRect().top;
+    const pinchDist = () => {
+      const it = pointers.values();
+      const a = it.next().value;
+      const b = it.next().value;
+      return Math.max(1, Math.hypot(a.x - b.x, a.y - b.y));
+    };
+    const selectAt = (x, y) => {
+      if (!layerOn(useStore.getState().layers, 'satellites')) return;
+      let bestId = null;
+      let bestD2 = 10 * 10; // px pick radius
+      for (const [id, entry] of motionRef.current.sats) {
+        const p = entry.proj;
+        if (!p.visible) continue;
+        const d2 = ((p.sx - x) ** 2) + ((p.sy - y) ** 2);
+        if (d2 < bestD2) { bestD2 = d2; bestId = id; }
+      }
+      if (bestId != null) useStore.getState().setSelectedSatelliteId?.(bestId);
+    };
+    const onPointerDown = (evt) => {
+      if (evt.pointerType === 'mouse' && evt.button !== 0) return;
+      const x = localX(evt);
+      const y = localY(evt);
+      pointers.set(evt.pointerId, { x, y });
+      try { canvas.setPointerCapture(evt.pointerId); } catch { /* capture is best-effort */ }
+      if (pointers.size === 1) {
+        drag.active = true;
+        drag.moved = false;
+        drag.startX = x; drag.startY = y;
+        drag.lastX = x; drag.lastY = y;
+        drag.lastT = performance.now();
+        nav.vLon = 0;
+        nav.vLat = 0;
+        markInteract();
+      } else if (pointers.size === 2) {
+        pinch.active = true;
+        pinch.dist = pinchDist();
+        pinch.zoom = nav.zoom;
+        drag.moved = true; // a pinch is never a click
+      }
+    };
+    const onPointerMove = (evt) => {
+      const pt = pointers.get(evt.pointerId);
+      if (!pt) return;
+      const x = localX(evt);
+      const y = localY(evt);
+      pt.x = x; pt.y = y;
+      if (pinch.active && pointers.size >= 2) {
+        nav.zoom = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, pinch.zoom * (pinchDist() / pinch.dist)));
+        markInteract();
+        return;
+      }
+      if (!drag.active) return;
+      if (!drag.moved) {
+        if (Math.hypot(x - drag.startX, y - drag.startY) <= DRAG_THRESHOLD_PX) return;
+        drag.moved = true;
+        canvas.style.cursor = 'grabbing';
+      }
+      const now = performance.now();
+      const dtS = Math.max((now - drag.lastT) / 1000, 1 / 240);
+      const R = Math.max(view.R, 1);
+      // The surface under the cursor follows it: right drag → globe turns right.
+      const dLon = -((x - drag.lastX) / R) * RAD2DEG;
+      const dLat = ((y - drag.lastY) / R) * RAD2DEG;
+      nav.lon += dLon;
+      nav.lat = Math.max(-MAX_TILT_DEG, Math.min(MAX_TILT_DEG, nav.lat + dLat));
+      const clampV = (v) => Math.max(-MAX_SPIN_DEG_PER_S, Math.min(MAX_SPIN_DEG_PER_S, v));
+      nav.vLon = clampV((0.6 * (dLon / dtS)) + (0.4 * nav.vLon));
+      nav.vLat = clampV((0.6 * (dLat / dtS)) + (0.4 * nav.vLat));
+      drag.lastX = x; drag.lastY = y; drag.lastT = now;
+      markInteract();
+    };
+    const endPointer = (evt, isClick) => {
+      if (!pointers.has(evt.pointerId)) return;
+      pointers.delete(evt.pointerId);
+      try { canvas.releasePointerCapture(evt.pointerId); } catch { /* already released */ }
+      if (pointers.size < 2) pinch.active = false;
+      if (pointers.size > 0) return;
+      if (drag.active) {
+        if (isClick && !drag.moved) selectAt(localX(evt), localY(evt));
+        // Held still before release → no fling.
+        if (performance.now() - drag.lastT > 80) { nav.vLon = 0; nav.vLat = 0; }
+        markInteract();
+      }
+      drag.active = false;
+      canvas.style.cursor = 'grab';
+    };
+    const onPointerUp = (evt) => endPointer(evt, true);
+    const onPointerCancel = (evt) => endPointer(evt, false);
+    const onWheel = (evt) => {
+      evt.preventDefault();
+      const unit = evt.deltaMode === 1 ? 16 : evt.deltaMode === 2 ? 400 : 1;
+      nav.zoom = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, nav.zoom * Math.exp(-evt.deltaY * unit * 0.0012)));
+      markInteract();
+    };
+    const onDblClick = (evt) => {
+      evt.preventDefault();
+      nav.vLon = 0;
+      nav.vLat = 0;
+      nav.resetting = true;
+      nav.lastInteractMs = -Infinity; // auto-rotation resumes straight away
+    };
+    canvas.addEventListener('pointerdown', onPointerDown);
+    canvas.addEventListener('pointermove', onPointerMove);
+    canvas.addEventListener('pointerup', onPointerUp);
+    canvas.addEventListener('pointercancel', onPointerCancel);
+    canvas.addEventListener('wheel', onWheel, { passive: false });
+    canvas.addEventListener('dblclick', onDblClick);
+
     // Pause when the tab is hidden or the canvas is offscreen.
     const stopActivity = observeActivity(canvas, (active) => (active ? start() : stop()));
 
@@ -711,31 +1464,20 @@ export default function ThreatGlobe({ alerts = EMPTY, satellites = EMPTY, select
       stopActivity();
       stop();
       ro.disconnect();
+      canvas.removeEventListener('pointerdown', onPointerDown);
+      canvas.removeEventListener('pointermove', onPointerMove);
+      canvas.removeEventListener('pointerup', onPointerUp);
+      canvas.removeEventListener('pointercancel', onPointerCancel);
+      canvas.removeEventListener('wheel', onWheel);
+      canvas.removeEventListener('dblclick', onDblClick);
     };
   }, []);
-
-  // Click a dot to select it (same selection as the live globe).
-  const setSelectedSatelliteId = useStore((s) => s.setSelectedSatelliteId);
-  const handleClick = (evt) => {
-    const rect = evt.currentTarget.getBoundingClientRect();
-    const x = evt.clientX - rect.left;
-    const y = evt.clientY - rect.top;
-    let bestId = null;
-    let bestD2 = 10 * 10; // px pick radius
-    for (const [id, entry] of motionRef.current.sats) {
-      const p = entry.proj;
-      if (!p.visible) continue;
-      const d2 = ((p.sx - x) ** 2) + ((p.sy - y) ** 2);
-      if (d2 < bestD2) { bestD2 = d2; bestId = id; }
-    }
-    if (bestId != null) setSelectedSatelliteId(bestId);
-  };
 
   return (
     <canvas
       ref={canvasRef}
-      onClick={handleClick}
-      style={{ width: '100%', height: '100%', display: 'block', cursor: 'crosshair', background: PALETTE.void }}
+      data-testid="threat-globe"
+      style={{ width: '100%', height: '100%', display: 'block', cursor: 'grab', touchAction: 'none', background: PALETTE.void }}
     />
   );
 }

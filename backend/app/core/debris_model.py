@@ -510,6 +510,20 @@ class DebrisModel:
             self._last_timeline = {}
             self._last_screen_meta = {}
 
+    def drop_events_with_parents(self, norad_ids) -> list[str]:
+        """Drop events whose parent objects were removed from the catalogue."""
+        ids = {int(x) for x in norad_ids}
+        with self._lock:
+            gone = [eid for eid, ev in self._events.items() if ids & set(ev.parent_ids)]
+            for eid in gone:
+                self._events.pop(eid, None)
+                self._last_exposure.pop(eid, None)
+                self._last_timeline.pop(eid, None)
+            if gone:
+                self._last_alerts = [a for a in self._last_alerts
+                                     if a.get("parent_event", {}).get("event_id") not in gone]
+        return gone
+
     @property
     def last_screen_meta(self) -> dict:
         return dict(self._last_screen_meta)

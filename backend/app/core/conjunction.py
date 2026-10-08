@@ -5,8 +5,10 @@ Screening itself lives in app/core/screening.py (future-window, refined TCA,
 Foster Pc with TLE-age covariance); this module keeps the CPI score, the
 legacy distance-band classifier, find_tca and a compatibility wrapper.
 
-CPI weights are calibrated against Foster Pc ordering so that higher
-CPI always correlates with higher Foster Pc.
+CPI (Conjunction Priority Index, 0-10) is a heuristic TRIAGE score for
+ordering the operator queue. It is a hand-weighted blend of Foster Pc, miss
+distance, time-to-TCA, closing speed and TLE age; it is NOT a probability and
+not fitted to data. The physics result is always probability_of_collision.
 
 References:
   Foster & Estes (1992) NASA/JSC-25898 — B-plane integration method
@@ -21,34 +23,12 @@ from app.core.sgp4_propagator import SGP4Propagator, SatelliteState
 
 logger = logging.getLogger(__name__)
 
-# ── Analytics import (Foster Pc engine) ───────────────────────────────────────
-try:
-    from app.core.analytics import compute_collision_probability
-    _ANALYTICS_AVAILABLE = True
-    logger.info("Foster B-plane analytics loaded successfully")
-except ImportError as _import_err:
-    _ANALYTICS_AVAILABLE = False
-    logger.warning("analytics.py not available (%s) — using Gaussian fallback", _import_err)
-
-# Thresholds
+# Legacy distance bands. Used ONLY by find_tca()'s ConjunctionEvent.severity
+# label and the pre-flight "trajectory_clear" policy gate (sim_engine). Alert
+# severity in the live pipeline is screening.classify_severity (Pc + miss).
 ALERT_DISTANCE_KM = 50.0       # Red alert
 WARNING_DISTANCE_KM = 200.0    # Yellow warning
 WATCH_DISTANCE_KM = 500.0      # Green watch
-
-
-# ── Gaussian fallback (used only when analytics import fails) ─────────────────
-
-def _gaussian_fallback(miss_km: float) -> float:  # unused by the pipeline (verify_physics.py only)
-    """
-    Simple Gaussian approximation used ONLY as fallback when analytics.py
-    cannot be imported. Never call this as the primary path.
-
-    Not physically calibrated — kept solely to prevent a hard crash.
-    """
-    sigma = max(1.0, miss_km / 6.0)
-    hbr   = 0.010  # km (10 m)
-    p = float(np.exp(-0.5 * (miss_km / sigma) ** 2) * (hbr / sigma) ** 2)
-    return min(1.0, max(0.0, p))
 
 
 # ── ConjunctionEvent ──────────────────────────────────────────────────────────
@@ -129,80 +109,6 @@ def compute_relative_speed(s1: SatelliteState, s2: SatelliteState) -> float:
     return np.sqrt(dvx * dvx + dvy * dvy + dvz * dvz) * 3600
 
 
-def compute_ric_frame(pos_chief: np.ndarray, vel_chief: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Compute RIC (Radial-In-Track-Cross-track) frame unit vectors.
-    R: radial (along position)
-    I: in-track (along velocity direction)
-    C: cross-track (orbit normal)
-    """
-    r_norm = np.linalg.norm(pos_chief)
-    if r_norm < 1e-6:
-        return np.array([1, 0, 0], dtype=float), np.array([0, 1, 0], dtype=float), np.array([0, 0, 1], dtype=float)
-
-    r_hat = pos_chief / r_norm
-    h = np.cross(pos_chief, vel_chief)
-    h_norm = np.linalg.norm(h)
-    if h_norm < 1e-6:
-        c_hat = np.array([0, 0, 1], dtype=float)
-    else:
-        c_hat = h / h_norm
-
-    i_hat = np.cross(c_hat, r_hat)
-    return r_hat, i_hat, c_hat
-
-
-def transform_covariance_to_ric(
-    cov_6x6_sat1: np.ndarray,
-    cov_6x6_sat2: np.ndarray,
-    r_hat: np.ndarray,
-    i_hat: np.ndarray,
-    c_hat: np.ndarray,
-) -> np.ndarray:
-    """
-    Transform covariances from ECI to RIC frame relative coordinates.
-    Returns a 2x2 covariance matrix for relative RIC position (R, I only).
-    """
-    R_mat = np.vstack([r_hat, i_hat, c_hat])
-    P_pos_1 = cov_6x6_sat1[:3, :3]
-    P_pos_2 = cov_6x6_sat2[:3, :3]
-    P_rel_eci = P_pos_1 + P_pos_2
-    P_rel_ric = R_mat @ P_rel_eci @ R_mat.T
-    P_rel_2d = P_rel_ric[:2, :2]
-    return P_rel_2d
-
-
-def compute_collision_probability_2d(
-    miss_distance_ric: np.ndarray,
-    covariance_2d: np.ndarray,
-    combined_radius_km: float = 0.010,
-) -> float:
-    """
-    Legacy RIC-frame approximation. NOT used by screening/Pc any more (the
-    Kalman covariance it was fed is not a physical uncertainty). Kept only so
-    old imports do not break.
-    """
-    try:
-        eigvals = np.linalg.eigvals(covariance_2d)
-        if np.any(eigvals <= 1e-10):
-            miss_dist_norm = np.linalg.norm(miss_distance_ric)
-            return 1.0 if miss_dist_norm < combined_radius_km else 0.0
-
-        try:
-            cov_inv = np.linalg.inv(covariance_2d)
-        except np.linalg.LinAlgError:
-            miss_dist_norm = np.linalg.norm(miss_distance_ric)
-            return 1.0 if miss_dist_norm < combined_radius_km else 0.0
-
-        mahal_dist_sq = miss_distance_ric @ cov_inv @ miss_distance_ric
-        from scipy.special import gammainc
-        p_coll = float(gammainc(1.0, (combined_radius_km**2) / (np.trace(covariance_2d) + 1e-10)))
-        return float(np.clip(p_coll, 0.0, 1.0))
-    except Exception as e:
-        logger.debug(f"Collision probability computation failed: {e}")
-        return 0.0
-
-
 # ── CPI score calibrated against Foster Pc ───────────────────────────────────
 
 def compute_cpi_score(
@@ -213,7 +119,8 @@ def compute_cpi_score(
     tle_age_hours: float = 6.0,
 ) -> float:
     """
-    Compute Conjunction Priority Index (0–10) calibrated against Foster Pc ordering.
+    Conjunction Priority Index (0–10): hand-weighted triage heuristic (design
+    choice, not fitted). Monotone in each input; NOT a probability.
 
     Weights (sum = 1.0):
       0.40 — miss distance component   (strongest predictor of Pc)
@@ -222,10 +129,8 @@ def compute_cpi_score(
       0.10 — closing speed component   (relative velocity)
       0.05 — TLE data quality          (age of orbital elements)
 
-    NASA CARA thresholds for reference:
-      Pc >= 1e-4 (score ≈ 5.0) → watch / elevated concern
-      Pc >= 1e-3 (score ≈ 7.5) → action threshold
-      Pc >= 1e-2 (score ≈ 10.) → emergency — maneuver required
+    Pc component mapping (log-linear): Pc 1e-6 -> 0, 1e-4 -> 5 (the common
+    CARA manoeuvre-consideration threshold), 1e-2 -> 10.
     """
     try:
         # ── Miss distance component (0–10) ─────────────────────────────────
@@ -246,7 +151,7 @@ def compute_cpi_score(
         miss_score = float(np.clip(miss_score, 0.0, 10.0))
 
         # ── Foster Pc component (0–10) — log-mapped ────────────────────────
-        # This mapping is calibrated so CPI rank == Foster Pc rank:
+        # Log-linear mapping of Pc onto 0-10:
         #   Pc = 1e-6 → score 0.0
         #   Pc = 1e-4 → score 5.0   (NASA CARA watch threshold)
         #   Pc = 1e-3 → score 7.5

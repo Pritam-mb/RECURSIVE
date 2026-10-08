@@ -408,9 +408,11 @@ class SimEngine:
             for nid, entry in self._scenario_backup.items():
                 self.propagator._satellites[nid] = entry
         try:
-            from app.core.debris_model import unregister_object_meta
+            from app.core.debris_model import debris_model, unregister_object_meta
             for nid in self._scenario_sats:
                 unregister_object_meta(nid)
+            # breakups of a synthetic scenario object cannot outlive the scenario
+            debris_model.drop_events_with_parents(self._scenario_sats)
         except Exception:
             pass
         self._scenario_sats.clear()

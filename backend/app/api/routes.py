@@ -683,6 +683,17 @@ async def execute_maneuver(
     return result
 
 
+# The canonical alert refresh lives in main.py (screening + debris alerts + ML
+# + cascade). main.py registers it here at startup to avoid a circular import.
+_alerts_refresher = None
+
+
+def set_alerts_refresher(fn) -> None:
+    """Register main.refresh_alerts_once as the single alert pipeline."""
+    global _alerts_refresher
+    _alerts_refresher = fn
+
+
 async def _recompute_alerts_pipeline(propagator) -> dict:
     """Rebuild snapshot + conjunction/cascade/debris alerts after a state change."""
     snapshot = await asyncio.to_thread(
@@ -691,6 +702,12 @@ async def _recompute_alerts_pipeline(propagator) -> dict:
         sim_clock.simulation_now(),
     )
     set_latest_snapshot(snapshot)
+
+    if _alerts_refresher is not None:
+        # Same pipeline as the periodic refresh, so a clock change or burn
+        # never publishes a payload without debris alerts / ML / cascade.
+        await _alerts_refresher()
+        return get_latest_alerts()
 
     sampled_states = snapshot.get("states", [])
     kalman_states = get_all_kalman_states()

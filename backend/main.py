@@ -30,7 +30,7 @@ from app.services.cascade_planner import CascadePlanner
 from app.services.debris_model import build_debris_alerts
 from app.services.conjunction_predictor import propagate_states_to, enrich_payload_with_geodetic
 from app.api.ws_handler import ConnectionManager, satellite_broadcast_loop
-from app.api.routes import router, init_routes
+from app.api.routes import router, init_routes, set_alerts_refresher
 from app.routers.test_mode import router as test_mode_router, init_test_mode
 from app.routers.predict import router as predict_router, init_predict_router
 from app.ml.runtime import get_ml_runtime
@@ -497,6 +497,7 @@ async def lifespan(app: FastAPI):
 
     # Initialize REST routes with shared instances
     init_routes(propagator, sim_engine)
+    set_alerts_refresher(refresh_alerts_once)
     init_test_mode(propagator)
     init_predict_router(propagator)
 

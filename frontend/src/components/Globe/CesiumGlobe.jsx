@@ -69,6 +69,11 @@ const SATELLITE_SELECTED_SCALE = 0.42;
 const SATELLITE_SCALE_BY_DISTANCE = new Cesium.NearFarScalar(1.0e6, 1.4, 3.0e7, 0.2);
 const ORBIT_BREAK_DISTANCE_KM = 8000;
 const MAX_HOTSPOTS = 20;
+// Geometry guards: nothing may cut through or engulf the Earth.
+const EARTH_RADIUS_KM = 6378.137;
+// A translucent zone/cloud sphere larger than this no longer reads as a
+// "zone" (it swallows a visible chunk of the planet); show the points only.
+const MAX_ZONE_RADIUS_KM = 500;
 const HOVER_PICK_INTERVAL_MS = 60;
 const EMPTY = [];
 
@@ -90,6 +95,26 @@ function normalizeId(id) {
 function toCartesian3(eci, date) {
   const c = eciToCesiumCartesian(eci, date);
   return new Cesium.Cartesian3(c.x, c.y, c.z);
+}
+
+const norm = (p) => Math.sqrt((p.x * p.x) + (p.y * p.y) + (p.z * p.z));
+const aboveSurface = (p) => !!p && norm(p) > EARTH_RADIUS_KM;
+
+/**
+ * True when the straight segment a→b (km, any Earth-centred frame) stays
+ * outside the Earth. Straight polyline segments between samples are chords;
+ * a chord between far-apart points dives through the planet.
+ */
+function segmentClearsEarth(a, b) {
+  const dx = b.x - a.x;
+  const dy = b.y - a.y;
+  const dz = b.z - a.z;
+  const len2 = (dx * dx) + (dy * dy) + (dz * dz);
+  const t = len2 > 0 ? Math.min(1, Math.max(0, -((a.x * dx) + (a.y * dy) + (a.z * dz)) / len2)) : 0;
+  const px = a.x + (t * dx);
+  const py = a.y + (t * dy);
+  const pz = a.z + (t * dz);
+  return Math.sqrt((px * px) + (py * py) + (pz * pz)) > EARTH_RADIUS_KM;
 }
 
 function freshPrimitives() {
@@ -203,7 +228,11 @@ const CesiumGlobe = ({ mode = 'live', alerts = EMPTY, onSatelliteSelect }) => {
       globe.baseColor = COLORS.void;
       globe.showGroundAtmosphere = false;
       globe.enableLighting = false;
-      globe.depthTestAgainstTerrain = false;
+      // Depth-test every primitive against the globe surface. With this off,
+      // Cesium only hides things behind a horizon *plane*, so anything between
+      // that plane and the camera — an orbit chord, the inside of a large
+      // zone sphere, a far-side label near the limb — is painted over the Earth.
+      globe.depthTestAgainstTerrain = true;
       globe.maximumScreenSpaceError = 3;
       globe.tileCacheSize = 100;
       globe.showSkirts = false;
@@ -578,20 +607,34 @@ const CesiumGlobe = ({ mode = 'live', alerts = EMPTY, onSatelliteSelect }) => {
     for (const polyline of prims.orbitSegmentPolylines) orbitLines.remove(polyline);
     prims.orbitSegmentPolylines = [];
 
-    // Split where consecutive samples jump (propagation gaps).
+    // Split where consecutive samples jump (propagation gaps) or where the
+    // straight chord between them would cut through the Earth; drop samples
+    // that are themselves below the surface (decayed / bad state).
     const segments = [];
     let current = [];
     let previous = null;
+    let stepSum = 0;
+    let stepCount = 0;
     for (const sample of selectedOrbit || EMPTY) {
       if (!sample?.position || !sample?.epoch_utc) continue;
       const pos = sample.position;
+      if (!aboveSurface(pos)) {
+        if (current.length > 1) segments.push(current);
+        current = [];
+        previous = null;
+        continue;
+      }
       if (previous) {
         const dx = pos.x - previous.x;
         const dy = pos.y - previous.y;
         const dz = pos.z - previous.z;
-        if (Math.sqrt((dx * dx) + (dy * dy) + (dz * dz)) > ORBIT_BREAK_DISTANCE_KM) {
+        const step = Math.sqrt((dx * dx) + (dy * dy) + (dz * dz));
+        if (step > ORBIT_BREAK_DISTANCE_KM || !segmentClearsEarth(previous, pos)) {
           if (current.length > 1) segments.push(current);
           current = [];
+        } else {
+          stepSum += step;
+          stepCount += 1;
         }
       }
       current.push(sample);
@@ -606,7 +649,16 @@ const CesiumGlobe = ({ mode = 'live', alerts = EMPTY, onSatelliteSelect }) => {
     const frameDate = segments.length > 0 ? new Date(segments[0][0].epoch_utc) : null;
     const toPositions = (segment) => segment.map((s) => toCartesian3(s.position, frameDate));
     if (segments.length === 1 && segments[0].length > 2) {
-      segments[0] = [...segments[0], segments[0][0]]; // close the loop
+      // Close the loop only when the samples really span one revolution: the
+      // closing gap must look like an ordinary step and clear the Earth.
+      const seg = segments[0];
+      const first = seg[0].position;
+      const last = seg[seg.length - 1].position;
+      const gap = Math.sqrt(((first.x - last.x) ** 2) + ((first.y - last.y) ** 2) + ((first.z - last.z) ** 2));
+      const meanStep = stepCount > 0 ? stepSum / stepCount : 0;
+      if (gap <= Math.max(3 * meanStep, 1) && segmentClearsEarth(last, first)) {
+        segments[0] = [...seg, seg[0]];
+      }
     }
 
     if (segments.length > 0) {
@@ -648,11 +700,14 @@ const CesiumGlobe = ({ mode = 'live', alerts = EMPTY, onSatelliteSelect }) => {
 
     viewer.entities.suspendEvents();
     for (const hotspot of list) {
+      if (!aboveSurface(hotspot.position)) continue;
       const position = toCartesian3(hotspot.position, new Date(hotspot.tca_utc));
       const score = Number(hotspot.hotspot_score || 0);
-      // No computed zone radius → draw the marker only, never an invented sphere.
+      // No computed zone radius → draw the marker only, never an invented
+      // sphere; a zone so large it would swallow the Earth is marker-only too.
       const radiusKm = Number(hotspot.zone_radius_km);
-      const radiusM = Number.isFinite(radiusKm) && radiusKm > 0 ? radiusKm * 1000 : null;
+      const radiusM = Number.isFinite(radiusKm) && radiusKm > 0 && radiusKm <= MAX_ZONE_RADIUS_KM
+        ? radiusKm * 1000 : null;
 
       prims.hotspotPoints.add({
         position,
@@ -693,9 +748,26 @@ const CesiumGlobe = ({ mode = 'live', alerts = EMPTY, onSatelliteSelect }) => {
       const shellRadii = Array.isArray(cloud.shells)
         ? cloud.shells.map((sh) => Number(sh?.radius_km)).filter((r) => Number.isFinite(r) && r > 0)
         : [];
-      const radii = (shellRadii.length > 0 ? shellRadii : radius ? [radius.km] : []).sort((a, b) => a - b);
-      const fragments = cloudFragments(cloud, 300);
-      clouds.push({ cloud, center, radii, fragments, label: cloudLabel(cloud) });
+      const allRadii = (shellRadii.length > 0 ? shellRadii : radius ? [radius.km] : []).sort((a, b) => a - b);
+      // Fragments below the surface are bad states; never draw them.
+      const fragments = cloudFragments(cloud, 300).filter(aboveSurface);
+      // Diverging fragment streams put the centroid in empty space (or inside
+      // the Earth) with a percentile radius of thousands of km. A sphere there
+      // would engulf the globe, so only draw shells for a compact cloud whose
+      // centroid is in orbit; otherwise the fragments alone carry the shape.
+      const compact = aboveSurface(center)
+        && (allRadii.length === 0 || allRadii[allRadii.length - 1] <= MAX_ZONE_RADIUS_KM);
+      const radii = compact ? allRadii : [];
+      let anchor = compact ? center : null;
+      if (!anchor) {
+        let best = Infinity;
+        for (const f of fragments) {
+          const d = ((f.x - center.x) ** 2) + ((f.y - center.y) ** 2) + ((f.z - center.z) ** 2);
+          if (d < best) { best = d; anchor = f; }
+        }
+      }
+      if (!anchor && fragments.length === 0) continue;
+      clouds.push({ cloud, center: anchor, radii, fragments, label: cloudLabel(cloud) });
     }
     const key = clouds.map(({ cloud, center, radii, fragments, label }) => (
       `${cloud.id}:${cloudEpoch(cloud)}:${Math.round(center.x)},${Math.round(center.y)},${Math.round(center.z)}:${radii.map((r) => r.toFixed(1)).join(',')}:${fragments.length}:${label}`
@@ -780,8 +852,11 @@ const CesiumGlobe = ({ mode = 'live', alerts = EMPTY, onSatelliteSelect }) => {
 
     const satA = testSatellites.a;
     const satB = testSatellites.b;
+    // A straight line between objects on opposite sides of the planet would
+    // be drawn through it: only link the pair while the chord clears the Earth.
     if (!testActive || !satA?.position || !satB?.position || !computed
-      || overrideAMode !== 'override' || overrideBMode !== 'override') {
+      || overrideAMode !== 'override' || overrideBMode !== 'override'
+      || !segmentClearsEarth(satA.position, satB.position)) {
       if (approachLine.show) {
         approachLine.show = false;
         viewer.scene.requestRender();

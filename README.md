@@ -16,12 +16,19 @@
 
 ## ✨ Features
 
-- **Real-Time Orbit Propagation:** Ingests Two-Line Element (TLE) sets and propagates tens of thousands of satellite orbits using SGP4.
-- **Conjunction Screening:** Screens pairwise miss distances and severity levels to detect potential collisions.
-- **Interactive 3D Globe Visualization:** A rich frontend built with Cesium renders thousands of satellite billboards, hotspots, and debris envelopes.
-- **Live Telemetry & Tracking:** Broadcasts live position updates at 1 Hz via WebSockets.
-- **Simulation Engine:** Run deterministic collision demos with customizable injection scenarios to evaluate safety parameters.
-- **Actionable Alerts:** Highlights conjunction alerts with severity levels and automated triage capabilities.
+> **Reviewers:** every number is computed. Start with
+> [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md), which covers each pipeline
+> stage with its equations, code locations, parameter sources, limitations and
+> the tests that prove it.
+
+- **Orbit propagation:** SGP4 on TLE sets (Space-Track, a public mirror, or the bundled snapshot), all on a simulation clock.
+- **Future-window conjunction screening:** 24 h look-ahead with a KD-tree per time step and Brent-refined TCA. Collision probability is Foster 2-D Pc with a TLE-age covariance model and per-object hard-body radii.
+- **ML surrogate (advisory):** an XGBoost regressor of log10 Pc, trained on Foster-labelled encounters, with held-out metrics in the model card. It never replaces the physics Pc.
+- **Collision to debris:** NASA Standard Breakup Model fragments, propagated with J2 + drag and screened against the catalogue.
+- **Cascade analysis:** an alert graph (collision event → fragments → satellites → neighbours) with BFS depth and P(hit) = 1 − Π(1 − Pc).
+- **Manoeuvre planning:** candidate burns are re-propagated and Pc is recomputed; fuel is costed with the rocket equation.
+- **Agencies:** owners from the CelesTrak SATCAT snapshot, with authority-gated commanding.
+- **3D visualisation:** a Cesium globe with live positions streamed over WebSocket at 1 Hz.
 
 ---
 
@@ -33,11 +40,13 @@ flowchart LR
   B --> C[Snapshot Cache]
   C --> D[WebSocket Broadcast]
   C --> E[REST API]
-  C --> F[Conjunction Screening]
-  F --> G[Alert Cache]
-  F --> H[Hotspot Planner]
-  H --> I[Debris Model]
-  I --> G
+  C --> F[24 h Screening + Foster Pc]
+  F --> M[XGBoost Pc surrogate - advisory]
+  F --> H[Cascade graph + manoeuvre re-propagation]
+  F --> I[NASA SBM breakup + fragment screening]
+  I --> H
+  M --> G[Alert Cache]
+  H --> G
   G --> J[Frontend Alert Panel]
   D --> K[Frontend Globe]
   E --> K
@@ -50,7 +59,7 @@ flowchart LR
 ## 🚀 Getting Started
 
 ### Prerequisites
-- Python 3.9+
+- Python 3.11+
 - Node.js 16+ & npm (or yarn)
 - Git
 
@@ -72,7 +81,7 @@ cd frontend
 npm install
 npm run dev
 ```
-*The frontend application will be running on http://localhost:3000.*
+*The frontend application will be running on the port Vite prints (default http://localhost:5173).*
 
 ---
 
@@ -118,16 +127,17 @@ sequenceDiagram
 - `frontend/` - Contains the React & Cesium 3D frontend application.
 - `research_paper/` - LaTeX/Markdown documents for academic publications regarding the project.
 - `PROJECT_OVERVIEW.txt` - Detailed overview of features, architecture, and future possibilities.
-- `PROJECT_SCENARIO.md` - Technical descriptions of demo scenarios and workflows.
+- `PROJECT_SCENARIO.md` - Component map and demo workflow.
+- `docs/HOW_IT_WORKS.md` - Judge-facing description of every computation, with verification commands.
 
 ---
 
 ## 🔮 Future Roadmap
 
-- **Enhanced Physics & Accuracy:** Replace single-epoch screening with Time of Closest Approach (TCA) search and integrate atmospheric drag.
-- **Risk Intelligence (ML):** Integrate LSTM predictors for short-term trajectory forecasts and XGBoost for collision risk scoring.
-- **Scenario Tooling:** Build a visual scenario editor and batch maneuver planning optimized for cost and safety.
-- **Expanded Integrations:** Connect to live TLE streams from public catalogs or private sensor networks and automate alerting (Slack/Email).
+- **Measured covariance:** ingest CDMs/ephemerides instead of the TLE-age covariance model.
+- **Masses:** a real mass catalogue (e.g. DISCOS) instead of RCS/type defaults.
+- **Long-term debris evolution:** a population model beyond the 24 h screening window.
+- **Expanded integrations:** automated alerting (Slack/Email) and live TLE streams by default.
 
 ---
 <div align="center">

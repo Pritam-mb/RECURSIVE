@@ -458,6 +458,34 @@ class SimEngine:
 
         return {**result, "preflight": preflight}
 
+    @staticmethod
+    def _fuel_check(norad_id: int, name: str, dv_ms: float) -> dict:
+        """Tsiolkovsky propellant for |dv| against the assumed propellant load.
+
+        Uses the same tagged mass / Isp / propellant-fraction model as the
+        manoeuvre planner (app.services.maneuver_planner.spacecraft_mass_model).
+        """
+        try:
+            from app.services.maneuver_planner import rocket_equation_cost, spacecraft_mass_model
+            from app.core import satcat
+            model = spacecraft_mass_model(name, satcat.lookup(norad_id, name=name))
+            cost = rocket_equation_cost(dv_ms, model)
+            load_kg = float(model["mass_kg"]) * float(model["propellant_fraction"])
+            return {
+                "within_budget": bool(cost["propellant_kg"] <= load_kg),
+                "propellant_kg": round(cost["propellant_kg"], 5),
+                "propellant_load_kg": round(load_kg, 3),
+                "fuel_cost_pct": round(cost["fuel_cost_pct"], 4),
+                "mass_kg": model["mass_kg"], "mass_source": model["mass_source"],
+                "isp_s": model["isp_s"], "isp_source": model.get("isp_source"),
+                "propellant_fraction": model["propellant_fraction"],
+                "tank_state_assumption": "full at session start",
+                "fuel_model": "rocket_equation",
+            }
+        except Exception as exc:  # no fabricated pass: fail the gate, say why
+            logger.warning("fuel check failed for %s: %s", norad_id, exc)
+            return {"within_budget": False, "fuel_model": "unavailable", "error": str(exc)}
+
     def preflight_check(
         self,
         norad_id: int,
@@ -503,9 +531,12 @@ class SimEngine:
         burn_result = cloned_propagator.apply_delta_v(norad_id, dvx, dvy, dvz, frame=frame, epoch=now)
 
         future_risk = None
+        fuel = self._fuel_check(norad_id, target_name, dv_magnitude)
         gates = {
             "trajectory_clear": False,
-            "fuel_budget": dv_magnitude <= 50.0,
+            # Rocket equation vs the assumed propellant load (full tank), with
+            # the mass/Isp provenance reported under "fuel".
+            "fuel_budget": fuel["within_budget"],
             "agency_auth": agency_auth,
             "tca_window": False,
             "physical_limits": False,
@@ -536,6 +567,13 @@ class SimEngine:
             "frame": frame,
             "dv_magnitude_ms": round(dv_magnitude, 3),
             "gates": gates,
+            "gate_policy": {
+                "trajectory_clear": f"nearest 24 h approach after burn > {WARNING_DISTANCE_KM} km",
+                "tca_window": "nearest approach > 60 min away (time to react)",
+                "physical_limits": "post-burn perigee >= 100 km and |dv| <= 100 m/s",
+                "fuel_budget": "rocket-equation propellant <= assumed propellant load",
+            },
+            "fuel": fuel,
             "all_clear": all_clear,
             "trajectory": future_risk,
             "burn": burn_result,

@@ -202,6 +202,10 @@ def _resolve_satellite_reference(
             "id": int(norad_id) if norad_id is not None else None,
             "name": ref.get("name") or f"GEO({ref['latitude_deg']}, {ref['longitude_deg']})",
             "source": "latlon",
+            # A sub-satellite point does not fix the orbit plane: inclination
+            # is the caller's, else an ISS-like 51.6 deg assumption (tagged).
+            "inclination_deg": incl,
+            "inclination_source": "request" if "inclination_deg" in ref else "assumed_default_51.6",
         }
         return eci_state, label
 

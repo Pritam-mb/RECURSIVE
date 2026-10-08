@@ -6,6 +6,8 @@ import asyncio
 import json
 import logging
 import os
+
+import numpy as np
 from datetime import datetime, timezone, timedelta
 from fastapi import APIRouter, Depends, Header, HTTPException, Response
 from fastapi.concurrency import run_in_threadpool
@@ -381,11 +383,30 @@ def get_ml_runtime_if_enabled():
 
 @router.get("/anomalies")
 async def get_anomalies():
+    """Residual z-score flags from app.ml.anomaly.ResidualAnomalyDetector.
+
+    Honest scope: the "actual" position is SGP4 output (there is no tracking /
+    radar feed), so a flag means the trajectory model disagrees with SGP4 by
+    > z_threshold sigma of its own recent residuals. It is a model-consistency
+    monitor, not detection of real-world manoeuvres or breakups.
+    """
+    method = {
+        "residual": "|trajectory_model_prediction - SGP4| (km)",
+        "flag": "z-score of residual vs rolling window >= z_threshold",
+        "truth_source": "SGP4 (no observational data)",
+    }
     runtime = get_ml_runtime_if_enabled()
     if runtime is None:
-        return {"count": 0, "anomalies": [], "enabled": False}
-    anomalies = runtime.get_anomalies()
-    return {"count": len(anomalies), "anomalies": anomalies, "enabled": True}
+        return {"count": 0, "anomalies": [], "monitored": 0, "enabled": False, "method": method}
+    rows = list((runtime.get_anomalies() or {}).values())
+    flagged = [row for row in rows if row.get("is_anomaly")]
+    return {
+        "count": len(flagged),
+        "anomalies": flagged,
+        "monitored": len(rows),
+        "enabled": True,
+        "method": method,
+    }
 
 
 @router.get("/model-metrics")
@@ -1211,8 +1232,8 @@ async def satellite_uplink(
     Accept an uplink command for a satellite.
 
     MANEUVER and SET_ORBIT are executed through the same validated path as the
-    REST maneuver endpoints; any other command is acknowledged without effect
-    so the link protocol stays explicit.
+    REST maneuver endpoints; any other command type is reported as
+    UNSUPPORTED (success=false) without changing state.
     """
     if _propagator is None or _sim_engine is None:
         raise HTTPException(status_code=503, detail="Runtime not initialized")
@@ -1240,11 +1261,13 @@ async def satellite_uplink(
         return {"result": result}
 
     if req.type == "SET_ORBIT":
+        if req.altitude_km is None:
+            raise HTTPException(status_code=400, detail="SET_ORBIT requires altitude_km")
         return {
             "result": await orbit_change(
                 OrbitChangeRequest(
                     norad_id=norad_id,
-                    target_altitude_km=float(req.altitude_km or 550.0),
+                    target_altitude_km=float(req.altitude_km),
                 ),
                 session_id=session_id,
             )
@@ -1252,9 +1275,9 @@ async def satellite_uplink(
 
     return {
         "result": {
-            "success": True,
-            "message": f"Command '{req.type}' acknowledged (no state change)",
-            "status": "ACK",
+            "success": False,
+            "message": f"Command '{req.type}' is not supported by the simulator (no state change)",
+            "status": "UNSUPPORTED",
         }
     }
 
@@ -1275,163 +1298,116 @@ async def judge_manipulate_satellite(
     session_id: str = Depends(resolve_session_id),
 ):
     """
-    Judge manipulation mode: override a satellite's state and immediately predict
-    downstream effects, neighbor risks, and cascade implications.
-    Returns: overridden state, KD-tree neighbors within 200km, CPI scores, and alerts.
+    What-if mode: replace one object's ECI state (NOT persisted) and re-run the
+    real pipeline on the modified catalogue at the current SIMULATION time:
+    24 h future-window screening (the overridden object is propagated from its
+    new state vector by two-body + J2, everything else by SGP4), Foster Pc,
+    cascade analysis and forecast debris clouds. Neighbours are the objects
+    within 200 km right now (pure geometry); their risk fields come from the
+    screened alerts for the pair, or are null when the pair is not screened in.
     """
     if _propagator is None:
         raise HTTPException(status_code=503, detail="Propagator not initialized")
 
     _require_satellite_authority(session_id, req.norad_id)
 
-    now = datetime.now(timezone.utc)
-    
-    # Build base snapshot from current constellation
-    snapshot = await asyncio.to_thread(_build_snapshot, _propagator, now)
-    states = snapshot.get("states", [])
-    
-    # Find and override the target satellite
-    target_idx = None
-    target_state = None
-    for idx, state in enumerate(states):
-        if state.norad_id == req.norad_id:
-            target_idx = idx
-            target_state = state
-            break
-    
+    now = sim_clock.simulation_now()
+    states = await asyncio.to_thread(_propagator.propagate_all, now)
+    states = [s for s in states if s.error_code == 0]
+    target_state = next((s for s in states if s.norad_id == req.norad_id), None)
     if target_state is None:
         raise HTTPException(status_code=404, detail=f"Satellite {req.norad_id} not found")
-    
-    # Apply override if provided
+
+    overridden = False
     if req.position_eci_km is not None and len(req.position_eci_km) == 3:
-        target_state.x, target_state.y, target_state.z = req.position_eci_km
-    
+        target_state.x, target_state.y, target_state.z = (float(c) for c in req.position_eci_km)
+        overridden = True
     if req.velocity_eci_kms is not None and len(req.velocity_eci_kms) == 3:
-        target_state.vx, target_state.vy, target_state.vz = req.velocity_eci_kms
-    
-    # Rebuild satellite list with override
-    satellites = [
-        {
-            "norad_id": state.norad_id,
-            "name": state.name,
-            "position": {
-                "x": state.x,
-                "y": state.y,
-                "z": state.z,
-            },
-            "velocity": {
-                "vx": state.vx,
-                "vy": state.vy,
-                "vz": state.vz,
-            },
-            "speed_kmh": round(float((state.vx**2 + state.vy**2 + state.vz**2) ** 0.5 * 3600.0), 2),
-            "altitude_km": round(float(((state.x**2 + state.y**2 + state.z**2) ** 0.5) - 6371.0), 2),
-            "epoch_utc": state.epoch_utc,
-        }
-        for state in states
-    ]
-    
-    # Recompute alerts and cascade plan with the overridden state
-    alerts = []
-    cascade_summary = {
-        "graph": {"node_count": 0, "edge_count": 0, "influence_radius_km": 200.0},
-        "alerts": [],
-        "cascade_plan": [],
-        "total_delta_v_ms": 0.0,
-        "cascade_depth": 0,
-        "agencies_involved": [],
-        "seed_satellites": [],
-        "cpi_threshold": 5.0,
-        "node_probabilities": {},
-        "ranker_review": {},
-    }
-    
-    sampled_states = []
-    if states:
-        # Screen the full catalogue (the vectorised screen handles it).
-        sampled_states = states
-        
-        kalman_states = get_all_kalman_states()
-        alerts = await asyncio.to_thread(screen_conjunctions, sampled_states, kalman_states=kalman_states, propagator=_propagator)
-        cascade_summary = await asyncio.to_thread(
-            _cascade_planner.analyze_snapshot,
-            sampled_states,
-            [alert.to_dict() for alert in alerts],
-        )
+        target_state.vx, target_state.vy, target_state.vz = (float(c) for c in req.velocity_eci_kms)
+        overridden = True
+
+    extra = None
+    screen_states = states
+    if overridden:
+        # The overridden object no longer follows its TLE: screen it from the
+        # new state vector instead of its Satrec.
+        screen_states = [s for s in states if s.norad_id != req.norad_id]
+        extra = [{
+            "id": req.norad_id, "name": target_state.name,
+            "r_km": [target_state.x, target_state.y, target_state.z],
+            "v_kms": [target_state.vx, target_state.vy, target_state.vz],
+        }]
+
+    screen_stats: dict = {}
+    alerts = await asyncio.to_thread(
+        screen_alerts, screen_states, now,
+        propagator=_propagator, extra_objects=extra, stats=screen_stats,
+    )
+    cascade_summary = await asyncio.to_thread(
+        _cascade_planner.analyze_snapshot, states, alerts, _propagator, now,
+    )
+    out_alerts = cascade_summary.get("alerts") or alerts
 
     debris_clouds = build_debris_alerts(
         cascade_summary.get("hotspots", []),
-        sampled_states if states else [],
-        snapshot.get("timestamp"),
-        alerts=cascade_summary.get("alerts", []),
+        states,
+        now.isoformat(),
+        alerts=out_alerts,
         cpi_threshold=cascade_summary.get("cpi_threshold", 5.0),
     )
-    
-    # Build a neighbor map: all satellites within 200 km of the target
-    target_pos = [target_state.x, target_state.y, target_state.z]
+
+    pair_alerts: dict[int, dict] = {}
+    for alert in out_alerts:
+        ids = ((alert.get("sat1") or {}).get("id"), (alert.get("sat2") or {}).get("id"))
+        if req.norad_id in ids:
+            other = ids[1] if ids[0] == req.norad_id else ids[0]
+            pair_alerts.setdefault(other, alert)
+
+    tp = np.array([target_state.x, target_state.y, target_state.z])
     neighbors = []
-    
     for state in states:
         if state.norad_id == req.norad_id:
             continue
-        
-        other_pos = [state.x, state.y, state.z]
-        distance_km = ((other_pos[0] - target_pos[0])**2 + 
-                       (other_pos[1] - target_pos[1])**2 + 
-                       (other_pos[2] - target_pos[2])**2) ** 0.5
-        
-        if distance_km <= 200.0:
-            # Find CPI score for this pair in the alerts
-            cpi_score = 0.0
-            for alert in cascade_summary.get("alerts", []):
-                if ((alert["sat1"]["id"] == req.norad_id and alert["sat2"]["id"] == state.norad_id) or
-                    (alert["sat1"]["id"] == state.norad_id and alert["sat2"]["id"] == req.norad_id)):
-                    cpi_score = alert.get("cpi_score", 0.0)
-                    break
-            
-            neighbors.append({
-                "satellite_id": state.norad_id,
-                "satellite_name": state.name,
-                "distance_km": round(distance_km, 3),
-                "position": {
-                    "x": state.x,
-                    "y": state.y,
-                    "z": state.z,
-                },
-                "velocity": {
-                    "vx": state.vx,
-                    "vy": state.vy,
-                    "vz": state.vz,
-                },
-                "speed_kmh": round(float((state.vx**2 + state.vy**2 + state.vz**2) ** 0.5 * 3600.0), 2),
-                "cpi_score": round(cpi_score, 2),
-                "collision_risk": "high" if cpi_score >= 7.0 else "medium" if cpi_score >= 5.0 else "low",
-            })
-    
-    # Sort neighbors by distance
+        distance_km = float(np.linalg.norm(np.array([state.x, state.y, state.z]) - tp))
+        if distance_km > 200.0:
+            continue
+        alert = pair_alerts.get(state.norad_id)
+        severity = alert.get("severity") if alert else None
+        neighbors.append({
+            "satellite_id": state.norad_id,
+            "satellite_name": state.name,
+            "distance_km": round(distance_km, 3),
+            "position": {"x": state.x, "y": state.y, "z": state.z},
+            "velocity": {"vx": state.vx, "vy": state.vy, "vz": state.vz},
+            "speed_kmh": round(float((state.vx**2 + state.vy**2 + state.vz**2) ** 0.5 * 3600.0), 2),
+            "cpi_score": round(float(alert.get("cpi_score", 0.0)), 2) if alert else None,
+            "probability_of_collision": alert.get("probability_of_collision") if alert else None,
+            "miss_distance_km": alert.get("miss_distance_km") if alert else None,
+            "tca_utc": alert.get("tca_utc") if alert else None,
+            "severity": severity,
+            "collision_risk": {"CRITICAL": "high", "WARNING": "medium"}.get(severity, "low") if alert else None,
+        })
     neighbors.sort(key=lambda n: n["distance_km"])
-    
+
+    r_norm = float(np.linalg.norm(tp))
     return {
         "status": "success",
+        "simulation_time": now.isoformat(),
+        "overridden": overridden,
+        "persisted": False,
         "manipulated_satellite": {
             "norad_id": req.norad_id,
             "name": target_state.name,
-            "position": {
-                "x": target_state.x,
-                "y": target_state.y,
-                "z": target_state.z,
-            },
-            "velocity": {
-                "vx": target_state.vx,
-                "vy": target_state.vy,
-                "vz": target_state.vz,
-            },
+            "position": {"x": target_state.x, "y": target_state.y, "z": target_state.z},
+            "velocity": {"vx": target_state.vx, "vy": target_state.vy, "vz": target_state.vz},
             "speed_kmh": round(float((target_state.vx**2 + target_state.vy**2 + target_state.vz**2) ** 0.5 * 3600.0), 2),
-            "altitude_km": round(float(((target_state.x**2 + target_state.y**2 + target_state.z**2) ** 0.5) - 6371.0), 2),
+            "altitude_km": round(r_norm - RE, 2),
         },
         "neighbors_within_200km": neighbors,
         "neighbor_count": len(neighbors),
-        "alerts": cascade_summary.get("alerts", []),
+        "target_alerts": list(pair_alerts.values()),
+        "alerts": out_alerts,
+        "screening": screen_stats,
         "cascade_plan": cascade_summary.get("cascade_plan", []),
         "graph": cascade_summary.get("graph", {}),
         "cascade_depth": cascade_summary.get("cascade_depth", 0),

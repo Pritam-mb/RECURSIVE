@@ -84,8 +84,8 @@ async def satellite_broadcast_loop(
 
     Enriches the satellite list with covariance_ellipse fields from active
     conjunction alerts. Field is None for non-threatened satellites and
-    contains ellipse parameters {a, b, angle, affection_rate, predicted_fragments}
-    for satellites in active conjunctions.
+    contains the alert's 3-sigma B-plane ellipse {a, b, angle, ...} (computed by
+    app.core.screening.compute_pc) for satellites in active conjunctions.
 
     Alerts, hotspots and the cascade plan are refreshed on a much slower cadence
     than the position stream, so they are attached to the broadcast only when

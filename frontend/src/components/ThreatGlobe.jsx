@@ -2,7 +2,9 @@ import { useRef, useEffect, useMemo } from 'react';
 import useTestMode from '../hooks/useTestMode';
 import useStore from '../store/useStore';
 import { severityLabel } from '../utils/severity';
-import { cloudCentroid, cloudLabel, cloudRadius } from '../utils/debrisCloud';
+import {
+  cloudCentroid, cloudFragments, cloudLabel, cloudRadius,
+} from '../utils/debrisCloud';
 import {
   CORRECTION_DECAY_S,
   MAX_EXTRAPOLATION_S,
@@ -39,6 +41,12 @@ const MAX_CONJUNCTION_LABELS = 3;
 const EMPTY = [];
 // Longest pair link drawn (km). Beyond this the chord leaves the surface.
 const MAX_LINK_KM = 1500;
+// Objects at or below this radius are inside the Earth (bad state / a
+// centroid between diverging streams) and are never drawn.
+const EARTH_RADIUS_KM = 6378.137;
+// A debris ring bigger than this would cover a large part of the disc.
+const MAX_RING_KM = 500;
+const aboveSurface = (p) => !!p && Math.hypot(p.x, p.y, p.z) > EARTH_RADIUS_KM;
 
 // Simplified coastline data as lat/lon polylines (very compressed)
 // Each sub-array is a connected polyline [[lat,lon],...]
@@ -222,6 +230,7 @@ function drawCallout(ctx, anchor, text, color, W, H) {
 const testPosA = { sx: 0, sy: 0, visible: false };
 const testPosB = { sx: 0, sy: 0, visible: false };
 const scratchProj = { sx: 0, sy: 0, visible: false };
+const fragAnchor = { sx: 0, sy: 0, visible: true };
 const placedBoxes = [];
 
 export default function ThreatGlobe({ alerts = EMPTY, satellites = EMPTY, selectedSatId }) {
@@ -383,11 +392,41 @@ export default function ThreatGlobe({ alerts = EMPTY, satellites = EMPTY, select
         for (const cloud of clouds) {
           const c = cloudCentroid(cloud);
           if (!c) continue;
-          const p = projectEci(c.x, c.y, c.z, scratchProj);
-          if (!p.visible) continue;
           const radius = cloudRadius(cloud);
+          // Real fragments, near side only (the sphere hides the far side).
+          const frags = cloudFragments(cloud, 300);
+          let hasAnchor = false;
+          let nearestD2 = Infinity;
+          ctx.setLineDash([]);
+          ctx.fillStyle = PALETTE.caution;
+          ctx.globalAlpha = 0.75;
+          ctx.beginPath();
+          for (const f of frags) {
+            if (!aboveSurface(f)) continue;
+            const fp = projectEci(f.x, f.y, f.z, scratchProj);
+            if (!fp.visible) continue;
+            ctx.rect(fp.sx - 0.75, fp.sy - 0.75, 1.5, 1.5);
+            const d2 = ((f.x - c.x) ** 2) + ((f.y - c.y) ** 2) + ((f.z - c.z) ** 2);
+            if (d2 < nearestD2) { nearestD2 = d2; hasAnchor = true; fragAnchor.sx = fp.sx; fragAnchor.sy = fp.sy; }
+          }
+          ctx.fill();
+          ctx.setLineDash([3, 3]);
+          // Diverging streams leave the centroid in empty space or inside the
+          // Earth with a radius of thousands of km: a ring there would cover
+          // the whole disc. Ring only a compact cloud whose centroid is in orbit.
+          const compact = aboveSurface(c) && (!radius || radius.km <= MAX_RING_KM);
+          let p;
+          if (compact) {
+            p = projectEci(c.x, c.y, c.z, scratchProj);
+            if (!p.visible) continue;
+          } else if (hasAnchor) {
+            p = fragAnchor;
+          } else {
+            continue;
+          }
           // Percentile radius of the real fragment spread; a dot when absent.
-          const radiusPx = radius ? Math.max(3, radius.km * (R / 6371.0)) : 3;
+          const radiusPx = compact && radius ? Math.max(3, radius.km * (R / 6371.0)) : 3;
+          ctx.strokeStyle = PALETTE.caution;
           ctx.globalAlpha = breathe;
           ctx.beginPath();
           ctx.arc(p.sx, p.sy, radiusPx, 0, TWO_PI);
@@ -513,6 +552,7 @@ export default function ThreatGlobe({ alerts = EMPTY, satellites = EMPTY, select
           const fr = alert.fragment_state?.r_km;
           const anchor = Array.isArray(fr) && fr.length === 3
             ? { x: Number(fr[0]), y: Number(fr[1]), z: Number(fr[2]) } : null;
+          if (anchor && !aboveSurface(anchor)) continue;
           const proj = anchor ? projectEci(anchor.x, anchor.y, anchor.z, { sx: 0, sy: 0, visible: false }) : null;
           if (!pA) { pA = proj; rA = anchor; } else { pB = proj; rB = anchor; }
         }

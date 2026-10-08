@@ -1,0 +1,68 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap');
+
+:root {
+  color-scheme: dark;
+  --bg: #000000;
+  --panel-bg: #0a0a0a;
+  --border: #1f2937;
+  --text: #d1d5db;
+  --text-dim: #6b7280;
+  --text-bright: #f3f4f6;
+  --text-mono: #9ca3af;
+  --alert-red: #ef4444;
+  --alert-yellow: #eab308;
+  --alert-green: #22c55e;
+  --white: #ffffff;
+
+  --sans: 'Inter', system-ui, -apple-system, sans-serif;
+  --mono: 'JetBrains Mono', ui-monospace, Consolas, monospace;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html, body {
+  height: 100%;
+  width: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 14px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  overflow: hidden;
+}
+
+#root {
+  height: 100%;
+  width: 100%;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar {
+  width: 4px;
+}
+::-webkit-scrollbar-track {
+  background: var(--bg);
+}
+::-webkit-scrollbar-thumb {
+  background: var(--border);
+}
+
+/* Monospace data class */
+.mono {
+  font-family: var(--mono);
+  color: var(--text-mono);
+  font-size: 13px;
+}
+
+/* Severity colors */
+.severity-red { color: var(--alert-red); }
+.severity-yellow { color: var(--alert-yellow); }
+.severity-green { color: var(--alert-green); }

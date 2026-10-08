@@ -1,0 +1,63 @@
+{
+  "generated_at": "2026-09-25T18:38:06.166819+00:00",
+  "risk_model_path": "boosted-stump",
+  "artifact_signature": "boosted-stump|graph_model.json:1778235019944789200:8030|gat_model.json:1790361111451976500:29612|trajectory_model.json:1781212394099979600:8292",
+  "graph_attention": {
+    "degenerate": false,
+    "torch_available": true,
+    "trainer": "torch_autograd",
+    "heads": 4,
+    "hidden_dim": 16,
+    "trained": true,
+    "epochs": 150
+  },
+  "classification_models": [
+    {
+      "name": "Risk Scorer",
+      "type": "classification",
+      "model_path": "boosted-stump",
+      "metrics": {
+        "accuracy": 0.7546,
+        "precision": 0.8783,
+        "recall": 0.4464,
+        "f1": 0.592,
+        "samples": 4096
+      }
+    },
+    {
+      "name": "Graph Cascade",
+      "type": "classification",
+      "independent": true,
+      "metrics": {
+        "accuracy": 0.9876,
+        "precision": 0.9846,
+        "recall": 0.9869,
+        "f1": 0.9857,
+        "samples": 2985
+      }
+    },
+    {
+      "name": "GAT Cascade",
+      "type": "classification",
+      "independent": true,
+      "metrics": {
+        "accuracy": 0.9554,
+        "precision": 0.9476,
+        "recall": 0.9498,
+        "f1": 0.9487,
+        "samples": 2985
+      }
+    }
+  ],
+  "regression_models": [
+    {
+      "name": "Trajectory Predictor",
+      "type": "regression",
+      "metrics": {
+        "mae": 226.9309,
+        "rmse": 281.7355,
+        "samples": 768
+      }
+    }
+  ]
+}

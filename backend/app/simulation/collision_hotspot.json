@@ -1,0 +1,20 @@
+{
+  "name": "collision_hotspot",
+  "description": "Two satellites injected onto the same orbit so the hotspot and debris area are obvious.",
+  "satellites": [
+    {
+      "name": "SAT-COLLIDER-A",
+      "norad_id": 99901,
+      "line1": "1 99901U 98067A   20316.41785509 -.00000021  00000-0  85542-5 0  9994",
+      "line2": "2 99901  51.6455 289.4795 0002011 255.4374  11.5369 15.49255566254823"
+    },
+    {
+      "name": "SAT-COLLIDER-B",
+      "norad_id": 99902,
+      "line1": "1 99902U 98067A   20316.41785509 -.00000021  00000-0  85542-5 0  9994",
+      "line2": "2 99902  51.6455 289.4795 0002011 255.4374  11.5369 15.49255566254823"
+    }
+  ],
+  "tca_minutes_from_trigger": 0,
+  "expected_miss_distance_km": 0.0
+}

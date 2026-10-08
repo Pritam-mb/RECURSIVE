@@ -1,0 +1,30 @@
+{
+  "training_samples": 4000,
+  "test_samples": 1000,
+  "n_positive_train": 2,
+  "n_negative_train": 3998,
+  "precision": 0.0,
+  "recall": 0.0,
+  "f1": 0.0,
+  "confusion_matrix": [
+    [
+      999,
+      0
+    ],
+    [
+      1,
+      0
+    ]
+  ],
+  "trained_at": "2026-06-12T21:27:34Z",
+  "feature_names": [
+    "miss_distance_km",
+    "relative_velocity_kms",
+    "tca_hours",
+    "tle_age_hours",
+    "altitude_km",
+    "c_radial",
+    "c_transverse",
+    "c_normal"
+  ]
+}

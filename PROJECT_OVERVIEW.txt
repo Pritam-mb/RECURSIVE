@@ -1,0 +1,101 @@
+ORBITAL SENTINEL - PROJECT OVERVIEW
+
+What it is
+Orbital Sentinel is a real-time satellite tracking and conjunction awareness
+prototype. It ingests Two-Line Element (TLE) sets, propagates thousands of
+satellite orbits with SGP4, and streams live position updates to a web UI.
+The UI renders a Cesium globe, highlights active conjunction alerts, and
+provides a demo workflow for manual delta-V maneuvers with preflight gates.
+
+Current capabilities
+- Real-time propagation of tens of thousands of objects using SGP4.
+- 1 Hz WebSocket broadcast of satellite positions for smooth visualization.
+- REST endpoints for snapshots, alerts, per-satellite details, and orbit tracks.
+- Pairwise conjunction screening with alert severity thresholds.
+- Demo simulation scenarios injected from JSON for deterministic testing.
+- Manual maneuver workflow with six preflight gates and delta-V limits.
+- Cesium globe visualization with selection, hover, and orbit track rendering.
+- Telemetry panel showing speed, altitude, and current geodetic coordinates.
+
+System architecture
+Backend (FastAPI)
+- SGP4 propagator parses TLEs and computes ECI position/velocity.
+- Snapshot cache stores the most recent propagated state for fast access.
+- Conjunction engine screens pairwise miss distances and severity levels.
+- Simulation engine loads scenario JSONs and injects custom satellites.
+- WebSocket manager pushes the latest snapshot payload at 1 Hz.
+- REST API provides:
+  - /api/satellites            (current snapshot)
+  - /api/satellites/{id}       (single satellite state)
+  - /api/satellites/{id}/orbit (short orbit track)
+  - /api/alerts                (current conjunction alerts)
+  - /api/maneuver              (delta-V maneuver)
+  - /api/preflight             (maneuver validation gates)
+  - /api/simulate              (load/clear scenario)
+  - /api/scenarios             (available scenarios)
+
+Frontend (React + Cesium)
+- Connects to REST for bootstrapping satellites and alerts.
+- Maintains a WebSocket to receive live position updates.
+- Renders an Earth globe and thousands of satellite billboards.
+- Highlights hovered and selected satellites and draws orbit tracks.
+- Telemetry panel shows speed, altitude, latitude, and longitude.
+- Alerts panel lists conjunctions with severity and relative speed.
+- Manual control panel triggers preflight checks and demo burns.
+
+Data flow (runtime)
+1) Backend loads a bundled TLE snapshot from backend/app/simulation/tle-data.txt.
+2) Backend propagates orbits and caches a snapshot every second.
+3) Backend screens conjunctions on a slower cadence and caches alerts.
+4) Frontend bootstraps with REST calls, then listens to WebSocket updates.
+5) UI updates satellite positions, alert list, and telemetry in real time.
+
+Data sources and models
+- TLEs are loaded from a local snapshot on startup.
+- A remote TLE fetcher is available for future use (not enabled at startup).
+- ML components exist as placeholders:
+  - LSTM predictor (currently linear extrapolation mock).
+  - XGBoost risk scorer (currently mock scoring).
+
+Known simplifications (current build)
+- Delta-V maneuvers are simplified and do not re-fit orbits physically.
+- Conjunction screening uses single-epoch pairwise checks rather than
+  full-time-of-closest-approach propagation.
+- No persistent storage or user accounts.
+- No data provenance or sensor fusion beyond TLEs.
+
+Future possibilities
+- Operational accuracy
+  - Replace single-epoch screening with TCA search and full encounter windows.
+  - Integrate high-fidelity propagators or numerical integration options.
+  - Include atmospheric drag and maneuver history in propagation.
+
+- Risk intelligence
+  - Train and plug in the LSTM predictor for short-term trajectory forecasts.
+  - Integrate a real XGBoost model for collision risk scoring.
+  - Add uncertainty models and covariance-based conjunction probability.
+
+- Scenario and mission tooling
+  - Scenario editor UI for creating custom encounters and maneuvers.
+  - Batch maneuver planning with cost and safety optimization.
+  - Replay timelines with rewind/fast-forward controls.
+
+- Product and UX
+  - Alerts triage with filtering, sorting, and acknowledgment workflows.
+  - Per-satellite pages with history, orbital elements, and ownership metadata.
+  - Operator dashboards and role-based views for different teams.
+
+- Integrations and ops
+  - Live TLE ingestion from public catalogs or private sensor networks.
+  - Automated alerting to email/Slack/ops tools.
+  - Deployment as a scalable API service with caching and load balancing.
+
+- Visualization upgrades
+  - Heatmaps for congestion zones and alert density.
+  - Orbit path prediction overlays and risk cones.
+  - Realistic lighting, day-night terminator, and atmosphere layers.
+
+Status today
+The project is a functional end-to-end prototype focused on real-time
+visualization and conjunction awareness, with clear hooks for adding
+higher-fidelity physics, risk analytics, and operational workflows.

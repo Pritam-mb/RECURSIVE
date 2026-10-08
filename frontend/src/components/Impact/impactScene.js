@@ -305,7 +305,7 @@ export default class ImpactScene {
     if (import.meta.env.DEV) {
       // TEMP perf probe (removed after verification)
       const pr = (window.__impactPerf ||= { frames: 0, ms: 0, renders: 0 });
-      pr.frames += 1; pr.ms += performance.now() - perf; if (changed || animating) pr.renders += 1;
+      pr.frames += 1; pr.alive = this.stats.alive; pr.F = this.model.F; pr.t = this.lastT; pr.shown = this.fragItems.filter((x) => x.show).length; pr.colShow = this.fragPoints.show; pr.p0 = this.fragItems[0] && [this.fragItems[0].position.x, this.fragItems[0].pixelSize, this.fragItems[0].color.alpha]; pr.ms += performance.now() - perf; if (changed || animating) pr.renders += 1;
     }
     return changed || animating;
   }

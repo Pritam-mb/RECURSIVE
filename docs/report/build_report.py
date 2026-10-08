@@ -984,31 +984,45 @@ def fig_breakup(res, sbm, event):
 
 
 def fig_cloud(res, snaps, event):
+    """3-D ECI view (true scale, equal aspect) of both fragment streams at three epochs."""
+    from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+
+    RE = 6378.137
     r0 = np.asarray(event["tca"]["position_a_eci"], float)
-    v0 = np.asarray(event["tca"]["velocity_a_eci"], float)
-    e1 = r0 / np.linalg.norm(r0)
-    hh = np.cross(r0, v0); hh /= np.linalg.norm(hh)
-    e2 = np.cross(hh, e1)
-    fig, axes = plt.subplots(1, 3, figsize=(7.2, 2.6))
-    for a, (t, r) in zip(axes, snaps.items()):
-        x, y = r @ e1, r @ e2
-        a.add_patch(Circle((0, 0), 6378.137, fc="#dfe9f5", ec="#9fb6d3", lw=0.6))
+    rn = r0 / np.linalg.norm(r0)
+    az0 = math.degrees(math.atan2(rn[1], rn[0]))
+    el0 = math.degrees(math.asin(rn[2]))
+    u, v = np.mgrid[0:2 * np.pi:36j, 0:np.pi:18j]
+    ex, ey, ez = RE * np.cos(u) * np.sin(v), RE * np.sin(u) * np.sin(v), RE * np.cos(v)
+    names = [p_["name"][:22] for p_ in event["parents"]]
+    fig = plt.figure(figsize=(7.2, 3.0))
+    L = 8200.0
+    for idx, (t, r) in enumerate(snaps.items()):
+        a = fig.add_subplot(1, 3, idx + 1, projection="3d")
+        a.plot_surface(ex, ey, ez, color="#c9daef", alpha=0.35, linewidth=0, shade=True, zorder=0)
+        a.plot_wireframe(ex, ey, ez, color="#9fb6d3", linewidth=0.25, rstride=3, cstride=3, alpha=0.6)
+        alive = np.linalg.norm(r, axis=1) - RE >= 100
         for k, col in ((0, CAT[0]), (1, CAT[1])):
-            m = res.parent_index == k
-            a.scatter(x[m], y[m], s=1.6, color=col, lw=0, alpha=0.8)
-        a.scatter([r0 @ e1], [r0 @ e2], marker="x", color=BAD, s=18, lw=1)
-        a.set_aspect("equal"); a.set_xlim(-8500, 8500); a.set_ylim(-8500, 8500)
-        a.set_title(f"+{t} min after breakup", loc="center")
-        a.tick_params(labelsize=5.5)
-        alive = np.linalg.norm(r, axis=1) - 6378.137 >= 100
-        a.text(0, -7900, f"{alive.sum()} fragments above 100 km", ha="center", fontsize=5.8, color=INK2)
-    axes[0].set_ylabel("km (parent orbital plane)")
-    axes[0].scatter([], [], color=CAT[0], label=event["parents"][0]["name"][:22])
-    axes[0].scatter([], [], color=CAT[1], label=event["parents"][1]["name"][:22])
-    axes[0].legend(fontsize=5.5, loc="upper left", markerscale=1.5)
-    fig.tight_layout()
+            m = (res.parent_index == k) & alive
+            a.scatter(r[m, 0], r[m, 1], r[m, 2], s=1.4, color=col, depthshade=False, lw=0,
+                      label=f"from {names[k]}" if idx == 0 else None)
+        a.scatter([r0[0]], [r0[1]], [r0[2]], marker="x", color=BAD, s=22, depthshade=False)
+        a.set_xlim(-L, L); a.set_ylim(-L, L); a.set_zlim(-L, L)
+        a.set_box_aspect((1, 1, 1))
+        a.view_init(elev=el0 + 20, azim=az0 + 35)
+        a.set_title(f"+{t} min: {int(alive.sum())} fragments > 100 km", fontsize=7.5, loc="center", pad=0)
+        a.tick_params(labelsize=4.5, pad=0)
+        for axis in (a.xaxis, a.yaxis, a.zaxis):
+            axis.pane.set_alpha(0.0)
+            axis._axinfo["grid"]["color"] = GRID
+        a.set_xlabel("x [km]", fontsize=5.5, labelpad=-8); a.set_ylabel("y [km]", fontsize=5.5, labelpad=-8)
+        a.set_zlabel("z [km]", fontsize=5.5, labelpad=-8)
+    fig.legend(loc="lower center", ncol=3, fontsize=6.3, markerscale=4, bbox_to_anchor=(0.5, 0.0))
+    fig.subplots_adjust(left=0.0, right=1.0, top=0.93, bottom=0.1, wspace=0.0)
     return save(fig, "18_cloud", "Fragments from the reproduced breakup propagated with app.core.breakup.propagate "
-                "(RK4, two-body + J2 + Vallado drag, Cd·A/M). Projection on parent A's orbital plane at TCA; × = impact point.")
+                "(RK4, two-body + J2 + Vallado drag, Cd·A/M), shown in 3-D ECI/TEME at true scale (equal axes, Earth "
+                "sphere R = 6378 km) for both parents; camera placed above the impact point (×). Fragments below 100 km "
+                "are removed.")
 
 
 def fig_debris_alerts(alerts_deb):

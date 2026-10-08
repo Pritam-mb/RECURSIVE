@@ -1,32 +1,68 @@
 import { useEffect, useState, useRef } from 'react';
-import { apiGet } from '../utils/api';
+import { apiGet, apiPost } from '../utils/api';
 
 const POLL_MS = 30_000;
 
 const TOP_FEATURES = ['miss_dist', 'rel_vel', 'altitude', 'tle_age'];
+const DEFAULT_BUFFER_THRESHOLD = 500;
+const PIPELINE_OFF_NOTE = 'Extended pipeline off — set ENABLE_EXTENDED_PIPELINE=1';
+
+// '—' when the value is unknown (status endpoint unreachable), never a fake 0.
+const fmt = (v) => (v == null ? '—' : Number(v).toLocaleString());
 
 export default function ModelStatusV2() {
   const [metrics, setMetrics] = useState(null);
   const [cascadeStatus, setCascadeStatus] = useState(null);
   const [sampleHistory, setSampleHistory] = useState([]);
+  const [mlStatus, setMlStatus] = useState(null);
+  const [mlStatusReachable, setMlStatusReachable] = useState(null);
+  const [retrainBusy, setRetrainBusy] = useState(false);
+  const [retrainMsg, setRetrainMsg] = useState(null);
   const mountedRef = useRef(true);
 
   const fetchAll = async () => {
     if (!mountedRef.current) return;
     try {
-      const [m, c] = await Promise.all([
+      const [m, c, s] = await Promise.all([
         apiGet('/api/model-metrics').catch(() => null),
         apiGet('/api/cascade/status').catch(() => null),
+        apiGet('/api/ml/status').catch(() => null),
       ]);
       if (!mountedRef.current) return;
       if (m) setMetrics(m);
       if (c) setCascadeStatus(c);
+      setMlStatus(s);
+      setMlStatusReachable(s != null);
       setSampleHistory((prev) => {
         const samples = m?.classification_models?.[0]?.metrics?.samples ?? 0;
         const ts = new Date().toISOString().substring(11, 19);
         return [...prev, { ts, count: samples }].slice(-10);
       });
     } catch (_) {}
+  };
+
+  const triggerRetrain = async () => {
+    setRetrainBusy(true);
+    setRetrainMsg(null);
+    try {
+      const res = await apiPost('/api/ml/retrain');
+      if (!mountedRef.current) return;
+      setRetrainMsg({
+        ok: res?.ok !== false,
+        text: res?.message ?? (res?.ok === false ? 'Retrain did not run' : 'Retrain complete'),
+      });
+    } catch (err) {
+      if (!mountedRef.current) return;
+      setRetrainMsg({
+        ok: false,
+        text: err?.body?.message ?? err?.body?.detail ?? err?.message ?? 'Retrain request failed',
+      });
+    } finally {
+      if (mountedRef.current) {
+        setRetrainBusy(false);
+        fetchAll();
+      }
+    }
   };
 
   useEffect(() => {
@@ -46,32 +82,47 @@ export default function ModelStatusV2() {
   const precision = riskModel?.metrics?.precision ?? null;
   const recall = riskModel?.metrics?.recall ?? null;
   const f1 = riskModel?.metrics?.f1 ?? null;
-  const predictions = 0;
-  const highRisk = 0;
+  const pipelineEnabled = mlStatus?.pipeline_enabled ?? null;
+  const pipelineOff = pipelineEnabled === false;
+  const xgb = mlStatus?.xgboost ?? null;
+  const lstm = mlStatus?.lstm ?? null;
+  const rlhf = mlStatus?.rlhf ?? null;
+  const meta = mlStatus?.meta_propagator ?? null;
+  const shadow = mlStatus?.shadow ?? null;
 
-  const lstmTrained = (trajModel?.metrics?.samples ?? 0) > 0;
+  const predictions = xgb?.predictions_today ?? null;
+  const highRisk = xgb?.high_risk_today ?? null;
+
+  const lstmTrained = lstm?.trained ?? ((trajModel?.metrics?.samples ?? 0) > 0);
   const lstmSeqs = trajModel?.metrics?.samples ?? 0;
-  const lstmSats = 0;
+  const lstmSats = lstm?.satellites_tracked ?? null;
   const lstmErr = trajModel?.metrics?.mae ?? null;
-  const bufferFill = 0;
-  const BUFFER_THRESHOLD = 500;
+  const bufferFill = lstm?.buffer_records ?? null;
+  const bufferThreshold = lstm?.buffer_threshold || DEFAULT_BUFFER_THRESHOLD;
 
   const gatStatus = metrics?.graph_attention ?? null;
   const gatDegenerate = gatStatus?.degenerate !== false;
   const cascadePred = cascadeStatus?.cascade_predictions ?? graphModel?.metrics?.samples ?? 0;
   const meanDepth = cascadeStatus?.mean_cascade_depth ?? 0;
 
-  const rlhfDecisions = 0;
-  const approvalRate = null;
-  const rlhfRounds = 0;
-  const rlhfRoundRates = [];
+  const rlhfDecisions = rlhf?.decisions ?? null;
+  const approvalRate = rlhf?.approval_rate ?? null;
+  const rlhfRounds = rlhf?.rounds ?? null;
+  // Rates are 0-1; tolerate a backend that reports percentages.
+  const rlhfRoundRates = (rlhf?.round_approval_rates ?? [])
+    .filter((r) => r != null && Number.isFinite(Number(r)))
+    .map((r) => { const n = Number(r); return Math.max(0, Math.min(1, n > 1 ? n / 100 : n)); });
 
-  const metaSats = 0;
-  const metaImprovement = 0;
-  const metaCorrections = 0;
+  const metaSats = meta?.satellites_with_corrections ?? null;
+  const metaImprovement = meta?.mean_improvement_pct ?? null;
+  const metaCorrections = meta?.corrections ?? null;
 
+  // Conjunction samples are the XGBoost training set; the retrain trigger is
+  // the LSTM position buffer reaching its threshold, so readiness is based on
+  // buffer fill (unknown when /api/ml/status is unreachable).
   const conjSamples = metrics?.conjunction_samples ?? trainSamples;
-  const readyToRetrain = conjSamples >= BUFFER_THRESHOLD;
+  const readyToRetrain = bufferFill != null ? bufferFill >= bufferThreshold : null;
+  const bufferPct = bufferFill != null ? Math.min((bufferFill / bufferThreshold) * 100, 100) : 0;
 
   // Sparkline for sample history (simple inline SVG)
   const maxCount = Math.max(...sampleHistory.map((s) => s.count), 1);
@@ -103,20 +154,23 @@ export default function ModelStatusV2() {
             <span>{precision.toFixed(2)} / {recall.toFixed(2)} / {f1.toFixed(2)}</span>
           </div>
         )}
-        <div className="msv2-row"><span>Predictions today</span><span>{predictions}</span></div>
-        <div className="msv2-row"><span>High-risk detections</span><span>{highRisk}</span></div>
+        <div className="msv2-row"><span>Predictions today</span><span>{fmt(predictions)}</span></div>
+        <div className="msv2-row"><span>High-risk detections</span><span>{fmt(highRisk)}</span></div>
+        {pipelineOff && <div className="msv2-note">{PIPELINE_OFF_NOTE}</div>}
 
         {/* Feature importance bars */}
         <div className="msv2-feature-bars">
-          {TOP_FEATURES.map((feat, i) => {
-            const imp = riskModel?.feature_importance?.[feat] ?? (0.35 - i * 0.06);
+          {TOP_FEATURES.map((feat) => {
+            // No fabricated fallback: unknown importance renders as an empty bar + '—'.
+            const raw = riskModel?.feature_importance?.[feat];
+            const imp = raw != null && Number.isFinite(Number(raw)) ? Number(raw) : null;
             return (
               <div className="msv2-feature-bar-row" key={feat}>
                 <span className="msv2-feature-name">{feat}</span>
                 <div className="msv2-bar-container">
-                  <div className="msv2-bar-fill" style={{ width: `${Math.min(imp * 100, 100)}%` }} />
+                  <div className="msv2-bar-fill" style={{ width: `${imp != null ? Math.min(imp * 100, 100) : 0}%` }} />
                 </div>
-                <span className="msv2-feature-val">{(imp * 100).toFixed(0)}%</span>
+                <span className="msv2-feature-val">{imp != null ? `${(imp * 100).toFixed(0)}%` : '—'}</span>
               </div>
             );
           })}
@@ -131,18 +185,19 @@ export default function ModelStatusV2() {
         </div>
         <div className="msv2-row">
           <span>Training sequences</span>
-          <span>{lstmSeqs} from {lstmSats} satellites</span>
+          <span>{lstmSeqs} from {fmt(lstmSats)} satellites</span>
         </div>
         {lstmErr != null && (
           <div className="msv2-row"><span>Mean prediction error</span><span>{lstmErr.toFixed(2)} km</span></div>
         )}
         <div className="msv2-row">
           <span>Buffer fill</span>
-          <span>{bufferFill} / {BUFFER_THRESHOLD}</span>
+          <span>{fmt(bufferFill)} / {bufferThreshold.toLocaleString()}</span>
         </div>
         <div className="msv2-bar-container">
-          <div className="msv2-bar-fill" style={{ width: `${Math.min((bufferFill / BUFFER_THRESHOLD) * 100, 100)}%` }} />
+          <div className="msv2-bar-fill" style={{ width: `${bufferPct}%` }} />
         </div>
+        {pipelineOff && <div className="msv2-note">{PIPELINE_OFF_NOTE}</div>}
       </div>
 
       {/* Section 3: GNN */}
@@ -192,32 +247,39 @@ export default function ModelStatusV2() {
       <div className="msv2-section">
         <div className="msv2-section-title">Meta-Propagator + RLHF</div>
 
-        <div className="msv2-row"><span>Sats with corrections</span><span>{metaSats}</span></div>
-        <div className="msv2-row"><span>Mean improvement vs SGP4</span><span>{metaImprovement.toFixed(1)}%</span></div>
-        <div className="msv2-row"><span>Total corrections</span><span>{metaCorrections}</span></div>
+        {pipelineOff && <div className="msv2-note">{PIPELINE_OFF_NOTE}</div>}
+        <div className="msv2-row"><span>Sats with corrections</span><span>{fmt(metaSats)}</span></div>
+        <div className="msv2-row">
+          <span>Mean improvement vs SGP4</span>
+          <span>{metaImprovement != null ? `${Number(metaImprovement).toFixed(1)}%` : '—'}</span>
+        </div>
+        <div className="msv2-row"><span>Total corrections</span><span>{fmt(metaCorrections)}</span></div>
 
         <div style={{ height: 6 }} />
 
-        <div className="msv2-row"><span>RLHF decisions</span><span>{rlhfDecisions}</span></div>
+        <div className="msv2-row"><span>RLHF decisions</span><span>{fmt(rlhfDecisions)}</span></div>
         <div className="msv2-row">
           <span>Approval rate</span>
           <span>
             {approvalRate != null ? `${(approvalRate * 100).toFixed(0)}%` : '—'}
           </span>
         </div>
-        <div className="msv2-row"><span>RLHF rounds</span><span>{rlhfRounds}</span></div>
+        <div className="msv2-row"><span>RLHF rounds</span><span>{fmt(rlhfRounds)}</span></div>
 
         {/* Approval rate sparkline dots */}
         {rlhfRoundRates.length > 0 && (
           <div className="msv2-rlhf-dots">
-            {rlhfRoundRates.slice(-10).map((r, i) => (
-              <div
-                key={i}
-                className="msv2-rlhf-dot"
-                style={{ height: `${Math.max(2, r * 28)}px` }}
-                title={`Round ${i + 1}: ${(r * 100).toFixed(0)}%`}
-              />
-            ))}
+            {rlhfRoundRates.slice(-10).map((r, i, shown) => {
+              const round = rlhfRoundRates.length - shown.length + i + 1;
+              return (
+                <div
+                  key={round}
+                  className="msv2-rlhf-dot"
+                  style={{ height: `${Math.max(2, r * 28)}px` }}
+                  title={`Round ${round}: ${(r * 100).toFixed(0)}%`}
+                />
+              );
+            })}
           </div>
         )}
       </div>
@@ -227,11 +289,40 @@ export default function ModelStatusV2() {
         <div className="msv2-section-title">Training Data Accumulation</div>
         <div className="msv2-row"><span>Conjunction samples</span><span>{conjSamples.toLocaleString()}</span></div>
         <div className="msv2-row">
-          <span>Ready to retrain</span>
+          <span>Ready to retrain (LSTM buffer)</span>
           <span style={{ color: readyToRetrain ? 'var(--alert-green)' : 'var(--text-dim)' }}>
-            {readyToRetrain ? 'YES' : `NO (${conjSamples}/${BUFFER_THRESHOLD})`}
+            {readyToRetrain == null
+              ? '—'
+              : readyToRetrain
+                ? 'YES'
+                : `NO (${bufferFill.toLocaleString()}/${bufferThreshold.toLocaleString()})`}
           </span>
         </div>
+        <div className="msv2-row">
+          <span>Shadow retrain</span>
+          <span>{shadow == null ? '—' : shadow.enabled ? 'ENABLED' : 'DISABLED'}</span>
+        </div>
+        <div className="msv2-row">
+          <span>Last retrain</span>
+          <span>{shadow == null ? '—' : (shadow.last_retrain ?? 'never')}</span>
+        </div>
+        {pipelineOff && <div className="msv2-note">{PIPELINE_OFF_NOTE}</div>}
+        {mlStatusReachable === false && (
+          <div className="msv2-note">ML status endpoint unreachable</div>
+        )}
+
+        <button
+          type="button"
+          className="msv2-btn"
+          onClick={triggerRetrain}
+          disabled={retrainBusy || pipelineEnabled !== true}
+          title={pipelineOff ? PIPELINE_OFF_NOTE : undefined}
+        >
+          {retrainBusy ? 'RETRAINING…' : 'RETRAIN NOW'}
+        </button>
+        {retrainMsg && (
+          <div className={`msv2-retrain-msg ${retrainMsg.ok ? 'ok' : 'err'}`}>{retrainMsg.text}</div>
+        )}
 
         {/* Sample count sparkline */}
         {sampleHistory.length > 1 && (

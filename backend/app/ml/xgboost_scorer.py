@@ -106,6 +106,61 @@ def _ensure_trained_model() -> None:
         _trained_model_loaded = True
 
 
+# ── Daily prediction counters (exposed via /api/ml/status) ───────────────────
+# A score at or above this is "high risk". It matches the label threshold the
+# Foster XGBoost model is trained against (labels = targets >= 0.5).
+HIGH_RISK_THRESHOLD = 0.5
+
+
+class _DailyPredictionCounter:
+    """Thread-safe count of production scores, reset at UTC day rollover."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._day = None
+        self._predictions = 0
+        self._high_risk = 0
+
+    @staticmethod
+    def _today():
+        from datetime import datetime, timezone
+
+        return datetime.now(timezone.utc).date()
+
+    def _roll(self) -> None:
+        today = self._today()
+        if self._day != today:
+            self._day = today
+            self._predictions = 0
+            self._high_risk = 0
+
+    def record(self, score: float) -> None:
+        with self._lock:
+            self._roll()
+            self._predictions += 1
+            if score >= HIGH_RISK_THRESHOLD:
+                self._high_risk += 1
+
+    def snapshot(self) -> dict[str, int]:
+        with self._lock:
+            self._roll()
+            return {"predictions_today": self._predictions, "high_risk_today": self._high_risk}
+
+    def reset(self) -> None:
+        with self._lock:
+            self._day = None
+            self._predictions = 0
+            self._high_risk = 0
+
+
+prediction_counter = _DailyPredictionCounter()
+
+
+def using_trained_model() -> bool:
+    """True when the Foster-trained XGBoost model is loaded and usable."""
+    return bool(_using_trained and _trained_model is not None and xgb is not None)
+
+
 # ── Legacy boosted-stump model (fallback) ─────────────────────────────────────
 
 @dataclass
@@ -473,14 +528,23 @@ class XGBoostScorer:
             c_normal,
         ], dtype=float)
 
-    def score(self, features: dict | list[float] | np.ndarray) -> float:
+    def score(self, features: dict | list[float] | np.ndarray, *, record: bool = True) -> float:
         """
         Score collision risk from 0.0 (safe) to 1.0 (critical).
 
         Primary path: Foster-trained XGBoost model, used only when the extended
         ML pipeline is enabled.
         Fallback: legacy boosted-stump heuristic.
+
+        ``record=False`` keeps offline evaluation (model-metrics) out of the
+        daily production prediction counters.
         """
+        value = self._score(features)
+        if record:
+            prediction_counter.record(value)
+        return value
+
+    def _score(self, features: dict | list[float] | np.ndarray) -> float:
         # ── Primary path: Foster-trained XGBoost (flag-gated) ────────────────
         if _extended_pipeline_enabled():
             _ensure_trained_model()

@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
 import useStore from '../store/useStore';
+import { nodeKey, setCachedPosition } from '../utils/cascadeGraph';
 
 const NODE_COLORS = {
   CRITICAL: '#ef4444',
@@ -35,13 +36,15 @@ export default function CascadeDiagram({ graph = { nodes: [], edges: [] } }) {
     const H = canvas.offsetHeight || 280;
 
     // Merge new nodes/edges, preserving positions
-    const nodeMap = new Map(simRef.current.nodes.map((n) => [n.id, n]));
+    const nodeMap = new Map(simRef.current.nodes.map((n) => [nodeKey(n.id), n]));
 
+    // New nodes start at the graph's deterministic position (cached sim
+    // position or NORAD-seeded offset, both centre-relative) — no Math.random().
     simRef.current.nodes = graph.nodes.map((n) => {
-      const existing = nodeMap.get(n.id);
+      const existing = nodeMap.get(nodeKey(n.id));
       return existing
         ? { ...n, x: existing.x, y: existing.y, vx: existing.vx, vy: existing.vy }
-        : { ...n, x: W / 2 + (Math.random() - 0.5) * 200, y: H / 2 + (Math.random() - 0.5) * 150, vx: 0, vy: 0 };
+        : { ...n, x: W / 2 + (n.x ?? 0), y: H / 2 + (n.y ?? 0), vx: 0, vy: 0 };
     });
 
     simRef.current.edges = graph.edges;
@@ -116,6 +119,8 @@ export default function CascadeDiagram({ graph = { nodes: [], edges: [] } }) {
         n.vy *= DAMPING;
         n.x = Math.max(20, Math.min(W - 20, n.x + n.vx));
         n.y = Math.max(20, Math.min(H - 20, n.y + n.vy));
+        // Remember centre-relative position so rebuilt graphs / remounts keep it
+        setCachedPosition(n.id, n.x - W / 2, n.y - H / 2);
       }
 
       // ── Draw ───────────────────────────────────────────────────────────────

@@ -15,6 +15,8 @@ from .synthetic_data import generate_trajectory_dataset
 logger = logging.getLogger(__name__)
 
 TRAJECTORY_ARTIFACT = "trajectory_model.json"
+# Total buffered position records that trigger a real-data LSTM retrain.
+LSTM_RETRAIN_THRESHOLD = 500
 
 
 class RingBuffer:
@@ -274,6 +276,8 @@ class LSTMPredictor:
         self.model: RecurrentTrajectoryModel | None = None
         self._buffers: dict[int, RingBuffer] = {}
         self.model_path = model_path
+        # True once train_on_buffer_data() has succeeded in this process.
+        self.trained_on_real_data = False
         self._load_or_train_model(model_path)
 
     def _load_or_train_model(self, path: str | None):
@@ -293,6 +297,21 @@ class LSTMPredictor:
             logger.warning("Trajectory model bootstrap failed, retraining: %s", error)
             self.model = train_trajectory_model()
 
+    def stats(self) -> dict[str, Any]:
+        """Buffer/training summary for /api/ml/status."""
+        import os
+
+        buffers = list(self._buffers.values())
+        records = sum(b.size for b in buffers)
+        tracked = sum(1 for b in buffers if b.size > 0)
+        weights = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lstm_model.pt")
+        return {
+            "trained": bool(self.trained_on_real_data or os.path.exists(weights)),
+            "satellites_tracked": int(tracked),
+            "buffer_records": int(records),
+            "buffer_threshold": int(LSTM_RETRAIN_THRESHOLD),
+        }
+
     def get_buffer(self, norad_id: int) -> RingBuffer:
         if norad_id not in self._buffers:
             self._buffers[norad_id] = RingBuffer(capacity=120)
@@ -306,7 +325,7 @@ class LSTMPredictor:
         # ── Auto-retrain trigger: when enough real data accumulates ────────
         # Count total entries across all buffers
         total_entries = sum(b.size for b in self._buffers.values())
-        if total_entries > 500 and not getattr(self, "_training_active", False):
+        if total_entries > LSTM_RETRAIN_THRESHOLD and not getattr(self, "_training_active", False):
             self._training_active = True
             t = threading.Thread(target=self._background_train, daemon=True)
             t.start()
@@ -419,6 +438,7 @@ class LSTMPredictor:
                 "LSTM retrained on %d sequences from %d satellites (saved to %s)",
                 len(X_list), n_sats, save_path,
             )
+            self.trained_on_real_data = True
             return True
 
         except Exception as exc:

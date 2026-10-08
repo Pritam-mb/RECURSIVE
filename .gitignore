@@ -35,6 +35,10 @@ pnpm-debug.log*
 # Env files
 .env
 .env.*
+!.env.example
+
+# Runtime ML state (operator feedback store)
+backend/app/ml/artifacts/rlhf_feedback.db
 
 # OS
 .DS_Store

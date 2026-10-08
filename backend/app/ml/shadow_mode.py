@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 from datetime import datetime, timedelta, timezone
 from typing import Iterable
 
@@ -24,6 +25,9 @@ class ShadowMode:
         self.predictor = predictor
         self.logger = get_shadow_logger()
         self.risk_scorer = XGBoostScorer()
+        self.last_retrain: str | None = None
+        self.last_result: dict | None = None
+        self._retrain_lock = threading.Lock()
 
     def record_snapshot(self, states: Iterable[SatelliteState], timestamp: datetime):
         if not self.enabled:
@@ -94,7 +98,12 @@ class ShadowMode:
         if not self.enabled:
             return {"status": {"status": "disabled"}}
 
-        lstm_result = self.retrain_lstm()
-        risk_result = self.retrain_risk()
-        logger.info("Shadow-mode retrain: LSTM=%s Risk=%s", lstm_result, risk_result)
-        return {"lstm": lstm_result, "risk": risk_result}
+        # Serialised so a manual /api/ml/retrain cannot overlap the scheduler.
+        with self._retrain_lock:
+            lstm_result = self.retrain_lstm()
+            risk_result = self.retrain_risk()
+            logger.info("Shadow-mode retrain: LSTM=%s Risk=%s", lstm_result, risk_result)
+            result = {"lstm": lstm_result, "risk": risk_result}
+            self.last_retrain = datetime.now(timezone.utc).isoformat()
+            self.last_result = result
+            return result

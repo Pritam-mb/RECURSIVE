@@ -8,6 +8,7 @@ import json
 import logging
 import os
 from contextlib import asynccontextmanager
+from pathlib import Path
 from datetime import datetime
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -35,10 +36,35 @@ from app.routers.predict import router as predict_router, init_predict_router
 from app.ml.runtime import get_ml_runtime
 from app.streaming.kafka_adapter import KafkaAdapter
 
-load_dotenv(dotenv_path="../.env")
+_BACKEND_DIR = Path(__file__).resolve().parent
+_REPO_ROOT = _BACKEND_DIR.parent
+
+
+def load_environment() -> list[Path]:
+    """Load .env files resolved from this file's location, not the cwd.
+
+    ``backend/.env`` is loaded first, then the repo-root ``.env`` as a
+    fallback. ``override=False`` everywhere, so real environment variables and
+    earlier files win. Set ORBIT_SENTINEL_SKIP_DOTENV=1 to skip loading
+    entirely (the test suite does this so a developer's local .env cannot flip
+    feature flags such as ENABLE_EXTENDED_PIPELINE under the tests).
+    """
+    if os.getenv("ORBIT_SENTINEL_SKIP_DOTENV", "0") == "1":
+        return []
+    loaded: list[Path] = []
+    for candidate in (_BACKEND_DIR / ".env", _REPO_ROOT / ".env"):
+        if candidate.is_file():
+            load_dotenv(dotenv_path=candidate, override=False)
+            loaded.append(candidate)
+    return loaded
+
+
+_LOADED_ENV_FILES = load_environment()
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+if _LOADED_ENV_FILES:
+    logger.info("Loaded environment from: %s", ", ".join(str(p) for p in _LOADED_ENV_FILES))
 
 # Global instances
 propagator = SGP4Propagator()

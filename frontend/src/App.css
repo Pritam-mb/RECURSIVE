@@ -2590,6 +2590,39 @@ input[type="range"]::-moz-range-thumb {
   transition: height 0.3s;
 }
 
+/* Pipeline-off / unreachable note */
+.msv2-note {
+  font-family: var(--mono);
+  font-size: 8px;
+  color: #ef9f27;
+  padding: 2px 0;
+}
+
+/* Retrain trigger */
+.msv2-btn {
+  margin-top: 8px;
+  padding: 3px 10px;
+  font-family: var(--mono);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.8px;
+  color: var(--alert-green);
+  background: rgba(34,197,94,0.08);
+  border: 0.5px solid var(--alert-green);
+  cursor: pointer;
+}
+.msv2-btn:hover:not(:disabled) { background: rgba(34,197,94,0.16); }
+.msv2-btn:disabled { color: var(--text-dim); border-color: var(--border); background: transparent; cursor: not-allowed; }
+
+.msv2-retrain-msg {
+  font-family: var(--mono);
+  font-size: 8px;
+  margin-top: 4px;
+  word-break: break-word;
+}
+.msv2-retrain-msg.ok  { color: var(--alert-green); }
+.msv2-retrain-msg.err { color: var(--alert-red); }
+
 /* ============================================================
    B-PLANE DIAGRAM (Task 15)
    ============================================================ */

@@ -4,9 +4,11 @@ REST API routes for maneuvers, scenarios, and alerts.
 
 import asyncio
 import json
+import logging
 import os
 from datetime import datetime, timezone, timedelta
 from fastapi import APIRouter, Depends, Header, HTTPException, Response
+from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
 
 from app.core.state_cache import get_latest_alerts, get_latest_snapshot, set_latest_alerts, set_latest_snapshot, get_all_kalman_states
@@ -26,11 +28,12 @@ from app.services.conjunction_predictor import propagate_states_to, enrich_paylo
 try:
     from app.core.satellite_state_tracker import satellite_tracker
     _TRACKER_AVAILABLE = True
-except ImportError:
+except Exception:  # any init failure, not just ImportError, must hit the fallback
     satellite_tracker = None
     _TRACKER_AVAILABLE = False
 
 router = APIRouter(prefix="/api")
+logger = logging.getLogger(__name__)
 
 
 # ── Agency authority ──────────────────────────────────────────────────────────
@@ -252,6 +255,29 @@ async def get_satellite_detail(norad_id: int):
     return state.to_dict()
 
 
+def _fallback_telemetry(norad_id: int, satellite_name: str) -> dict:
+    """Deterministic telemetry used only when the state tracker is unavailable.
+
+    Values are seeded from the NORAD id so repeated calls for the same
+    satellite return identical numbers instead of fresh random noise.
+    """
+    import random
+
+    rng = random.Random(int(norad_id))
+    return {
+        "norad_id": norad_id,
+        "satellite_name": satellite_name,
+        "fuel_remaining_pct": round(max(0.0, 85.0 + rng.uniform(-5, 10)), 2),
+        "battery_pct": round(88.0 + rng.uniform(-3, 3), 2),
+        "temperature_c": round(-10.0 + rng.uniform(-8, 8), 2),
+        "signal_strength_dbm": round(-65.0 + rng.uniform(-5, 5), 2),
+        "solar_power_w": round(1200.0 + rng.uniform(-100, 100), 1),
+        "total_delta_v_used_ms": 0.0,
+        "maneuver_count": 0,
+        "telemetry_source": "deterministic_fallback",
+    }
+
+
 @router.get("/satellites/{norad_id}/telemetry")
 async def get_satellite_telemetry(norad_id: int):
     """Get stateful telemetry for a satellite (fuel, battery, temperature, etc.)."""
@@ -265,19 +291,7 @@ async def get_satellite_telemetry(norad_id: int):
     if _TRACKER_AVAILABLE and satellite_tracker is not None:
         telemetry = satellite_tracker.get_telemetry(norad_id, state.name)
     else:
-        # Minimal fallback when tracker is unavailable
-        import random
-        telemetry = {
-            "norad_id": norad_id,
-            "satellite_name": state.name,
-            "fuel_remaining_pct": round(max(0.0, 85.0 + random.uniform(-5, 10)), 2),
-            "battery_pct": round(88.0 + random.uniform(-3, 3), 2),
-            "temperature_c": round(-10.0 + random.uniform(-8, 8), 2),
-            "signal_strength_dbm": round(-65.0 + random.uniform(-5, 5), 2),
-            "solar_power_w": round(1200.0 + random.uniform(-100, 100), 1),
-            "total_delta_v_used_ms": 0.0,
-            "maneuver_count": 0,
-        }
+        telemetry = _fallback_telemetry(norad_id, state.name)
 
     return {
         **telemetry,
@@ -369,6 +383,118 @@ async def get_anomalies():
 async def get_model_metrics_endpoint():
     from app.ml.model_metrics import get_model_metrics
     return get_model_metrics()
+
+
+def _ml_status_payload() -> dict:
+    """Build the /api/ml/status body. Never constructs the ML runtime."""
+    import app.ml.xgboost_scorer as xgb_scorer
+    from app.ml.rlhf_store import get_stats as rlhf_stats
+
+    pipeline_enabled = os.getenv("ENABLE_EXTENDED_PIPELINE", "0") == "1"
+
+    # Read the runtime only if something already built it: status polling must
+    # not trigger the (slow) model load/training that get_ml_runtime() does.
+    runtime = None
+    if pipeline_enabled:
+        from app.ml.runtime import get_ml_runtime
+        if get_ml_runtime.cache_info().currsize:
+            runtime = get_ml_runtime()
+
+    xgboost = {
+        "using_trained": xgb_scorer.using_trained_model(),
+        **xgb_scorer.prediction_counter.snapshot(),
+    }
+
+    lstm = {"trained": False, "satellites_tracked": 0, "buffer_records": 0, "buffer_threshold": 500}
+    shadow = {
+        "enabled": pipeline_enabled and os.getenv("SHADOW_MODE_ENABLED", "1") == "1",
+        "last_retrain": None,
+        "last_result": None,
+    }
+    if runtime is not None:
+        try:
+            lstm = runtime.trajectory.stats()
+        except Exception as error:
+            logger.warning("LSTM stats unavailable: %s", error)
+        shadow["enabled"] = bool(runtime.shadow.enabled)
+        shadow["last_retrain"] = runtime.shadow.last_retrain
+        shadow["last_result"] = runtime.shadow.last_result
+    else:
+        from app.ml.lstm_predictor import LSTM_RETRAIN_THRESHOLD
+        lstm["buffer_threshold"] = LSTM_RETRAIN_THRESHOLD
+
+    try:
+        rlhf = rlhf_stats()
+    except Exception as error:
+        logger.warning("RLHF stats unavailable: %s", error)
+        rlhf = {
+            "decisions": 0, "approved": 0, "rejected": 0,
+            "approval_rate": None, "rounds": 0, "round_approval_rates": [],
+        }
+
+    # There is no meta-propagator: nothing produces corrected-vs-raw-SGP4
+    # error pairs. Shadow mode logs LSTM predictions against SGP4 positions
+    # (SGP4 is the "actual"), so an improvement over SGP4 cannot be measured
+    # from it. Report zeros rather than a fabricated number.
+    meta_propagator = {"satellites_with_corrections": 0, "mean_improvement_pct": 0.0, "corrections": 0}
+
+    return {
+        "pipeline_enabled": pipeline_enabled,
+        "xgboost": xgboost,
+        "lstm": lstm,
+        "rlhf": rlhf,
+        "meta_propagator": meta_propagator,
+        "shadow": shadow,
+    }
+
+
+@router.get("/ml/status")
+async def get_ml_status():
+    """Aggregate live ML pipeline counters for the model status panel.
+
+    Safe with ENABLE_EXTENDED_PIPELINE=0: LSTM/shadow fields report
+    zeros/false/null and the ML runtime is never constructed by this call.
+    ``meta_propagator`` is always zeros (no such model exists; see
+    _ml_status_payload).
+    """
+    return await run_in_threadpool(_ml_status_payload)
+
+
+@router.post("/ml/retrain")
+async def trigger_ml_retrain():
+    """Run a shadow-mode retrain (LSTM fine-tune + risk model) on demand.
+
+    Always responds HTTP 200 with ``{"ok", "result", "message"}``; failure is
+    signalled by ``ok: false``, never by the status code:
+      - pipeline disabled (ENABLE_EXTENDED_PIPELINE != 1): ok=false, result=null
+      - shadow mode disabled: ok=false, result is the "disabled" marker
+      - retrain raised: ok=false, result=null, message carries the error
+    "skipped" sub-results (insufficient data) still return ok=true; inspect
+    ``result.lstm.status`` / ``result.risk.status``. Runs in a threadpool so
+    the event loop keeps serving WebSocket/REST traffic during training.
+    """
+    runtime = get_ml_runtime_if_enabled()
+    if runtime is None:
+        return {
+            "ok": False,
+            "result": None,
+            "message": "Extended ML pipeline is disabled. Set ENABLE_EXTENDED_PIPELINE=1 and restart the backend.",
+        }
+    try:
+        result = await run_in_threadpool(runtime.shadow_retrain)
+    except Exception as error:
+        logger.exception("Manual shadow retrain failed")
+        return {"ok": False, "result": None, "message": f"Retrain failed: {error}"}
+
+    if "status" in result and (result.get("status") or {}).get("status") == "disabled":
+        return {
+            "ok": False,
+            "result": result,
+            "message": "Shadow mode is disabled (SHADOW_MODE_ENABLED=0).",
+        }
+
+    parts = [f"{name}: {(sub or {}).get('status', 'unknown')}" for name, sub in result.items()]
+    return {"ok": True, "result": result, "message": "Retrain finished (" + ", ".join(parts) + ")."}
 
 
 @router.get("/cascade/status")
@@ -713,6 +839,20 @@ async def maneuver_feedback(
         return {"status": "ERROR", "message": "Not initialized"}
 
     _require_satellite_authority(session_id, req.sat1_id)
+
+    # Persist the decision for the RLHF counters exposed by /api/ml/status.
+    try:
+        from app.ml.rlhf_store import record_decision
+        await run_in_threadpool(
+            record_decision,
+            req.decision,
+            alert_id=req.alert_id,
+            sat1_id=req.sat1_id,
+            sat2_id=req.sat2_id,
+            delta_v_ms=req.delta_v_ms,
+        )
+    except Exception as error:  # never block a maneuver on bookkeeping
+        logger.warning("Failed to record operator decision: %s", error)
 
     executed = None
     if req.decision in ("APPROVE", "MODIFY"):

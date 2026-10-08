@@ -184,7 +184,7 @@ def _evaluate_risk_model() -> dict[str, Any]:
     # exercises the real production feature extraction instead of shortcutting
     # straight to a feature matrix.
     probabilities = np.array(
-        [scorer.score(dict(zip(feature_names, row))) for row in features],
+        [scorer.score(dict(zip(feature_names, row)), record=False) for row in features],
         dtype=float,
     )
 

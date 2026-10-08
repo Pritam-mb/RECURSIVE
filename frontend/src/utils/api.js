@@ -23,7 +23,14 @@ export async function apiPost(path, body = {}) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   });
-  if (!res.ok) throw new Error(`POST ${path} → ${res.status}`);
+  if (!res.ok) {
+    // Attach status + parsed JSON body (if any) so callers can surface
+    // server-provided messages (e.g. 409 { ok:false, message }).
+    const err = new Error(`POST ${path} → ${res.status}`);
+    err.status = res.status;
+    err.body = await res.json().catch(() => null);
+    throw err;
+  }
   return res.json();
 }
 

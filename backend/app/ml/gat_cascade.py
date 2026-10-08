@@ -395,6 +395,11 @@ if TORCH_AVAILABLE:
             )
             return (hidden @ self.W_out + self.b_out).reshape(-1)
 
+else:
+    # Without torch the trainer is unavailable; keep the name importable so
+    # callers (and tests that skip on TORCH_AVAILABLE) can still import it.
+    TorchGraphAttentionBank = None  # type: ignore[assignment,misc]
+
 
 def train_gat_model(
     sample_count: int = 320,

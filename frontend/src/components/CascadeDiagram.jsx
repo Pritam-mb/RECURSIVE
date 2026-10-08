@@ -295,7 +295,6 @@ export default function CascadeDiagram({ graph = EMPTY_GRAPH }) {
               {view.nodes.map((n) => {
                 const sevClass = SEVERITY_CLASS[n.severity] ?? 'an-sev-unknown';
                 const selected = selectedSatId != null && nodeKey(selectedSatId) === nodeKey(n.id);
-                const label = selected || view.labelled.has(nodeKey(n.id)) ? shortLabel(n.label) : '';
                 return (
                   <g
                     key={nodeKey(n.id)}
@@ -327,12 +326,20 @@ export default function CascadeDiagram({ graph = EMPTY_GRAPH }) {
                         stroke="currentColor"
                       />
                     )}
-                    {label && (
-                      <text className="an-node-label" x={n.x} y={n.y + n.r + 11} textAnchor="middle">
-                        {label}
-                      </text>
-                    )}
                   </g>
+                );
+              })}
+            </g>
+            {/* Names in their own layer, after every node, so later nodes
+                never paint over an earlier node's label. */}
+            <g pointerEvents="none">
+              {view.nodes.map((n) => {
+                const selected = selectedSatId != null && nodeKey(selectedSatId) === nodeKey(n.id);
+                if (!selected && !view.labelled.has(nodeKey(n.id))) return null;
+                return (
+                  <text key={nodeKey(n.id)} className="an-node-label" x={n.x} y={n.y + n.r + 11} textAnchor="middle">
+                    {shortLabel(n.label)}
+                  </text>
                 );
               })}
             </g>

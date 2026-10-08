@@ -15,6 +15,20 @@ It is a triage aid and a cross-check of the physics Pc:
   (e.g. an unusual covariance orientation) -- worth a human look.
 
 No torch, no feature flag, ~0.1 ms per alert (single-row inplace predict).
+
+Per-alert explanation (``contributions`` / ``base_log10`` / ``main_factor``)
+---------------------------------------------------------------------------
+XGBoost ``pred_contribs`` splits each alert's log10 Pc prediction into one
+additive contribution per feature plus a bias (the model's expected value):
+``base_log10 + sum(contributions) == log10 Pc prediction`` exactly.
+* The ``EXACT_SHAP_BUDGET`` (default 8, env ORBIT_SENTINEL_EXACT_SHAP_BUDGET)
+  highest-risk alerts of each batch (by max of physics and surrogate Pc) get
+  **exact path-dependent TreeSHAP** (~2.4 ms/row single-threaded; run on a
+  4-thread model copy, ~1 ms/row).
+* All other alerts get **Saabas path attribution** (``approx_contribs=True``,
+  ~0.02 ms/row batched), which is also exactly additive but not a Shapley value.
+Typical cost: ~10 ms + 0.02 ms/alert per refresh.
+``contribution_method`` on each alert says which one was used.
 """
 
 from __future__ import annotations
@@ -26,7 +40,10 @@ from typing import Any
 
 import numpy as np
 
+import os
+
 from .artifacts import artifact_path, load_artifact
+from .explain import label as feature_label
 from .train_risk_surrogate import (
     CARD_FILE,
     FEATURES,
@@ -40,6 +57,12 @@ from .train_risk_surrogate import (
 logger = logging.getLogger(__name__)
 
 DEFAULT_HBR_KM = 0.010  # same default as app.core.analytics when an alert has no hbr_km
+TOP_CONTRIBUTIONS = 6
+try:
+    EXACT_SHAP_BUDGET = max(0, int(os.getenv("ORBIT_SENTINEL_EXACT_SHAP_BUDGET", "8")))
+except ValueError:  # pragma: no cover
+    EXACT_SHAP_BUDGET = 8
+SHAP_THREADS = max(1, min(4, os.cpu_count() or 1))
 
 _lock = threading.Lock()
 _booster = None
@@ -67,6 +90,25 @@ def _get_booster():
             _load_failed = str(exc)
             logger.warning("Pc surrogate unavailable: %s", exc)
     return _booster
+
+
+_shap_booster = None
+
+
+def _get_shap_booster():
+    """Separate copy of the model for exact TreeSHAP with a few threads, so the
+    single-threaded scoring booster's parameters are never mutated concurrently."""
+    global _shap_booster
+    if _shap_booster is None:
+        booster = _get_booster()
+        if booster is None:
+            return None
+        with _lock:
+            if _shap_booster is None:
+                b = booster.copy()
+                b.set_param({"nthread": SHAP_THREADS})
+                _shap_booster = b
+    return _shap_booster
 
 
 def model_card() -> dict[str, Any] | None:
@@ -244,12 +286,52 @@ def _finalize(alert: dict[str, Any], log_pc: float, missing: list[str], record: 
     }
 
 
-def score_alert(alert: dict[str, Any], *, record: bool = True) -> dict[str, Any] | None:
+def _contributions(booster, rows: np.ndarray, *, exact: bool) -> np.ndarray:
+    """(n, p+1) additive contributions (log10 Pc); last column = bias."""
+    import xgboost as xgb
+
+    if exact:
+        booster = _get_shap_booster() or booster
+
+    d = xgb.DMatrix(np.asarray(rows, dtype=np.float32), feature_names=list(FEATURES), missing=np.nan)
+    return booster.predict(d, pred_contribs=True, approx_contribs=not exact)
+
+
+def explain_block(row: np.ndarray, contrib: np.ndarray, *, exact: bool) -> dict[str, Any]:
+    """Format one contributions row for alert["ml"] (top-6 by |value|)."""
+    feats = contrib[:-1]
+    order = np.argsort(-np.abs(feats))
+    top = order[:TOP_CONTRIBUTIONS]
+    items = []
+    for i in top:
+        v = float(row[i])
+        items.append({
+            "feature": FEATURES[i],
+            "label": feature_label(FEATURES[i]),
+            "value": round(v, 6) if math.isfinite(v) else None,
+            "contribution_log10": round(float(feats[i]), 4),
+        })
+    rest = float(np.sum(feats[order[TOP_CONTRIBUTIONS:]])) if len(order) > TOP_CONTRIBUTIONS else 0.0
+    return {
+        "contributions": items,
+        "base_log10": round(float(contrib[-1]), 4),
+        "main_factor": FEATURES[int(order[0])],
+        "main_factor_label": feature_label(FEATURES[int(order[0])]),
+        "other_contributions_log10": round(rest, 4),
+        "contribution_method": "treeshap_exact" if exact else "saabas_path",
+    }
+
+
+def score_alert(alert: dict[str, Any], *, record: bool = True, explain: bool = False,
+                exact: bool = False) -> dict[str, Any] | None:
     """Return the ML block for ``alert["ml"]`` or None if the model is unavailable.
 
     Keys: pc_surrogate, log10_pc_surrogate, risk_class, model, agreement
     (|log10 ml - log10 physics| in decades, both clipped at 1e-12; None if no
-    physics Pc), inputs_missing, role.
+    physics Pc), inputs_missing, role. With explain=True also contributions,
+    base_log10, main_factor (Saabas; exact=True for TreeSHAP). Explanation is
+    off by default here to keep single-alert scoring < 1 ms; the live pipeline
+    uses score_alerts, which always explains in one batched call.
     """
     booster = _get_booster()
     if booster is None:
@@ -257,11 +339,23 @@ def score_alert(alert: dict[str, Any], *, record: bool = True) -> dict[str, Any]
     row, missing = extract_features(alert)
     if "miss_distance_km" in missing:
         return None
-    return _finalize(alert, booster.inplace_predict(row)[0], missing, record)
+    block = _finalize(alert, booster.inplace_predict(row)[0], missing, record)
+    if not explain:
+        return block
+    try:
+        block.update(explain_block(row[0], _contributions(booster, row, exact=exact)[0], exact=exact))
+    except Exception as exc:  # pragma: no cover - explanation is best-effort
+        logger.debug("contributions failed: %s", exc)
+    return block
 
 
-def score_alerts(alerts: list[dict[str, Any]], *, record: bool = True) -> list[dict[str, Any]]:
-    """Attach ``alert["ml"]`` in place with one batched prediction (never touches physics Pc)."""
+def score_alerts(alerts: list[dict[str, Any]], *, record: bool = True,
+                 exact_budget: int | None = None) -> list[dict[str, Any]]:
+    """Attach ``alert["ml"]`` in place with one batched prediction (never touches physics Pc).
+
+    Contributions: one batched exact-TreeSHAP call for the ``exact_budget``
+    highest-risk alerts and one batched Saabas call for the rest.
+    """
     booster = _get_booster()
     if booster is None or not alerts:
         for alert in alerts:
@@ -272,7 +366,33 @@ def score_alerts(alerts: list[dict[str, Any]], *, record: bool = True) -> list[d
         row, missing = extract_features(alert)
         metas.append(missing)
         rows.append(row[0])
-    preds = booster.inplace_predict(np.asarray(rows, dtype=np.float32))
-    for alert, missing, log_pc in zip(alerts, metas, preds):
-        alert["ml"] = None if "miss_distance_km" in missing else _finalize(alert, log_pc, missing, record)
+    x = np.asarray(rows, dtype=np.float32)
+    preds = booster.inplace_predict(x)
+    scored = []
+    for k, (alert, missing, log_pc) in enumerate(zip(alerts, metas, preds)):
+        if "miss_distance_km" in missing:
+            alert["ml"] = None
+            continue
+        alert["ml"] = _finalize(alert, log_pc, missing, record)
+        scored.append(k)
+    if not scored:
+        return alerts
+
+    budget = EXACT_SHAP_BUDGET if exact_budget is None else max(0, int(exact_budget))
+
+    def priority(k: int) -> float:
+        physics = _physics_pc(alerts[k]) or 0.0
+        return max(physics, alerts[k]["ml"]["pc_surrogate"])
+
+    ranked = sorted(scored, key=priority, reverse=True)
+    groups = ((ranked[:budget], True), (ranked[budget:], False))
+    try:
+        for idx, exact in groups:
+            if not idx:
+                continue
+            contrib = _contributions(booster, x[idx], exact=exact)
+            for j, k in enumerate(idx):
+                alerts[k]["ml"].update(explain_block(x[k], contrib[j], exact=exact))
+    except Exception as exc:  # pragma: no cover - explanation is best-effort
+        logger.debug("contributions failed: %s", exc)
     return alerts

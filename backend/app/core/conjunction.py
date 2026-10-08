@@ -3,7 +3,7 @@ Conjunction assessment engine.
 Computes pairwise miss distances and identifies close approaches.
 Screening itself lives in app/core/screening.py (future-window, refined TCA,
 Foster Pc with TLE-age covariance); this module keeps the CPI score, the
-legacy distance-band classifier, find_tca and a compatibility wrapper.
+legacy distance-band classifier and find_tca (single-pair TCA search).
 
 CPI (Conjunction Priority Index, 0-10) is a heuristic TRIAGE score for
 ordering the operator queue. It is a hand-weighted blend of Foster Pc, miss
@@ -206,75 +206,6 @@ def compute_cpi_score(
     except Exception as exc:
         logger.warning("compute_cpi_score failed: %s — returning 0", exc)
         return 0.0
-
-
-# ── Screening (delegates to the future-window screener) ─────────────────────
-
-class ScreenedConjunction:
-    """Thin wrapper so legacy callers can keep using ``.to_dict()``."""
-
-    __slots__ = ("_alert",)
-
-    def __init__(self, alert: dict):
-        self._alert = alert
-
-    def to_dict(self) -> dict:
-        return dict(self._alert)
-
-    def __getattr__(self, item):
-        a = object.__getattribute__(self, "_alert")
-        mapping = {
-            "sat1_id": ("sat1", "id"), "sat1_name": ("sat1", "name"),
-            "sat2_id": ("sat2", "id"), "sat2_name": ("sat2", "name"),
-        }
-        if item in mapping:
-            k1, k2 = mapping[item]
-            return a.get(k1, {}).get(k2)
-        if item in a:
-            return a[item]
-        raise AttributeError(item)
-
-
-def screen_conjunctions(
-    states: list[SatelliteState],
-    threshold_km: float | None = None,
-    kalman_states: dict = None,
-    propagator: SGP4Propagator = None,
-    sim_time: datetime | None = None,
-) -> list[ScreenedConjunction]:
-    """
-    Legacy entry point, now a wrapper around app.core.screening.screen():
-    all-vs-all FUTURE-window screening (default 24 h), Brent-refined TCA,
-    Foster Pc with TLE-age covariance.
-
-    The old implementation kept pairs by their CURRENT separation (< 500 km)
-    and reported TCA = now. ``kalman_states`` is accepted for signature
-    compatibility and deliberately ignored: the Kalman filter in
-    app/core/kalman.py "observes" SGP4 output and its covariance is not a
-    physical uncertainty, so it must not feed Pc.
-    """
-    from app.core.screening import screen
-
-    if sim_time is None:
-        sim_time = None
-        for s in states or []:
-            stamp = getattr(s, "epoch_utc", None)
-            if stamp:
-                try:
-                    sim_time = datetime.fromisoformat(stamp)
-                    break
-                except Exception:
-                    pass
-        if sim_time is None:
-            from app.core import sim_clock
-            sim_time = sim_clock.simulation_now()
-    if sim_time.tzinfo is None:
-        sim_time = sim_time.replace(tzinfo=timezone.utc)
-    # Thresholds >= the old 500 km "current separation" default are legacy
-    # values; future-window screening uses its own (env-configurable) radius.
-    thr = threshold_km if (threshold_km is not None and threshold_km < WATCH_DISTANCE_KM) else None
-    alerts = screen(states, sim_time, threshold_km=thr, propagator=propagator)
-    return [ScreenedConjunction(a) for a in alerts]
 
 
 def find_tca(

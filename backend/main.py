@@ -357,6 +357,16 @@ async def refresh_alerts_once():
             reference=sim_now,
         )
 
+        # Physics cross-checks (Chan / Alfano max / Monte Carlo for the top-10
+        # Pc) and the multi-model decision score for every alert (agent DS).
+        decision_stats: dict = {}
+        try:
+            from app.core.decision import annotate_alerts
+            decision_stats = await asyncio.to_thread(annotate_alerts, merged_alerts, mc_top_n=10)
+            logger.info("decision layer: %s", decision_stats)
+        except Exception as exc:
+            logger.warning("decision layer failed: %s", exc)
+
         debris_context_states = states
         top_hotspot_tca = None
         for hotspot in cascade_summary.get("hotspots", []):
@@ -387,6 +397,7 @@ async def refresh_alerts_once():
             "debris_alert_count": len(debris_alerts),
             "graph_alert_count": len(cascade_summary.get("alerts", [])),
             "screening": screen_stats,
+            "decision_layer": decision_stats,
             "hotspots": hotspots,
             "graph": cascade_summary.get("graph", {}),
             "cascade_plan": cascade_summary.get("cascade_plan", []),
@@ -543,6 +554,14 @@ app.add_middleware(
 app.include_router(router)
 app.include_router(test_mode_router)
 app.include_router(predict_router)
+
+# Analytics (PCA / correlation / SHAP) and physics cross-validation routers.
+# Registered defensively so the API still starts while they are being built.
+for _router_module in ("app.routers.analytics", "app.routers.physics"):
+    try:
+        app.include_router(__import__(_router_module, fromlist=["router"]).router)
+    except Exception as _router_error:  # pragma: no cover - startup guard
+        logger.warning("Router %s not loaded: %s", _router_module, _router_error)
 
 
 @app.get("/")

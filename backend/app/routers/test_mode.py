@@ -4,6 +4,8 @@ Test mode router for manual conjunction validation.
 
 from __future__ import annotations
 
+import asyncio
+
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import math
@@ -239,7 +241,7 @@ async def run_to_tca_endpoint(req: RunToTcaRequest):
     state_a = parse_eci_state(sat_a.position_eci_km, sat_a.velocity_eci_kms, sat_a.epoch_utc)
     state_b = parse_eci_state(sat_b.position_eci_km, sat_b.velocity_eci_kms, sat_b.epoch_utc)
 
-    result = run_to_tca(
+    result = await asyncio.to_thread(run_to_tca, 
         state_a=state_a,
         state_b=state_b,
         target_utc=target_utc,

@@ -126,16 +126,31 @@ function strokeUnitPolylines(ctx, lines) {
   ctx.stroke();
 }
 
-/** Projects an ECI km vector (≈ earth-fixed for display) into `out`. */
+// Objects are drawn at a (log-compressed) altitude above the disc rather
+// than flattened onto it, so an orbit is a ring around the Earth — like the
+// 3D globe — instead of a track painted across the disc. GEO lands at ~1.3 R.
+const ALT_GAIN = 0.3 / Math.log(1 + (35786 / 500));
+const displayScale = (r) => 1 + (ALT_GAIN * Math.log(1 + (Math.max(r - 6371, 0) / 500)));
+
+/**
+ * Projects an ECI km vector (≈ earth-fixed for display) into `out`.
+ * Hidden only when it is inside the Earth or behind the disc (far hemisphere
+ * AND inside the limb) — the canvas has no depth buffer, so this is the
+ * occlusion test.
+ */
 function projectEci(x, y, z, out) {
   const r = Math.sqrt((x * x) + (y * y) + (z * z));
-  if (!(r > 1)) { out.visible = false; return out; }
+  if (!(r > EARTH_RADIUS_KM)) { out.visible = false; return out; }
   const ux = x / r;
   const uy = y / r;
+  const uz = z / r;
   const { cx, cy, R, cosV, sinV } = view;
-  out.sx = cx + (((uy * cosV) - (ux * sinV)) * R);
-  out.sy = cy - ((z / r) * R);
-  out.visible = (ux * cosV) + (uy * sinV) >= 0;
+  const k = R * displayScale(r);
+  const px = ((uy * cosV) - (ux * sinV)) * k;
+  const py = uz * k;
+  out.sx = cx + px;
+  out.sy = cy - py;
+  out.visible = (ux * cosV) + (uy * sinV) >= 0 || Math.hypot(px, py) > R + 1;
   return out;
 }
 
@@ -195,11 +210,13 @@ function drawCallout(ctx, anchor, text, color, W, H) {
   const w = ctx.measureText(text).width + 10;
   const h = 14;
   const base = Math.atan2(anchor.sy - cy, anchor.sx - cx);
+  // Anchors sit at altitude, possibly beyond the limb: start outside them.
+  const ring = Math.max(R, Math.hypot(anchor.sx - cx, anchor.sy - cy)) + CALLOUT_GAP;
   for (const nudge of CALLOUT_NUDGES) {
     const a = base + nudge;
     const cos = Math.cos(a);
-    const ex = cx + (cos * (R + CALLOUT_GAP));
-    const ey = cy + (Math.sin(a) * (R + CALLOUT_GAP));
+    const ex = cx + (cos * ring);
+    const ey = cy + (Math.sin(a) * ring);
     const x = Math.min(Math.max(cos >= 0 ? ex : ex - w, 2), W - w - 2);
     const y = Math.min(Math.max(ey - (h / 2), 2), H - h - 2);
     // Reject slots where clamping pushed the tag back onto the disc.
@@ -381,6 +398,8 @@ export default function ThreatGlobe({ alerts = EMPTY, satellites = EMPTY, select
       strokeUnitPolylines(ctx, GRID_UNIT);
       ctx.strokeStyle = PALETTE.lineStrong;
       strokeUnitPolylines(ctx, COAST_UNIT);
+      // Orbital objects sit above the surface and may extend past the limb.
+      ctx.restore();
 
       // ── Debris clouds: thin dashed rings, slow breathing opacity ───────
       if (clouds && clouds.length > 0) {
@@ -615,8 +634,6 @@ export default function ThreatGlobe({ alerts = EMPTY, satellites = EMPTY, select
         const sid = Number(selectedId);
         drawThreatDot(sid, posOf(sid));
       }
-
-      ctx.restore();
 
       // ── Limb + readout ─────────────────────────────────────────────────
       ctx.beginPath();

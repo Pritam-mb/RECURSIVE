@@ -26,6 +26,37 @@ def _risk_card() -> dict[str, Any] | None:
     return risk_api.model_card()
 
 
+@lru_cache(maxsize=1)
+def _analytics() -> dict[str, Any] | None:
+    from .train_risk_surrogate import ANALYTICS_FILE
+
+    return load_artifact(ANALYTICS_FILE)
+
+
+def _explainability_summary() -> dict[str, Any] | None:
+    """Short explainability digest for the Model Status panel (full: /api/analytics/model)."""
+    a = _analytics()
+    if not a:
+        return None
+    pca = a.get("pca") or {}
+    pvr = a.get("pca_vs_raw") or {}
+    wt = (a.get("correlation") or {}).get("with_target", {}).get("spearman", {})
+    top_corr = sorted(((f, r) for f, r in wt.items() if r is not None), key=lambda t: -abs(t[1]))[:3]
+    return {
+        "main_factor": a.get("main_factor"),
+        "main_factor_label": a.get("main_factor_label"),
+        "shap_top3": (a.get("shap_global") or [])[:3],
+        "shap_method": "exact TreeSHAP on held-out rows (mean |contribution|, decades of Pc)",
+        "pca_n_components_95": pca.get("n_components_95"),
+        "pca_feature_count": len(a.get("features") or []),
+        "raw_xgb_mae_log10": (pvr.get("raw_xgb") or {}).get("mae_log10"),
+        "pca_xgb_mae_log10": (pvr.get("pca_xgb") or {}).get("mae_log10"),
+        "pca_verdict": pvr.get("verdict"),
+        "top_target_correlations_spearman": [{"feature": f, "rho": r} for f, r in top_corr],
+        "endpoint": "/api/analytics/model",
+    }
+
+
 def _risk_model_section() -> dict[str, Any]:
     card = _risk_card()
     available = risk_api.model_available()
@@ -66,6 +97,7 @@ def _risk_model_section() -> dict[str, Any]:
             "baseline_f1_at_1e-4": baseline.get("classification_at_1e-4", {}).get("f1"),
         },
         "feature_importance": card.get("feature_importance_gain"),
+        "explainability": _explainability_summary(),
         "reference_check": card.get("reference_check"),
         "recipe": card.get("recipe"),
         "trained_at_utc": card.get("trained_at_utc"),

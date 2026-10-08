@@ -1,0 +1,263 @@
+/* =====================================================================
+   Analytics drawer — model analytics, physics cross-validation, propulsion
+   Prefix: ax-   (builds on dr-sheet from drawers.css)
+   ===================================================================== */
+
+/* Diverging scale endpoints (blue = negative, orange = positive).
+   Blue/orange is the colour-blind-safe diverging pair. */
+.ax-sheet {
+  --ax-neg: #3f86f0;
+  --ax-pos: #f08a24;
+  --ax-mid: #161c25;
+  width: clamp(560px, 60vw, 1040px);
+  z-index: 75;
+}
+
+.ax-toolbar {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+}
+.ax-toolbar .ui-btn { height: 22px; padding: 0 var(--s-2); font-size: var(--fs-micro); }
+
+.ax-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-4);
+}
+
+/* ── Section shell ──────────────────────────────────────────────────── */
+.ax-section {
+  border: 1px solid var(--c-line);
+  background: var(--c-base);
+  min-width: 0;
+}
+.ax-section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--s-2);
+  min-height: 28px;
+  padding: 0 var(--s-3);
+  background: var(--c-raised);
+  border-bottom: 1px solid var(--c-line);
+}
+.ax-section-title { color: var(--c-text-bright); }
+.ax-section-meta {
+  font-family: var(--font-data);
+  font-size: var(--fs-micro);
+  color: var(--c-text-dim);
+  white-space: nowrap;
+}
+.ax-section-body {
+  padding: var(--s-3);
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-3);
+  min-width: 0;
+}
+.ax-grid2 {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--s-4);
+}
+@media (max-width: 1100px) {
+  .ax-grid2 { grid-template-columns: minmax(0, 1fr); }
+}
+
+.ax-empty {
+  padding: var(--s-3) 0;
+  font-family: var(--font-data);
+  font-size: var(--fs-small);
+  color: var(--c-text-faint);
+}
+.ax-empty.is-error { color: var(--c-caution); }
+
+.ax-note {
+  font-size: var(--fs-small);
+  color: var(--c-text-dim);
+  line-height: 1.5;
+}
+.ax-note b { color: var(--c-text); font-weight: 500; }
+.ax-mono { font-family: var(--font-data); font-variant-numeric: tabular-nums; }
+
+/* ── Segmented toggle ───────────────────────────────────────────────── */
+.ax-seg {
+  display: inline-flex;
+  border: 1px solid var(--c-line-strong);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+.ax-seg button {
+  height: 20px;
+  padding: 0 var(--s-2);
+  background: var(--c-base);
+  border: 0;
+  border-right: 1px solid var(--c-line-strong);
+  font-family: var(--font-label);
+  font-size: var(--fs-micro);
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--c-text-dim);
+  cursor: pointer;
+}
+.ax-seg button:last-child { border-right: 0; }
+.ax-seg button[aria-pressed='true'] { background: var(--c-accent-soft); color: var(--c-text-bright); }
+
+/* ── Charts ─────────────────────────────────────────────────────────── */
+.ax-svg {
+  display: block;
+  width: 100%;
+  height: auto;
+  overflow: visible;
+}
+.ax-svg text {
+  font-family: var(--font-data);
+  font-size: 9px;
+  fill: var(--c-text-dim);
+}
+.ax-svg .ax-axis { stroke: var(--c-line-strong); stroke-width: 1; }
+.ax-svg .ax-gridline { stroke: var(--c-line); stroke-width: 1; }
+.ax-svg .ax-cell-val { fill: var(--c-text-bright); font-size: 8px; pointer-events: none; }
+.ax-svg .ax-lbl-target { fill: var(--c-text-bright); font-weight: 500; }
+
+.ax-readout {
+  min-height: 18px;
+  font-family: var(--font-data);
+  font-size: var(--fs-small);
+  color: var(--c-text);
+}
+.ax-readout .is-dim { color: var(--c-text-faint); }
+
+.ax-legend {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  font-family: var(--font-data);
+  font-size: var(--fs-micro);
+  color: var(--c-text-dim);
+}
+.ax-legend-bar {
+  width: 160px;
+  height: 8px;
+  border: 1px solid var(--c-line);
+  background: linear-gradient(90deg, var(--ax-neg), var(--ax-mid), var(--ax-pos));
+}
+
+/* ── Stat callouts ──────────────────────────────────────────────────── */
+.ax-stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--s-2);
+}
+.ax-stat {
+  flex: 1 1 140px;
+  padding: var(--s-2) var(--s-3);
+  border: 1px solid var(--c-line);
+  background: var(--c-panel);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.ax-stat-val {
+  font-family: var(--font-data);
+  font-size: var(--fs-title);
+  font-variant-numeric: tabular-nums;
+  color: var(--c-text-bright);
+}
+.ax-callout {
+  padding: var(--s-2) var(--s-3);
+  border-left: 2px solid var(--c-accent);
+  background: var(--c-accent-soft);
+  font-size: var(--fs-body);
+  color: var(--c-text);
+}
+.ax-callout b { color: var(--c-text-bright); font-weight: 500; }
+
+/* ── Tables ─────────────────────────────────────────────────────────── */
+.ax-table-wrap { overflow-x: auto; }
+.ax-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--fs-small);
+}
+.ax-table th {
+  position: sticky;
+  top: 0;
+  padding: 4px 6px;
+  text-align: left;
+  background: var(--c-raised);
+  border-bottom: 1px solid var(--c-line-strong);
+  font-family: var(--font-label);
+  font-size: var(--fs-micro);
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--c-text-dim);
+  white-space: nowrap;
+}
+.ax-table td {
+  padding: 4px 6px;
+  border-bottom: 1px solid var(--c-line);
+  color: var(--c-text);
+  vertical-align: top;
+}
+.ax-table td.num, .ax-table th.num {
+  text-align: right;
+  font-family: var(--font-data);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.ax-table td.mono { font-family: var(--font-data); font-size: var(--fs-micro); color: var(--c-text-dim); }
+.ax-table td.src { font-size: var(--fs-micro); color: var(--c-text-faint); max-width: 200px; }
+.ax-table tr:hover td { background: var(--c-raised); }
+.ax-table tr.is-hi td { background: var(--c-accent-soft); }
+.ax-heat-cell { text-align: right; font-family: var(--font-data); font-variant-numeric: tabular-nums; color: var(--c-text-bright); }
+
+/* ── Chips ──────────────────────────────────────────────────────────── */
+.ax-chip {
+  display: inline-block;
+  padding: 0 5px;
+  border: 1px solid currentColor;
+  border-radius: var(--radius);
+  font-family: var(--font-label);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: var(--track-caps);
+  text-transform: uppercase;
+  line-height: 15px;
+  white-space: nowrap;
+}
+.ax-chip.is-pass { color: var(--c-nominal); background: var(--c-nominal-soft); }
+.ax-chip.is-fail { color: var(--c-warning); background: var(--c-warning-soft); }
+.ax-chip.is-na { color: var(--c-text-faint); }
+
+/* ── Bar rows (attribution) ─────────────────────────────────────────── */
+.ax-bars {
+  display: grid;
+  grid-template-columns: minmax(110px, auto) minmax(0, 1fr) minmax(0, 0.7fr);
+  column-gap: var(--s-3);
+  row-gap: 4px;
+  align-items: center;
+}
+.ax-bars-head { font-family: var(--font-label); font-size: var(--fs-micro); letter-spacing: 0.1em; text-transform: uppercase; color: var(--c-text-faint); }
+.ax-bar-name { font-size: var(--fs-small); color: var(--c-text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ax-bar-name.is-main { color: var(--c-text-bright); font-weight: 500; }
+.ax-bar {
+  position: relative;
+  height: 14px;
+  background: var(--c-panel);
+  border: 1px solid var(--c-line);
+}
+.ax-bar-fill { position: absolute; left: 0; top: 0; bottom: 0; background: var(--c-accent); opacity: 0.85; }
+.ax-bar-fill.is-gain { background: var(--c-text-faint); }
+.ax-bar-val {
+  position: absolute;
+  right: 4px;
+  top: 0;
+  line-height: 12px;
+  font-family: var(--font-data);
+  font-size: 9px;
+  color: var(--c-text-bright);
+}

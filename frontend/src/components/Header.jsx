@@ -1,5 +1,6 @@
 import { memo, useEffect, useMemo, useState } from 'react';
 import useStore from '../store/useStore';
+import AnalyticsDrawer from './AnalyticsDrawer';
 
 const DEFAULT_AGENCIES = ['SpaceX', 'ISS', 'Roscosmos', 'CNSA', 'NOAA', 'NASA', 'Iridium'];
 
@@ -67,6 +68,8 @@ export default function Header() {
   const setMetricsOpen = useStore((s) => s.setMetricsDrawerOpen);
   const simOpen = useStore((s) => s.simulationDrawerOpen);
   const setSimOpen = useStore((s) => s.setSimulationDrawerOpen);
+  const analyticsOpen = useStore((s) => s.analyticsDrawerOpen);
+  const setAnalyticsOpen = useStore((s) => s.setAnalyticsDrawerOpen);
 
   const maxCpi = useMemo(() => {
     let max = 0;
@@ -156,7 +159,18 @@ export default function Header() {
         >
           Simulation
         </button>
+        <button
+          type="button"
+          className="ui-btn sh-toggle"
+          aria-pressed={analyticsOpen}
+          onClick={() => setAnalyticsOpen(!analyticsOpen)}
+          title="Toggle model & physics analytics"
+        >
+          Analytics
+        </button>
       </div>
+      {/* Fixed-position side sheet; mounted here so it fetches only when open. */}
+      <AnalyticsDrawer />
     </header>
   );
 }

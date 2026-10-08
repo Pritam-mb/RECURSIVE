@@ -127,13 +127,42 @@
     }
   },
   "feature_importance_gain": {
-    "miss_distance_km": 0.3974,
-    "radial_miss_km": 0.0717,
-    "relative_speed_kms": 0.0216,
-    "tle_age_max_h": 0.3731,
-    "tle_age_min_h": 0.0113,
-    "hbr_km": 0.1113,
-    "altitude_km": 0.0136
+    "miss_distance_km": 0.4384,
+    "radial_miss_km": 0.0704,
+    "relative_speed_kms": 0.0184,
+    "tle_age_max_h": 0.3501,
+    "tle_age_min_h": 0.0101,
+    "hbr_km": 0.1013,
+    "altitude_km": 0.0114
+  },
+  "explainability": {
+    "artifact": "risk_model_analytics.json",
+    "main_factor": "tle_age_max_h",
+    "shap_global_top3": [
+      {
+        "feature": "tle_age_max_h",
+        "label": "Older TLE age",
+        "mean_abs_contribution_log10": 0.9958,
+        "mean_contribution_log10": -0.007,
+        "share": 0.3514
+      },
+      {
+        "feature": "miss_distance_km",
+        "label": "Miss distance",
+        "mean_abs_contribution_log10": 0.7773,
+        "mean_contribution_log10": -0.106,
+        "share": 0.2743
+      },
+      {
+        "feature": "hbr_km",
+        "label": "Hard-body radius",
+        "mean_abs_contribution_log10": 0.5746,
+        "mean_contribution_log10": 0.0133,
+        "share": 0.2028
+      }
+    ],
+    "pca_n_components_95": 6,
+    "pca_vs_raw_verdict": "Raw features win: XGBoost on the 7 raw features scores held-out MAE 0.106 dex / F1@1e-4 0.962, versus 0.250 dex / 0.910 on the first 6 principal components (95% variance). Even with all 7 components (a pure rotation, no information lost) MAE is 0.216 dex: trees split one axis at a time, so rotating physically meaningful axes (miss distance, TLE age, HBR) into mixtures makes the Pc boundary harder to carve, and the dropped low-variance components still carry Pc signal. PCA is used here to describe the inputs, not as a preprocessing step."
   },
   "reference_check": {
     "reference": "app.core.analytics",
@@ -172,9 +201,9 @@
     "note": "Underperforms the linear-extrapolation baseline; not used for any alert, Pc or manoeuvre. SGP4 is the propagator of record.",
     "torch_lstm": "optional (ENABLE_EXTENDED_PIPELINE=1); not loaded by predict()"
   },
-  "trained_at_utc": "2026-10-08T07:38:42.116082+00:00",
-  "train_seconds": 5.4,
-  "generation_seconds": 3.38,
+  "trained_at_utc": "2026-10-08T08:33:45.128458+00:00",
+  "train_seconds": 79.19,
+  "generation_seconds": 12.97,
   "xgboost_version": "3.4.1",
   "python": "3.14.3",
   "artifact": "risk_model_xgb.json"

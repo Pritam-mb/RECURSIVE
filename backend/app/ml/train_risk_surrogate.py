@@ -73,6 +73,7 @@ LOG_PC_FLOOR = -12.0
 
 MODEL_FILE = "risk_model_xgb.json"
 CARD_FILE = "risk_model_card.json"
+ANALYTICS_FILE = "risk_model_analytics.json"
 MODEL_NAME = "xgboost-pc-surrogate v1"
 
 FEATURES = [
@@ -309,8 +310,21 @@ def _train_booster(xgb, x_tr, y_tr, x_va, y_va, feature_names, seed):
 
 
 def _predict(xgb, booster, x, feature_names):
+    try:
+        rng = (0, int(booster.best_iteration) + 1)
+    except (AttributeError, TypeError, ValueError):
+        rng = (0, 0)  # sliced booster: all trees
     return booster.predict(xgb.DMatrix(x, feature_names=feature_names, missing=np.nan),
-                           iteration_range=(0, booster.best_iteration + 1))
+                           iteration_range=rng)
+
+
+def _slice_best(booster):
+    """Keep only the trees up to the early-stopping best iteration, so the saved
+    model, inplace_predict and TreeSHAP pred_contribs all use the same trees."""
+    best = int(booster.best_iteration) + 1
+    sliced = booster[:best]
+    sliced.set_attr(best_iteration=str(best - 1), best_score=booster.attr("best_score"))
+    return sliced
 
 
 def _check_against_reference(data: dict[str, np.ndarray], count: int = 12) -> dict:
@@ -395,7 +409,7 @@ def train(sample_count: int = SAMPLE_COUNT, seed: int = SEED, out_dir: Path | No
     n_va = int(0.1 * sample_count)
     te, va, tr = perm[:n_te], perm[n_te:n_te + n_va], perm[n_te + n_va:]
 
-    booster = _train_booster(xgb, x_masked[tr], y[tr], x_masked[va], y[va], FEATURES, seed)
+    booster = _slice_best(_train_booster(xgb, x_masked[tr], y[tr], x_masked[va], y[va], FEATURES, seed))
 
     pred_full = _predict(xgb, booster, x_full[te], FEATURES)
     pred_masked = _predict(xgb, booster, x_masked[te], FEATURES)
@@ -418,6 +432,28 @@ def train(sample_count: int = SAMPLE_COUNT, seed: int = SEED, out_dir: Path | No
 
     model_path = out_dir / MODEL_FILE
     booster.save_model(str(model_path))
+
+    # Explainability analytics (correlation, PCA + PCA-vs-raw XGBoost, TreeSHAP).
+    from .explain import build_analytics
+
+    t_an = time.perf_counter()
+    analytics = build_analytics(
+        booster=booster, names=FEATURES,
+        x_train=x_masked[tr], y_train=y[tr], x_val=x_masked[va], y_val=y[va],
+        x_test=x_full[te], y_test=y_te, x_test_masked=x_masked[te],
+        pred_raw_full=pred_full, pred_raw_masked=pred_masked,
+        train_fn=lambda a, b, c, d, n, s: _train_booster(xgb, a, b, c, d, n, s),
+        predict_fn=lambda b, a, n: _predict(xgb, b, a, n),
+        metrics_fn=classification_metrics, regression_fn=regression_metrics, seed=seed,
+    )
+    analytics.update({
+        "model": MODEL_NAME,
+        "artifact": MODEL_FILE,
+        "analytics_seconds": round(time.perf_counter() - t_an, 2),
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "seed": seed,
+    })
+    (out_dir / ANALYTICS_FILE).write_text(json.dumps(analytics, indent=2), encoding="utf-8")
 
     card = {
         "model": MODEL_NAME,
@@ -459,6 +495,13 @@ def train(sample_count: int = SAMPLE_COUNT, seed: int = SEED, out_dir: Path | No
             },
         },
         "feature_importance_gain": importance,
+        "explainability": {
+            "artifact": ANALYTICS_FILE,
+            "main_factor": analytics["main_factor"],
+            "shap_global_top3": analytics["shap_global"][:3],
+            "pca_n_components_95": analytics["pca"]["n_components_95"],
+            "pca_vs_raw_verdict": analytics["pca_vs_raw"]["verdict"],
+        },
         "reference_check": _check_against_reference(data),
         "recipe": {
             "generator": "app.ml.train_risk_surrogate.generate_encounters",
@@ -495,6 +538,6 @@ def train(sample_count: int = SAMPLE_COUNT, seed: int = SEED, out_dir: Path | No
 if __name__ == "__main__":
     result = train()
     print(json.dumps({k: result[k] for k in ("training_samples", "heldout", "baselines",
-                                             "feature_importance_gain", "reference_check",
+                                             "feature_importance_gain", "explainability", "reference_check",
                                              "trajectory_model", "train_seconds",
                                              "positive_fraction_pc_ge_1e-4")}, indent=2))

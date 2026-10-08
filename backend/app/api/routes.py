@@ -604,7 +604,7 @@ async def execute_maneuver(
 
     _require_satellite_authority(session_id, req.norad_id)
 
-    result = _sim_engine.apply_maneuver(
+    result = await asyncio.to_thread(_sim_engine.apply_maneuver, 
         req.norad_id,
         req.dvx,
         req.dvy,
@@ -763,7 +763,7 @@ async def orbit_change(
     dv2_ms = abs(v_circ_2 - v_transfer_2) * 1000.0
 
     prograde = r2 >= r_norm
-    result = _sim_engine.apply_maneuver(
+    result = await asyncio.to_thread(_sim_engine.apply_maneuver, 
         req.norad_id,
         0.0,
         dv1_ms if prograde else -dv1_ms,
@@ -798,7 +798,7 @@ async def state_override(
 
     _require_satellite_authority(session_id, req.norad_id)
 
-    result = _propagator.apply_state_override(
+    result = await asyncio.to_thread(_propagator.apply_state_override, 
         req.norad_id,
         req.x, req.y, req.z,
         req.vx, req.vy, req.vz,
@@ -875,7 +875,7 @@ async def maneuver_feedback(
 
     executed = None
     if req.decision in ("APPROVE", "MODIFY"):
-        executed = _sim_engine.apply_maneuver(
+        executed = await asyncio.to_thread(_sim_engine.apply_maneuver, 
             target_id,
             dv_rsw[0],
             dv_rsw[1],
@@ -922,7 +922,7 @@ async def trigger_scenario(
         name = "collision_hotspot"
 
     try:
-        result = _sim_engine.load_scenario(name)
+        result = await asyncio.to_thread(_sim_engine.load_scenario, name)
         # Update snapshot immediately so the new satellites show up on the UI
         if _propagator:
             snapshot = await asyncio.to_thread(_build_snapshot, _propagator, sim_clock.simulation_now())
@@ -1253,7 +1253,7 @@ async def satellite_uplink(
             "NORMAL": (0.0, 0.0, delta_v),
         }
         dvx, dvy, dvz = components.get(req.direction or "PROGRADE", (0.0, delta_v, 0.0))
-        result = _sim_engine.apply_maneuver(
+        result = await asyncio.to_thread(_sim_engine.apply_maneuver, 
             norad_id, dvx, dvy, dvz, frame="RSW", session_id=session_id
         )
         if result.get("status") == "success":
@@ -1288,7 +1288,10 @@ async def preflight_check(req: ManeuverRequest):
     if _sim_engine is None:
         return {"status": "ERROR"}
 
-    result = _sim_engine.preflight_check(req.norad_id, req.dvx, req.dvy, req.dvz, frame=req.frame)
+    # Heavy (24 h screening of the burned orbit): keep it off the event loop.
+    result = await asyncio.to_thread(
+        _sim_engine.preflight_check, req.norad_id, req.dvx, req.dvy, req.dvz, frame=req.frame,
+    )
     return result
 
 

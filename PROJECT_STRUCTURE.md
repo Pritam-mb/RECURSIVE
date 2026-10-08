@@ -44,7 +44,7 @@ hackolution/
         state_cache.py
       data/
         __init__.py
-        demo_tles.py
+
         tle_fetcher.py
       ml/
         __init__.py
@@ -170,7 +170,7 @@ hackolution/
 #### Data Layer
 
 - `backend/app/data/__init__.py` marks the data package.
-- `backend/app/data/demo_tles.py` contains a hardcoded fallback TLE set for when remote data is unavailable.
+- Fallback TLEs: the bundled real snapshot `backend/app/simulation/tle-data.txt` (see docs/HOW_IT_WORKS.md).
 - `backend/app/data/tle_fetcher.py` loads satellite TLE data.
   - `parse_3line_tle()` converts the 3-line `0/1/2` TLE format into dictionaries.
   - `load_local_tles()` reads the bundled snapshot from `backend/app/simulation/tle-data.txt`.

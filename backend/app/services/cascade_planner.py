@@ -63,6 +63,7 @@ DEFAULT_CPI_THRESHOLD = 5.0          # kept for API compatibility (debris builde
 MANEUVER_PC_THRESHOLD = 1e-6         # alerts at/above this Pc get a recommended manoeuvre
 MAX_MANEUVER_ALERTS = 15             # cap re-propagation work per refresh (top-Pc alerts)
 MANEUVER_TIME_BUDGET_S = 3.0
+MAX_FRAGMENTS_FOR_MANEUVER_CHECK = 2000   # live fragments re-screened against candidate burns
 MAX_DOWNSTREAM_IDS = 50
 MAX_HOTSPOTS = 20
 RANKER_DISAGREEMENT_THRESHOLD = 0.25
@@ -349,7 +350,10 @@ class CascadePlanner:
         if not jobs:
             return {"status": "no_jobs", "eligible_alerts": len(eligible)}
 
-        stats = mp.plan_maneuvers(jobs, ref, time_budget_s=budget_s)
+        catalogue, extra_objects = self._screening_context(propagator, satrecs, state_by_id, ref, mp)
+        stats = mp.plan_maneuvers(jobs, ref, time_budget_s=budget_s, catalogue=catalogue,
+                                  extra_objects=extra_objects)
+        stats["cascade_context"] = {"catalogue_tracks": len(catalogue), "state_objects": len(extra_objects)}
         for job in jobs:
             res = job.alert.pop("_maneuver_result", None) or {}
             job.alert["maneuver_status"] = res.get("status", "failed")
@@ -359,6 +363,50 @@ class CascadePlanner:
         stats["eligible_alerts"] = len(eligible)
         stats["planned_alerts"] = sum(1 for j in jobs if j.alert.get("recommended_maneuver"))
         return stats
+
+    @staticmethod
+    def _screening_context(propagator, satrecs, state_by_id, ref, mp):
+        """Objects a candidate burn is re-screened against (cascade-safety check).
+
+        catalogue: SGP4 tracks of the screened population (the snapshot's states
+        when given, else every loaded TLE), incl. already executed burns.
+        extra_objects: state-vector objects without a TLE (scenario objects)
+        plus live debris fragments (app.core.debris_model events already past
+        their collision epoch, alive fragments at the burn epoch), propagated
+        two-body + J2 by the screening grid."""
+        traj = getattr(propagator, "trajectory", None)
+        ids = [sid for sid in state_by_id if sid in satrecs] if state_by_id else list(satrecs)
+        catalogue = []
+        for sid in ids:
+            sat, name = satrecs[sid][0], satrecs[sid][1]
+            if traj is not None:
+                sat = traj(sid) or sat
+            catalogue.append(mp.ObjectTrack(sid, name, satrec=sat))
+        extra = []
+        for sid, s in state_by_id.items():
+            if sid in satrecs:
+                continue
+            r = [_get(s, "x"), _get(s, "y"), _get(s, "z")]
+            v = [_get(s, "vx"), _get(s, "vy"), _get(s, "vz")]
+            if None not in r and None not in v:
+                extra.append({"id": sid, "name": _get(s, "name", str(sid)), "r_km": r, "v_kms": v})
+        try:
+            from app.core import debris_model as dm
+
+            model = dm.debris_model
+            base = getattr(dm, "FRAGMENT_ID_BASE", 90_000_000)
+            for eid in model.list_event_ids():
+                ev = model.get_cloud(eid)
+                if ev is None or ev.pending(ref):
+                    continue
+                r, v, alive = ev.state_at(ref)
+                for fidx in np.flatnonzero(alive)[:max(0, MAX_FRAGMENTS_FOR_MANEUVER_CHECK - len(extra))]:
+                    extra.append({"id": base + ev.seq * 10_000 + int(fidx), "name": f"FRAG {eid} #{int(fidx)}",
+                                  "agency": "Debris", "object_type": "DEB",
+                                  "r_km": r[fidx], "v_kms": v[fidx]})
+        except Exception as exc:  # debris model optional
+            logger.debug("no debris fragments for manoeuvre check: %s", exc)
+        return catalogue, extra
 
     # ── Advisory rankers ───────────────────────────────────────────────────
     def _ranker_review(self, graph, node_prob, state_by_id) -> dict:

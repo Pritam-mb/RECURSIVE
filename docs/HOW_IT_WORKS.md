@@ -122,10 +122,35 @@ manoeuvres, then publish.
   * MAE 0.106 dex in log10 Pc.
   * At the 1e-4 threshold: precision 0.975, recall 0.950.
   * Baseline that only knows miss distance: MAE 1.57 dex, recall 0.
-* **Use:** `alert.ml = {pc_surrogate, risk_class, model, agreement}`, where
+* **Use:** `alert.ml = {pc_surrogate, risk_class, model, agreement, contributions, base_log10, main_factor}`, where
   `agreement` is |Δlog10| against the physics Pc. **The model never writes
   `probability_of_collision`.** Scoring takes < 1 ms per alert and does not
   import torch.
+* **Explainability** (`app/ml/explain.py`, artifact `risk_model_analytics.json`,
+  served by `GET /api/analytics/model`; computed at training time):
+  * **Correlation:** Pearson and Spearman matrices over the 7 features plus
+    the target log10 Pc (pairwise deletion for the masked/missing values).
+    Strongest pairs: miss distance ~ radial miss (rho 0.95), older ~ newer TLE
+    age (0.47). Strongest target correlation: older TLE age (Spearman -0.56).
+  * **PCA** (numpy SVD on z-scored features; median imputation for PCA only):
+    6 of 7 components are needed for 95 % variance, because the inputs have
+    little redundancy. PC1 = miss distance + radial miss, PC2 = the two TLE ages.
+  * **PCA before XGBoost, measured:** the same recipe on the first 6 PCs scores
+    held-out MAE 0.250 dex and F1@1e-4 0.910. Raw features score 0.106 dex and
+    0.962. Even all 7 PCs (a pure rotation) score 0.216 dex, because trees split
+    one axis at a time. So PCA describes the inputs and is not used as a
+    preprocessing step.
+  * **What XGBoost boosts:** exact TreeSHAP (`pred_contribs`) on 2000 held-out
+    rows. Mean |contribution| in decades of Pc: older TLE age 1.00 (the
+    **main factor**, since it sets the along-track covariance), miss distance
+    0.78, HBR 0.57, radial miss 0.29, relative speed 0.15. Gain/weight/cover
+    split importances are reported alongside for comparison.
+  * **Per alert:** `alert.ml` also carries `contributions` (the top 6 features
+    with input value and log10 contribution), `base_log10`, `main_factor` and
+    `contribution_method`. `base_log10 + Σ contributions` equals the
+    prediction, and this is unit-tested. The 8 highest-risk alerts per refresh
+    get exact TreeSHAP. The rest get Saabas path attribution, which is also
+    additive and costs about 0.02 ms per alert.
 * **Limitations:** the training distribution is synthetic encounter geometry,
   not real CDMs. Accuracy drops when `radial_miss_km`/`altitude` are missing
   (masked-feature MAE is 0.34 dex). The model card reports both figures.
@@ -195,19 +220,51 @@ manoeuvres, then publish.
 * **Search:** candidates are ±R/±S/±W × {0.01 … 2 m/s}, applied at sim-now.
   Each burn is applied to a copy of the trajectory (same deviation model as
   §1). The encounter is re-screened (±15 min, 2 s sampling then TCA
-  refinement) and Pc is **recomputed with `screening.compute_pc`**. The planner
-  picks the smallest |Δv| with Pc < 1e-6, or else the lowest-Pc candidate
-  (`achieved_target: false`).
+  refinement) and Pc is **recomputed with `screening.compute_pc`**.
+* **Cascade-safe choice (does the burn hamper anyone else?):** up to 4
+  pair-verified options are shortlisted (smallest Δv reaching Pc < 1e-6 per
+  direction, then more). Each option's burned trajectory is re-screened for
+  24 h against the **whole catalogue + live debris fragments**. This uses the
+  same grid, linear-motion filter, TCA refinement and Foster Pc as
+  `screening.screen`, restricted to the burned row. The catalogue grid is
+  built once per refresh after a perigee/apogee shell prefilter. A zero-burn
+  pass separates burn-induced secondaries from pre-existing ones.
+  `cascade_safe` means there is no burn-induced or burn-worsened secondary
+  with Pc ≥ 1e-6 or miss < 1 km; the original threat is excluded. The rule
+  is: min Δv among cascade-safe options reaching 1e-6. Otherwise, the
+  largest Pc reduction among cascade-safe options. Otherwise, the planner
+  says **"NO cascade-safe option"**. The output is
+  `recommended_maneuver.options[]` plus `selection_rule`, `chosen_index` and
+  `naive_min_dv_index`. Measured on 500 TLEs: 15 alerts / 40 options take
+  1.8 s for the whole planner, and 3.5 s with 500 extra state-vector objects.
+* **Engines (`app/core/propulsion.py`, `ENGINES`):** each option is costed for
+  RL10 (LOX/LH2), R-4D and AMBR (hypergolic), MR-106L and MR-103G
+  (hydrazine), HPGP / LMP-103S and GR-1 / AF-M315E (green), N2 cold gas,
+  SPT-100 and BHT-600 (Hall), and NSTAR and T6 (gridded ion). Propellant is
+  `m₀(1 − e^{−Δv/(Isp g₀)})`. Burn time is `t = m_p·Isp·g₀/F`, which is
+  exact for constant thrust. `finite_burn_ok` requires t ≤ 10 % of the lead
+  time to TCA **and** an arc ≤ 1/10 orbit, the conditions for the impulsive
+  approximation. Cryogenic engines are flagged impractical because of
+  boil-off. Electric thrusters fail `finite_burn_ok` for m/s-class burns,
+  meaning they need planned low-thrust arcs. `recommended_engine` is the
+  lowest propellant mass among practical engines with `finite_burn_ok`.
+* **Analytic check per option:** the exact Clohessy–Wiltshire along-track
+  shift `y(t) = (2ẋ₀/n)(cos nt − 1) + (ẏ₀/n)(4 sin nt − 3nt)` at the new TCA
+  (n from vis-viva `a`) is compared with the numerically propagated shift.
+  For S burns, `rel_error` is typically < 1.5 %.
 * **Fuel:** Tsiolkovsky, `m_prop = m₀(1 − e^{−Δv/(Isp·g₀)})`, reported as a
   percentage of the assumed propellant load. Mass and Isp come from name class
   (ISS, Starlink, OneWeb, Iridium, each tagged), else the SATCAT RCS class,
   else a default of 500 kg / 220 s / 10 % propellant. The pre-flight
   `fuel_budget` gate (`sim_engine._fuel_check`) uses the same model.
 * **Limitations:**
-  * Only the alert's own pair is re-screened (`rescreen_scope: "pair"`), so
-    secondary conjunctions caused by the burn are not checked by the planner.
-    The next full refresh catches them.
-  * Burns are impulsive.
+  * Options of different alerts are checked independently: two simultaneous
+    burns are not screened against each other. Fragments in the cascade
+    check are propagated two-body + J2 without drag. If the 2.5 s budget runs
+    out, the remaining options are marked `cascade_check:
+    "time_budget_exceeded"`.
+  * Burns are impulsive. Engine finite-burn validity is reported but not
+    simulated.
   * The pre-flight gates `trajectory_clear` (> 200 km), `tca_window`
     (> 60 min) and `physical_limits` are **policy thresholds**, listed in
     `gate_policy`.
@@ -238,6 +295,88 @@ There is no spacecraft downlink. Payloads therefore get a block flagged
 Battery, temperature, signal strength and solar power are `null` ("not
 modeled"). Debris and rocket bodies return no telemetry.
 
+## 10. Physics cross-validation
+
+Foster is the authoritative Pc. Every alert also carries `pc_checks`, which
+recomputes the Pc with standard independent formulations from the same
+B-plane inputs (`b_t_km`, `b_n_km`, `covariance_ellipse` a/b/angle at its
+`sigma_level`, `hbr_km`). Code: `app/core/pc_methods.py`.
+
+| Method | Formula | Role |
+|---|---|---|
+| Foster (1992) | `∬_{|x|≤HBR} N(x; b, C) dx` (Gauss–Legendre × trapezoid) | authoritative |
+| Chan (1997/2008) equivalent-area series | `u = HBR²/(σxσy)`, `v = x²/σx² + y²/σy²`; `Pc = e^{-v/2} Σ_m (v/2)^m/m! · [1 − e^{-u/2} Σ_{k≤m} (u/2)^k/k!]` (log-space, no cancellation) | independent analytic check (exact for an isotropic covariance) |
+| Alfano (2005) maximum Pc | max over covariance scale `k²C`. The closed form is `HBR²/(e·σxσy·bᵀC⁻¹b)`, refined by the exact Foster integral and never below Pc(k=1) | upper bound when the covariance size is uncertain (our covariance is modelled from TLE age) |
+| Monte Carlo | `x ~ N(b, C)`. Seeded, vectorised, adaptive N ≤ 2·10⁵. Hits `|x| ≤ HBR` | sampling check. Returns `null` when Pc is below the resolution (< 10 hits), rather than reporting a noisy value |
+
+`spread_decades` is max − min of log10 Pc over Foster, Chan and Monte Carlo
+(when resolved), with a floor at 1e-20. `consistent` means Foster and Chan
+agree within 0.5 decades. `refresh_alerts_once` runs the cheap methods on
+every alert and Monte Carlo only on the 10 highest-Pc alerts. This costs
+about 0.5 s for about 1000 alerts, plus about 0.2 s for Monte Carlo, and the
+statistics are published as `decision_layer`.
+
+`GET /api/physics/validation` (`app/routers/physics.py`, computed live and
+cached 60 s, about 0.6 s warm and about 1.3 s cold) returns 18 checks. Each
+check has the fields `standard_formula`, `our_value`, `reference_value`,
+`abs/rel_error`, `tolerance` and `source`:
+
+* **Pc, three geometries** (isotropic; 5:1; rotated 3.3:1 with a large HBR):
+  Foster vs Chan (rel 2 %), Foster vs Monte Carlo with N = 2·10⁵ (within
+  4σ_MC), Foster vs the exact Rice / non-central χ² CDF (rel 1e-6), Alfano
+  closed form vs the numerical maximum, and Alfano ≥ Foster.
+* **Propagation:** the production J2-RK4 (`screening.propagate_j2`) conserves
+  specific energy including the J2 potential to about 7e-11 over 3 h. The
+  vis-viva `a` averaged over one SGP4 revolution matches SGP4's mean `a` to
+  0.017 km. SGP4 and J2-RK4 agree to 0.04 km over a 30 min arc.
+* **Manoeuvres** (from `app/core/analytic_checks.py`, with a local fallback):
+  the Clohessy–Wiltshire along-track drift matches the numerical burn (0.2 %).
+  The Hohmann Δv1 matches the numerically found Δv for the altitude raise
+  (2e-7). The Tsiolkovsky equation matches RK4 mass integration (1e-9).
+  Vis-viva energy is conserved.
+* **Breakup:** the NASA SBM fragment count from `breakup.simulate_breakup`
+  matches `0.1·M^0.75·Lc^-1.71` (to within one fragment). The sampled size
+  distribution matches the power law (4σ binomial).
+
+`GET /api/physics/engines` serves `app.core.propulsion.ENGINES` and returns
+503 if that catalogue is unavailable.
+
+## 11. Decision score (one well-defined number across models)
+
+`app/core/decision.py` combines the models into `alert["decision"]`. The
+formula is documented in that module's docstring.
+
+```
+L(p)        = clip((log10 p + 7) / 3, 0, 1)          0 at 1e-7, 1 at 1e-4
+n_physics   = L(Pc_Foster)                         w = 0.60   (0.75 if no ML)
+n_ml        = L(Pc_surrogate)                      w = 0.15   (0 if no ML)
+n_cascade   = 1 − exp(−D/5), D = len(downstream_ids)  w = 0.15
+n_manoeuvre = exp(−Δv / 1 m/s) · (0.5 if not cascade-safe; 0 if no plan)  w = 0.10
+score       = 100 · Σ wᵢ nᵢ   ∈ [0, 100]   (each component lists raw, normalized, weight, points)
+```
+
+* **Action (the physics Pc decides):** Pc ≥ 1e-4 gives MANOEUVRE, the
+  threshold commonly used in the NASA CARA Best Practices Handbook
+  (NASA/SP-20205011318, 2020) and in ESA SDO practice (Merz et al. 2017).
+  Pc ≥ 1e-5 gives PREPARE and Pc ≥ 1e-7 gives MONITOR. Anything lower gives
+  NONE. The 1e-5 and 1e-7 values are our own planning and monitoring tiers,
+  one and three decades below the 1e-4 threshold.
+* **Escalation:** PREPARE becomes MANOEUVRE only when the ML surrogate (≥ 1e-4)
+  and the cascade (n_cascade ≥ 0.5, i.e. ≥ 4 downstream objects) both agree.
+  No model can lower the physics action.
+* **Confidence:** this comes from model agreement.
+  * high: physics-method spread ≤ 0.5 decades, |log Foster − log ML| ≤ 1
+    decade, and the short-encounter assumption is valid.
+  * medium: spread ≤ 1 decade and the ML difference ≤ 2 decades (or no ML).
+  * low: everything else.
+* **Properties (unit-tested in `tests/test_decision_real.py`):** the weights
+  sum to 1 and physics outweighs the other components combined. The score is
+  monotone non-decreasing in Pc. The points add up to the score. The
+  thresholds and escalation behave as described. The `rationale` sentence is
+  generated from the numbers.
+* The CPI (`cpi_score`) remains a hand-weighted triage index. The decision
+  score replaces it as the basis for decisions.
+
 ---
 
 ## How to verify
@@ -253,9 +392,11 @@ python -m pytest -q                      # full suite
 | `tests/test_screening_real.py` | Screening TCA/miss agree with an independent brute-force 1 s + 1 ms scan (within 1 s / 0.1 km). A pair **> 2000 km apart now** that meets in 2 h is found at the right TCA. Foster quadrature equals `dblquad` (rel 1e-4). σ grows with TLE age. Severity rule. HBR by object type. `find_tca` matches truth. |
 | `tests/test_debris_real.py` | 40 J/g catastrophic threshold. Fragment count equals `0.1·M^0.75·Lc^-1.71`. Size distribution matches. No hyperbolic fragments; momentum conserved. Energy drift < 1e-5 without drag. Density table matches Vallado. A fragment placed on a satellite's path produces a `source: "debris"` alert with the right TCA/parent event. The fragment state reproduces the TCA. |
 | `tests/test_cascade_real.py` | Depth is BFS hops on event → fragment → satellite → neighbour. P(hit) = 1 − Π(1 − Pc). The recommended manoeuvre lowers the **re-propagated** Pc below 1e-6 with ≤ 2 m/s and rocket-equation fuel. Along-track drift ≈ 3·Δv·t. SATCAT lookup (ISS, Vanguard). Agency from SATCAT owner first; < 5 % unknown owners in the bundled catalogue. Unknown owners are not commandable. |
+| `tests/test_avoidance_real.py` | In a constructed scenario, the naive min-Δv burn (executed with the real `apply_delta_v` on a clone) puts the mover 30 m from a third payload, and full `screen()` confirms this. The planner flags that option `cascade_safe: false`, with the secondary miss matching `screen()` within 50 m, and picks a different cascade-safe burn that still reaches Pc < 1e-6. Tsiolkovsky mass and burn time match RK4 integration of dm/dt (1e-6). The engine rules hold. CW matches the numerical shift (< 0.5 % for small Δv over 2 h; < 5 % per option). Hohmann, vis-viva and rocket-equation validation checks pass. |
 | `tests/test_burn_real.py` | A zero burn moves nothing (< 1 m). An along-track burn matches the Clohessy–Wiltshire drift. Burns survive cloning and the screening grid. The planner's predicted post-burn miss equals what screening finds after execution (< 10 m, TCA < 1 s). |
 | `tests/test_predictor_real.py` | `/api/predict/conjunction` values (TCA, Pc, HBR, ellipse, CPI, SBM fragment count, mass sources) equal independent recomputation. There are no `affection_rate`/`predicted_fragments` leftovers. Epoch fallback is the sim clock. A fragment alert gets a re-propagated manoeuvre with drag. |
 | `tests/test_ml_real.py` | The model and card load (≥ 10 000 training samples, Foster labels). The model beats the baseline on held-out data. On fresh encounters, MAE < 0.4 dex and precision/recall > 0.9 at 1e-4. `score_alert` never touches the physics Pc and is monotone in miss distance. Scoring takes < 1 ms per alert and does not import torch. The metrics endpoint reports the card, not a formula. |
+| `tests/test_decision_real.py` | The decision score is monotone in Pc. The weights sum to 1 with physics dominant. The 1e-4/1e-5/1e-7 thresholds and the escalation rule hold. Chan agrees with Foster within 0.1 decades on a production geometry and exactly for an isotropic covariance. Monte Carlo agrees with Foster within 4σ for Pc ≥ 1e-3. Alfano max ≥ Foster. `/api/physics/validation` returns 200 and every check passes. |
 | `tests/test_telemetry_real.py` | Non-payloads have no telemetry. Payload fuel follows the rocket equation. Illumination geometry is correct. |
 
 Reproduce the ML model with `python -m app.ml.train_risk_surrogate`. It is

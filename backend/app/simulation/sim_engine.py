@@ -292,41 +292,44 @@ class SimEngine:
         # on the clone start from the trajectory the live propagator flies.
         return self.propagator.clone()
 
+    # Pre-flight looks for the closest post-burn approach out to this distance.
+    PREFLIGHT_SCREEN_KM = 100.0
+
     def _assess_future_conjunctions(self, propagator: SGP4Propagator, target_id: int, start_time: datetime) -> dict:
+        """Nearest post-burn approach of target_id over the next 24 h.
+
+        Uses the same vectorised screen as the live alert pipeline (SGP4 grid +
+        KD-tree + Brent TCA refinement) on the cloned, burned propagator, so a
+        pre-flight costs about one screening pass instead of a scalar TCA search
+        per catalogue object.
+        """
+        from app.core.screening import screen
+
         nearest = None
-
-        for other_id in propagator.norad_ids:
-            if other_id == target_id:
+        states = [s for s in propagator.propagate_all(start_time) if getattr(s, "error_code", 0) == 0]
+        alerts = screen(
+            states,
+            start_time,
+            window_hours=24.0,
+            threshold_km=self.PREFLIGHT_SCREEN_KM,
+            propagator=propagator,
+        )
+        for alert in alerts:
+            ids = (int(alert["sat1"]["id"]), int(alert["sat2"]["id"]))
+            if target_id not in ids:
                 continue
-
-            event = find_tca(
-                propagator,
-                target_id,
-                other_id,
-                start=start_time,
-                hours_ahead=24.0,
-                steps=120,
-            )
-            if event is None:
-                continue
-
-            try:
-                event_time = datetime.fromisoformat(event.tca_utc)
-            except Exception:
-                event_time = start_time
-
-            if event_time.tzinfo is None:
-                event_time = event_time.replace(tzinfo=timezone.utc)
-
-            event_minutes = max(0.0, (event_time - start_time).total_seconds() / 60.0)
-            if nearest is None or event.miss_distance_km < nearest["min_miss_distance_km"]:
+            other = alert["sat2"] if ids[0] == target_id else alert["sat1"]
+            miss = float(alert["miss_distance_km"])
+            if nearest is None or miss < nearest["min_miss_distance_km"]:
                 nearest = {
-                    "other_id": other_id,
-                    "other_name": event.sat2_name if event.sat1_id == target_id else event.sat1_name,
-                    "min_miss_distance_km": float(event.miss_distance_km),
-                    "closest_tca_minutes": float(event_minutes),
-                    "tca_utc": event_time.isoformat(),
-                    "severity": event.severity,
+                    "other_id": int(other["id"]),
+                    "other_name": other.get("name"),
+                    "min_miss_distance_km": miss,
+                    "closest_tca_minutes": float(alert.get("tca_minutes") or 0.0),
+                    "tca_utc": alert.get("tca_utc"),
+                    "severity": alert.get("severity"),
+                    "p_collision": alert.get("p_collision"),
+                    "screen_threshold_km": self.PREFLIGHT_SCREEN_KM,
                 }
 
         return nearest or {

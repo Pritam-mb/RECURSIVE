@@ -17,6 +17,7 @@ const useStore = create((set, get) => ({
   modelMetrics: null,
   simulationDrawerOpen: false,
   metricsDrawerOpen: false,
+  analyticsDrawerOpen: false,
 
   // ── Maneuver controls ───────────────────────────────────────────────────────
   maneuver: { dvx: 0, dvy: 0, dvz: 0 },
@@ -110,6 +111,8 @@ const useStore = create((set, get) => ({
   setSimulationDrawerOpen: (simulationDrawerOpen) => set({ simulationDrawerOpen }),
 
   setMetricsDrawerOpen: (metricsDrawerOpen) => set({ metricsDrawerOpen }),
+
+  setAnalyticsDrawerOpen: (analyticsDrawerOpen) => set({ analyticsDrawerOpen }),
 
   setManeuver: (axis, value) =>
     set((state) => ({

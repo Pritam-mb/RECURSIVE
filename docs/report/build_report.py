@@ -984,46 +984,40 @@ def fig_breakup(res, sbm, event):
 
 
 def fig_cloud(res, snaps, event):
-    """3-D ECI view (true scale, equal aspect) of both fragment streams at three epochs."""
-    from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
-
+    """One row per parent: that parent's fragments projected on ITS OWN orbital plane at TCA."""
     RE = 6378.137
-    r0 = np.asarray(event["tca"]["position_a_eci"], float)
     tca = event["tca"]
-    ha = np.cross(r0, np.asarray(tca["velocity_a_eci"], float)); ha /= np.linalg.norm(ha)
-    hb = np.cross(np.asarray(tca["position_b_eci"], float), np.asarray(tca["velocity_b_eci"], float)); hb /= np.linalg.norm(hb)
-    cam = ha + hb
-    cam = cam / np.linalg.norm(cam) if np.linalg.norm(cam) > 1e-6 else ha
-    az0 = math.degrees(math.atan2(cam[1], cam[0]))
-    el0 = math.degrees(math.asin(np.clip(cam[2], -1, 1)))
-    plane_angle = math.degrees(math.acos(np.clip(abs(ha @ hb), -1, 1)))
-    u, v = np.mgrid[0:2 * np.pi:36j, 0:np.pi:18j]
-    ex, ey, ez = RE * np.cos(u) * np.sin(v), RE * np.sin(u) * np.sin(v), RE * np.cos(v)
-    names = [p_["name"][:22] for p_ in event["parents"]]
-    fig = plt.figure(figsize=(7.2, 3.0))
-    L = 8200.0
-    for idx, (t, r) in enumerate(snaps.items()):
-        a = fig.add_subplot(1, 3, idx + 1, projection="3d")
-        a.plot_surface(ex, ey, ez, color="#c9daef", alpha=0.25, linewidth=0, shade=True, zorder=0)
-        a.plot_wireframe(ex, ey, ez, color="#9fb6d3", linewidth=0.25, rstride=3, cstride=3, alpha=0.6)
-        alive = np.linalg.norm(r, axis=1) - RE >= 100
-        for k, col in ((0, CAT[0]), (1, CAT[1])):
-            m = (res.parent_index == k) & alive
-            a.scatter(r[m, 0], r[m, 1], r[m, 2], s=1.4, color=col, depthshade=False, lw=0,
-                      label=f"from {names[k]}" if idx == 0 else None)
-        a.scatter([r0[0]], [r0[1]], [r0[2]], marker="x", color=BAD, s=22, depthshade=False)
-        a.set_xlim(-L, L); a.set_ylim(-L, L); a.set_zlim(-L, L)
-        a.set_box_aspect((1, 1, 1))
-        a.view_init(elev=el0, azim=az0)
-        a.set_title(f"+{t} min: {int(alive.sum())} fragments > 100 km", fontsize=7.5, loc="center", pad=0)
-        a.set_axis_off()
-    fig.legend(loc="lower center", ncol=3, fontsize=6.3, markerscale=4, bbox_to_anchor=(0.5, 0.0))
-    fig.subplots_adjust(left=0.0, right=1.0, top=0.93, bottom=0.1, wspace=0.0)
+    states = [(np.asarray(tca["position_a_eci"], float), np.asarray(tca["velocity_a_eci"], float)),
+              (np.asarray(tca["position_b_eci"], float), np.asarray(tca["velocity_b_eci"], float))]
+    hs = [np.cross(r, v) / np.linalg.norm(np.cross(r, v)) for r, v in states]
+    plane_angle = math.degrees(math.acos(np.clip(abs(hs[0] @ hs[1]), 0, 1)))
+    fig, axes = plt.subplots(2, 3, figsize=(7.2, 4.9))
+    for k, ((r0, v0), h) in enumerate(zip(states, hs)):
+        e1 = r0 / np.linalg.norm(r0)
+        e2 = np.cross(h, e1)
+        col = CAT[0] if k == 0 else CAT[1]
+        for c, (t, r) in enumerate(snaps.items()):
+            a = axes[k, c]
+            m = (res.parent_index == k) & (np.linalg.norm(snaps[t], axis=1) - RE >= 100)
+            x, y, z = r[m] @ e1, r[m] @ e2, r[m] @ h
+            a.add_patch(Circle((0, 0), RE, fc="#dfe9f5", ec="#9fb6d3", lw=0.6, zorder=1))
+            a.scatter(x, y, s=1.8, color=col, lw=0, zorder=3)
+            a.scatter([r0 @ e1], [r0 @ e2], marker="x", color=BAD, s=20, lw=1.1, zorder=4)
+            a.set_aspect("equal"); a.set_xlim(-8800, 8800); a.set_ylim(-8800, 8800)
+            a.tick_params(labelsize=5.2)
+            oop = np.percentile(np.abs(z), 90) if len(z) else 0.0
+            a.set_title(f"+{t} min · {int(m.sum())} frag. · 90% within {oop:.0f} km of plane",
+                        fontsize=6.4, loc="center")
+            if c == 0:
+                a.set_ylabel(f"{event['parents'][k]['name'][:24]}\nalong-track axis [km]", fontsize=6.6)
+            if k == 1:
+                a.set_xlabel("radial axis at TCA [km]", fontsize=6.3)
+    fig.tight_layout(h_pad=0.8, w_pad=0.6)
     return save(fig, "18_cloud", "Fragments from the reproduced breakup propagated with app.core.breakup.propagate "
-                "(RK4, two-body + J2 + Vallado drag, Cd·A/M), shown in 3-D ECI/TEME at true scale (equal axes, Earth "
-                "sphere R = 6378 km, axes ±8200 km) for both parents. Camera looks along the bisector of the two "
-                "parents' orbit normals (planes {:.0f}° apart), so both streams appear as tilted rings; × = impact point. "
-                "Fragments below 100 km are removed.".format(plane_angle))
+                "(RK4, two-body + J2 + Vallado drag, Cd·A/M). Each row shows ONE parent's fragments projected on that "
+                f"parent's own orbital plane at TCA (the two planes are {plane_angle:.0f}° apart), so the stream stays "
+                "outside the Earth disc; title gives fragments above 100 km and their 90th-percentile out-of-plane "
+                "distance. × = impact point. Fragments below 100 km are removed.")
 
 
 def fig_debris_alerts(alerts_deb):

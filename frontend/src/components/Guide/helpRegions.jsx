@@ -6,6 +6,7 @@
  *
  * place: where the explanation card goes relative to the region rect
  *   'below-left' | 'below-right' | 'inside-tl' | 'inside-bl' | 'inside-tr' | 'inside-wide'
+ *   | 'beside-right' (to the right of `anchor`'s rect)
  * badgeOnly: draw outline + number only; the text lives in `parent`'s card.
  */
 
@@ -67,7 +68,8 @@ export const HELP_REGIONS = [
     key: 'threat-card',
     title: 'Threat card (click a row)',
     selectors: ['.tq-row.is-expanded', '.tq-list'],
-    place: 'inside-bl',
+    place: 'beside-right',
+    anchor: '.tq-root',
     what: null,
     bullets: [
       ['Decision score', '0–100 = 60 % physics Pc + 15 % ML + 15 % cascade + 10 % manoeuvre cost; the action (MANOEUVRE ≥ 1e-4, PREPARE ≥ 1e-5, MONITOR ≥ 1e-7) is set by physics Pc.'],

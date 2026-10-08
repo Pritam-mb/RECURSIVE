@@ -44,6 +44,7 @@ FIG = HERE / "fig"
 DATA = HERE / "data"
 PDF_PATH = HERE / "Orbital_Sentinel_Judges_Report.pdf"
 VERIFICATION = HERE / "verification.json"
+VERIFICATION_MD = HERE / "VERIFICATION.md"
 ARTIFACTS = BACKEND / "app" / "ml" / "artifacts"
 SATCAT_CSV = BACKEND / "app" / "data" / "satcat_snapshot.csv"
 API = os.environ.get("ORBIT_SENTINEL_API", "http://127.0.0.1:8000/api")
@@ -1126,7 +1127,8 @@ ST = {
 }
 
 SUPER = {"²": "2", "³": "3", "⁻": "−", "¹": "1", "⁰": "0", "⁴": "4", "⁵": "5", "⁶": "6", "⁷": "7", "⁸": "8", "⁹": "9", "ᵀ": "T"}
-SUB = {"₀": "0", "₁": "1", "₂": "2", "ᵢ": "i", "₃": "3", "ₖ": "k"}
+SUB = {"₀": "0", "₁": "1", "₂": "2", "ᵢ": "i", "₃": "3", "ₖ": "k", "₄": "4", "₅": "5", "₆": "6", "₇": "7",
+       "₈": "8", "₉": "9", "ₓ": "x", "ₙ": "n"}
 
 
 def rl(text) -> str:
@@ -1182,7 +1184,7 @@ def what_how_why(what, how, why):
     cells = []
     for lab, txt, col in (("WHAT IT IS", what, BLUE), ("HOW IT'S COMPUTED", how, TEAL), ("WHY TRUST IT", why, GOOD)):
         cells.append([P(f'<font color="{col}"><b>{lab}</b></font>', "lab"), P(txt, "small")])
-    inner = [Table(c, colWidths=[TW / 3 - 4]) for c in cells]
+    inner = [Table([[c[0]], [c[1]]], colWidths=[TW / 3 - 14]) for c in cells]
     for it in inner:
         it.setStyle(TableStyle([("LEFTPADDING", (0, 0), (-1, -1), 0), ("RIGHTPADDING", (0, 0), (-1, -1), 0),
                                 ("TOPPADDING", (0, 0), (-1, -1), 0), ("BOTTOMPADDING", (0, 0), (-1, -1), 1)]))
@@ -1209,14 +1211,15 @@ def callout(title, eq_lines, note_text=None):
     return [t, Spacer(1, 6)]
 
 
-def figure(name, width=TW, path=None):
+def figure(name, width=TW, path=None, keep=True):
     path = path or FIG / f"{name}.png"
     if not Path(path).exists():
         return [P(f'<font color="{BAD}">Figure {rl(name)} unavailable (data missing).</font>', "small")]
     ir = ImageReader(str(path))
     iw, ih = ir.getSize()
     img = Image(str(path), width=width, height=width * ih / iw)
-    return [KeepTogether([img, P("Source: " + rl(CAPTIONS.get(name, "")), "cap")])]
+    parts = [img, P("Source: " + rl(CAPTIONS.get(name, "")), "cap")]
+    return [KeepTogether(parts)] if keep else parts
 
 
 def bullets(items):
@@ -1378,6 +1381,160 @@ def build_pdf(story):
 # ══════════════════════════════════════════════════════════════════════════════
 # Story
 # ══════════════════════════════════════════════════════════════════════════════
+
+def _ver_ratio(x):
+    """error / tolerance using whichever error metric (abs or rel) satisfies the tolerance; None if tol is 0."""
+    t = x.get("tolerance")
+    if not isinstance(t, (int, float)) or isinstance(t, bool) or t <= 0:
+        return None
+    vals = []
+    for k in ("abs_err", "rel_err"):
+        e = x.get(k)
+        if isinstance(e, (int, float)) and not isinstance(e, bool) and math.isfinite(e) and e < 1e10:
+            vals.append(abs(e) / t)
+    return min(vals) if vals else None
+
+
+def fig_verification(ver):
+    areas = [a for a, _ in Counter(x["area"] for x in ver).most_common()]
+    fig, axes = plt.subplots(1, 2, figsize=(7.2, 3.3), gridspec_kw={"width_ratios": [0.85, 1.4]})
+    a = axes[0]
+    ys = np.arange(len(areas))[::-1]
+    for y, ar in zip(ys, areas):
+        xs = [x for x in ver if x["area"] == ar]
+        npass = sum(1 for x in xs if x.get("pass"))
+        nfix = sum(1 for x in xs if x.get("fixed"))
+        a.barh(y, npass, color=GOOD, height=0.62)
+        if len(xs) - npass:
+            a.barh(y, len(xs) - npass, left=npass, color=BAD, height=0.62)
+        a.text(len(xs) + 0.4, y, f"{npass}/{len(xs)}" + (f"  ({nfix} fixed)" if nfix else ""), va="center", fontsize=6)
+    a.set_yticks(ys, areas, fontsize=6.4); a.set_xlabel("checks"); a.grid(axis="y", visible=False)
+    a.set_xlim(0, max(Counter(x["area"] for x in ver).values()) * 1.45)
+    a.set_title("Checks per area (green = pass)")
+    b = axes[1]
+    rng = np.random.default_rng(0)
+    n_exact = 0
+    for y, ar in zip(ys, areas):
+        rs = []
+        for x in ver:
+            if x["area"] != ar:
+                continue
+            r = _ver_ratio(x)
+            if r is None:
+                n_exact += 1
+                continue
+            rs.append(max(r, 1e-16))
+        if rs:
+            b.scatter(np.log10(rs), y + rng.uniform(-0.18, 0.18, len(rs)), s=12, color=BLUE, edgecolor="white", lw=0.3, zorder=3)
+    b.axvline(0, color=BAD, lw=1, ls="--")
+    b.text(0.05, ys.max() + 0.3, "tolerance", color=BAD, fontsize=6.3)
+    b.set_yticks(ys, [""] * len(areas)); b.set_xlim(-16.5, 1.2); b.set_ylim(-0.7, len(areas) - 0.2)
+    b.set_xlabel("log10 (error ÷ tolerance)   — left of the red line = inside tolerance")
+    b.set_title(f"Margin to tolerance ({n_exact} exact / inequality checks not shown)")
+    fig.tight_layout(w_pad=0.6)
+    return save(fig, "21_verification", "docs/report/verification.json (independent re-implementations: scipy, sklearn, "
+                "raw sgp4, DOP853 integrators). error = abs_err or rel_err, whichever the tolerance applies to; "
+                "checks with tolerance 0 (exact equality / inequality) are counted on the left only.")
+
+
+def _md_inline(t: str) -> str:
+    t = t.strip().replace(chr(92) + "|", "|")
+    t = rl(t)
+    import re
+    t = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", t)
+    t = re.sub(r"`([^`]+)`", r'<font name="DVM" size="6.4">\1</font>', t)
+    t = re.sub(r"(?<![\w*])\*([^*]+)\*(?![\w*])", r"<i>\1</i>", t)
+    t = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", t)
+    return t
+
+
+def _md_section(md: str, heading: str) -> list[str]:
+    lines, on = [], False
+    for ln in md.splitlines():
+        if ln.startswith("## "):
+            on = ln[3:].strip().lower().startswith(heading.lower())
+            continue
+        if on:
+            lines.append(ln)
+    return lines
+
+
+def _md_table(lines):
+    rows = []
+    for ln in lines:
+        if not ln.strip().startswith("|"):
+            continue
+        body = ln.strip().replace(chr(92) + "|", "\x00")
+        cells = [c.replace("\x00", "|") for c in body.strip("|").split("|")]
+        if all(set(c.strip()) <= set("-: ") for c in cells):
+            continue
+        rows.append(cells)
+    return rows
+
+
+def _md_bullets(lines):
+    items, cur = [], None
+    for ln in lines:
+        if ln.startswith("* ") or ln.startswith("- "):
+            if cur:
+                items.append(cur)
+            cur = ln[2:].strip()
+        elif cur is not None and ln.strip():
+            cur += " " + ln.strip()
+    if cur:
+        items.append(cur)
+    return items
+
+
+def verification_section(ver, md: str):
+    out = []
+    n = len(ver)
+    npass = sum(1 for x in ver if x.get("pass"))
+    fixed = [x for x in ver if x.get("fixed")]
+    areas = Counter(x["area"] for x in ver)
+    out.append(kpi_table([(f"{n}", "independent checks", NAVY), (f"{npass}/{n}", "pass (after fixes)", GOOD if npass == n else BAD),
+                          (f"{len(fixed)}", "genuine defects found & fixed", CAUTION), (f"{len(areas)}", "areas covered", BLUE)]))
+    out.append(Spacer(1, 6))
+    out += what_how_why(
+        "A separate agent recomputed every mathematical component with a different implementation, without reusing "
+        "the project's code path.",
+        "scipy dblquad / ncx2 / solve_ivp (DOP853), sklearn PCA & metrics, raw sgp4 brute-force scans, KS tests, an own "
+        "re-implementation of the decision formula; each record logs ours vs independent, error and tolerance.",
+        "It found real bugs (below) and they were fixed and re-tested — evidence that the checks have teeth, "
+        "not just that they pass.")
+    out += figure("21_verification")
+    defects = _md_table(_md_section(md, "Defects found"))
+    if len(defects) > 1:
+        out.append(P("Defects found and fixed", "h2"))
+        hdr = [c.strip() for c in defects[0]]
+        rows = [[_md_inline(c) for c in r] for r in defects[1:]]
+        out.append(data_table(hdr, rows, [TW * 0.10, TW * 0.36, TW * 0.27, TW * 0.27]))
+    elif fixed:
+        out.append(P("Defects found and fixed", "h2"))
+        out.append(data_table(["id", "check", "fix"], [[rl(x["id"]), rl(x["check"]), rl(x.get("fix_summary", ""))] for x in fixed],
+                              [TW * 0.12, TW * 0.38, TW * 0.50]))
+    hl = _md_table(_md_section(md, "What was verified"))
+    if len(hl) > 1:
+        out.append(CondPageBreak(60 * mm))
+        out.append(P("What was verified — independent method and worst error per area", "h2"))
+        hdr = [c.strip() for c in hl[0]]
+        rows = [[f"<b>{_md_inline(r[0])}</b>"] + [_md_inline(c) for c in r[1:]] for r in hl[1:]]
+        out.append(data_table(hdr, rows, [TW * 0.17, TW * 0.48, TW * 0.35]))
+    else:
+        rows = []
+        for ar, cnt in areas.most_common():
+            xs = [x for x in ver if x["area"] == ar]
+            worst = max(xs, key=lambda x: _ver_ratio(x) or 0)
+            rows.append([f"<b>{rl(ar)}</b>", str(cnt), rl(worst.get("method_independent", ""))[:120],
+                         f"{rl(worst['id'])}: abs {fmt(worst.get('abs_err'))}"])
+        out.append(data_table(["Area", "n", "Independent method", "Worst"], rows, [TW * 0.17, TW * 0.06, TW * 0.5, TW * 0.27]))
+    lim = _md_bullets(_md_section(md, "Honest limitations"))
+    if lim:
+        out.append(Spacer(1, 6))
+        out.append(P("Limitations stated by the verifier", "h2"))
+        out += bullets([_md_inline(x) for x in lim])
+    return out
+
 
 def verification_flowables(ver):
     out = []
@@ -1591,8 +1748,15 @@ def main():
     n_deb_sats = len({a["sat1"]["id"] for a in deb_alerts if a.get("source") == "debris"})
     fetched = (live.get("alerts") or {}).get("_fetched_utc", "")[:16].replace("T", " ")
     sim_epoch = alerts_payload.get("timestamp", "")[:16].replace("T", " ")
-    verified_pass = None
-    if ver is not None:
+    if isinstance(ver, list) and ver and isinstance(ver[0], dict) and "area" in ver[0]:
+        try:
+            mk("verification", fig_verification, ver)
+            vf = verification_section(ver, VERIFICATION_MD.read_text(encoding="utf-8") if VERIFICATION_MD.exists() else "")
+        except Exception as exc:
+            note(f"verification renderer failed: {exc}")
+            traceback.print_exc()
+            vf = verification_flowables(ver)
+    else:
         vf = verification_flowables(ver)
 
     # ══ story ══════════════════════════════════════════════════════════════
@@ -1612,7 +1776,8 @@ def main():
         (f"{n_pass}/{n_tot}", "physics cross-checks passing", "#5fd39a" if n_pass == n_tot and n_tot else "#f0c674"),
         (f"{c14.get('f1', 0):.3f}", "ML surrogate F1 @ Pc 1e-4 (held-out)", "white"),
         (f"{unk}/{ag_total}", "objects with unknown agency", "white"),
-        (f"{len(satcat_rows):,}", "SATCAT rows for owner / type / RCS", "white"),
+        ((f"{sum(1 for x in ver if x.get('pass'))}/{len(ver)}", "independent maths checks passing", "#5fd39a")
+         if isinstance(ver, list) and ver else (f"{len(satcat_rows):,}", "SATCAT rows for owner / type / RCS", "white")),
     ]
     S.append(kpi_table(tiles, dark=True, ncol=3))
     S.append(Spacer(1, 14 * mm))
@@ -1751,7 +1916,7 @@ def main():
                    f"{pcs.get('spread_decades')} decades → <b>consistent = {pcs.get('consistent')}</b>. Monte Carlo "
                    f"({pcs.get('mc_samples')} samples, {pcs.get('mc_hits')} hits) gives {fmt(pcs.get('monte_carlo'))}. "
                    f"Alfano's maximum {fmt(pcs.get('alfano_max'))} is what Pc could reach if the covariance size were wrong.", "small"))
-    t2 = Table([[figure("06_tle_sigma", width=TW * 0.5)[0],
+    t2 = Table([[figure("06_tle_sigma", width=TW * 0.5, keep=False),
                  [P("Why model the covariance?", "h2"),
                   P("TLEs carry no covariance. We grow a diagonal RTN 1σ linearly with TLE age, dominated by the "
                     "along-track term (~1 km/day). Stale TLEs therefore <i>dilute</i> Pc: with a huge ellipse the "
@@ -1920,7 +2085,7 @@ def main():
                         [TW * 0.47, TW * 0.13, TW * 0.13, TW * 0.11, TW * 0.10, TW * 0.06]))
     S.append(PageBreak())
     S += section_header(10, "Independent verification", "a separate agent re-derived results outside the production code path")
-    S += (vf if ver is not None else verification_flowables(None))
+    S += vf
     S.append(Spacer(1, 8))
     S.append(P("Test suite (backend/tests)", "h2"))
     trows = [

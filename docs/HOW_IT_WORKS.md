@@ -398,6 +398,7 @@ python -m pytest -q                      # full suite
 | `tests/test_ml_real.py` | The model and card load (≥ 10 000 training samples, Foster labels). The model beats the baseline on held-out data. On fresh encounters, MAE < 0.4 dex and precision/recall > 0.9 at 1e-4. `score_alert` never touches the physics Pc and is monotone in miss distance. Scoring takes < 1 ms per alert and does not import torch. The metrics endpoint reports the card, not a formula. |
 | `tests/test_decision_real.py` | The decision score is monotone in Pc. The weights sum to 1 with physics dominant. The 1e-4/1e-5/1e-7 thresholds and the escalation rule hold. Chan agrees with Foster within 0.1 decades on a production geometry and exactly for an isotropic covariance. Monte Carlo agrees with Foster within 4σ for Pc ≥ 1e-3. Alfano max ≥ Foster. `/api/physics/validation` returns 200 and every check passes. |
 | `tests/test_telemetry_real.py` | Non-payloads have no telemetry. Payload fuel follows the rocket equation. Illumination geometry is correct. |
+| `tests/test_verification_real.py` | Regressions for the defects found by the independent verification (`docs/report/VERIFICATION.md`, `verification.json`, 149 checks): state-vector satellite tracks in debris screening are metre-accurate against DOP853. The model card describes the live covariance model. `rel_error` is `null` for a zero reference. |
 
 Reproduce the ML model with `python -m app.ml.train_risk_surrogate`. It is
 seeded, and it writes the artifact and the model card.

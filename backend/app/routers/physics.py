@@ -55,10 +55,12 @@ GEOMETRIES = [
 def _check(name, category, formula, ours, ref, tol, source, *, rel=True, units="", detail=None) -> dict:
     ours, ref = float(ours), float(ref)
     abs_err = abs(ours - ref)
-    rel_err = abs_err / max(abs(ref), 1e-300)
+    # Relative error is undefined for a zero reference (absolute-tolerance checks such as
+    # SGP4 vs J2-RK4 separation): report None instead of abs_err / 1e-300 ~ 1e+298.
+    rel_err = abs_err / abs(ref) if ref != 0.0 else None
     out = {"name": name, "category": category, "standard_formula": formula, "our_value": ours,
            "reference_value": ref, "abs_error": abs_err, "rel_error": rel_err,
-           "pass": bool((rel_err if rel else abs_err) <= tol), "tolerance": tol,
+           "pass": bool((rel_err if rel and rel_err is not None else abs_err) <= tol), "tolerance": tol,
            "tolerance_kind": "relative" if rel else "absolute", "units": units, "source": source}
     if detail:
         out["detail"] = detail

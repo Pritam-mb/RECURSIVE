@@ -154,10 +154,10 @@ def _rsw(r, v) -> np.ndarray:
 
 def _check(name, formula, ours, ref, tol, source, rel=True) -> dict[str, Any]:
     abs_err = abs(float(ours) - float(ref))
-    rel_err = abs_err / max(abs(float(ref)), 1e-300)
+    rel_err = abs_err / abs(float(ref)) if float(ref) != 0.0 else None   # undefined for a zero reference
     return {"name": name, "standard_formula": formula, "our_value": float(ours), "reference_value": float(ref),
             "abs_error": abs_err, "rel_error": rel_err,
-            "pass": bool((rel_err if rel else abs_err) <= tol), "tolerance": tol,
+            "pass": bool((rel_err if rel and rel_err is not None else abs_err) <= tol), "tolerance": tol,
             "tolerance_kind": "relative" if rel else "absolute", "source": source}
 
 

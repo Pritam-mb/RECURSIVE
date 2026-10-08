@@ -22,7 +22,6 @@ from app.core.state_cache import (
     get_latest_snapshot,
     set_latest_alerts,
     set_latest_snapshot,
-    get_all_kalman_states,  # noqa: F401  (diagnostics only; never used for Pc)
 )
 from app.data.tle_fetcher import fetch_tles
 from app.simulation.sim_engine import SimEngine
@@ -86,8 +85,6 @@ kafka_adapter = KafkaAdapter() if ENABLE_EXTENDED_PIPELINE else None
 
 def build_snapshot(current_propagator: SGP4Propagator, dt: datetime) -> dict:
     """Compute a serializable snapshot for the latest satellite state."""
-    from app.core.state_cache import set_kalman_state
-    
     states = current_propagator.propagate_all(dt)
 
     active_states = [state for state in states if state.error_code == 0]
@@ -113,15 +110,6 @@ def build_snapshot(current_propagator: SGP4Propagator, dt: datetime) -> dict:
         for state in active_states
     ]
 
-    # Capture Kalman covariance per satellite
-    covariances = {}
-    for state in active_states:
-        kal_state = current_propagator._kalman_states.get(state.norad_id)
-        if kal_state is not None:
-            kal_dict = kal_state.to_dict()
-            covariances[state.norad_id] = kal_dict.get("covariance_6x6")
-            set_kalman_state(state.norad_id, kal_dict)
-
     from app.core.debris_model import debris_model
     debris_clouds = debris_model.get_frontend_debris_clouds(active_states)
 
@@ -131,7 +119,6 @@ def build_snapshot(current_propagator: SGP4Propagator, dt: datetime) -> dict:
         "satellites": satellites,
         "count": len(states),
         "states": active_states,
-        "covariances": covariances,
         "debris_clouds": debris_clouds,
     }
     snapshot["payload"] = json.dumps({

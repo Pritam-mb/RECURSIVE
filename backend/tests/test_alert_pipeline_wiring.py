@@ -102,9 +102,6 @@ class TestAlertPipelineNotFlagGated:
         monkeypatch.setattr(app_module, "screen_alerts", fake_screen)
         monkeypatch.setattr(app_module, "cascade_planner", _Planner())
         monkeypatch.setattr(app_module, "build_debris_alerts", fake_debris)
-        monkeypatch.setattr(
-            app_module, "get_all_kalman_states", lambda: {}
-        )
 
         _seed_snapshot(
             app_module,
@@ -121,7 +118,6 @@ class TestAlertPipelineNotFlagGated:
         """A populated alert payload must land in the cache, not the stub."""
         monkeypatch.setattr(app_module, "ENABLE_EXTENDED_PIPELINE", False)
         monkeypatch.setattr(app_module, "screen_alerts", lambda s, t, **k: [])
-        monkeypatch.setattr(app_module, "get_all_kalman_states", lambda: {})
 
         class _Planner:
             def analyze_snapshot(self, states, alerts, propagator, stamp):
@@ -176,7 +172,6 @@ class TestAlertListIsSelfConsistent:
 
     def test_count_matches_the_emitted_list(self, app_module, monkeypatch):
         monkeypatch.setattr(app_module, "ENABLE_EXTENDED_PIPELINE", False)
-        monkeypatch.setattr(app_module, "get_all_kalman_states", lambda: {})
 
         class _Alert:
             def __init__(self, a, b):

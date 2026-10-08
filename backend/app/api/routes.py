@@ -11,8 +11,8 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Response
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
 
-from app.core.state_cache import get_latest_alerts, get_latest_snapshot, set_latest_alerts, set_latest_snapshot, get_all_kalman_states
-from app.core.conjunction import screen_conjunctions
+from app.core.state_cache import get_latest_alerts, get_latest_snapshot, set_latest_alerts, set_latest_snapshot
+from app.core.screening import screen as screen_alerts
 from app.core.sgp4_propagator import MU, RE
 from app.core.agency import infer_agency
 from app.core.agency_authority import authority_manager
@@ -606,79 +606,17 @@ async def execute_maneuver(
             except Exception as tracker_err:
                 import logging as _log
                 _log.getLogger(__name__).warning("Tracker record_maneuver failed: %s", tracker_err)
-        snapshot = await asyncio.to_thread(
-            _build_snapshot,
-            _propagator,
-            sim_clock.simulation_now(),
-        )
-        set_latest_snapshot(snapshot)
-
-        sampled_states = snapshot.get("states", [])
-        alerts = []
-        cascade_summary = {
-            "graph": {"node_count": 0, "edge_count": 0, "influence_radius_km": 200.0},
-            "alerts": [],
-            "cascade_plan": [],
-            "total_delta_v_ms": 0.0,
-            "cascade_depth": 0,
-            "agencies_involved": [],
-            "seed_satellites": [],
-            "cpi_threshold": 5.0,
-            "node_probabilities": {},
-            "ranker_review": {},
-        }
-
-        if sampled_states:
-            kalman_states = get_all_kalman_states()
-            alerts = await asyncio.to_thread(screen_conjunctions, sampled_states, kalman_states=kalman_states, propagator=_propagator)
-            cascade_summary = await asyncio.to_thread(
-                _cascade_planner.analyze_snapshot,
-                sampled_states,
-                [alert.to_dict() for alert in alerts],
-                _propagator,
-                datetime.fromisoformat(snapshot["timestamp"]),
-            )
-
-        debris_clouds = build_debris_alerts(
-            cascade_summary.get("hotspots", []),
-            sampled_states if sampled_states else [],
-            snapshot.get("timestamp"),
-            alerts=cascade_summary.get("alerts", [a.to_dict() for a in alerts]),
-            cpi_threshold=cascade_summary.get("cpi_threshold", 5.0),
-        )
-
+        # Same pipeline as the periodic refresh (screening + debris + ML + cascade).
+        payload = await _recompute_alerts_pipeline(_propagator)
         result = {
             **result,
-            "alerts": cascade_summary.get("alerts", [a.to_dict() for a in alerts]),
-                "hotspots": cascade_summary.get("hotspots", []),
-            "cascade_plan": cascade_summary.get("cascade_plan", []),
-            "graph": cascade_summary.get("graph", {}),
-            "cascade_depth": cascade_summary.get("cascade_depth", 0),
-            "total_delta_v_ms": cascade_summary.get("total_delta_v_ms", 0.0),
-            "agencies_involved": cascade_summary.get("agencies_involved", []),
-            "seed_satellites": cascade_summary.get("seed_satellites", []),
-            "cpi_threshold": cascade_summary.get("cpi_threshold", 5.0),
-            "node_probabilities": cascade_summary.get("node_probabilities", {}),
-            "ranker_review": cascade_summary.get("ranker_review", {}),
-            "debris_clouds": debris_clouds,
+            **{k: payload.get(k, default) for k, default in (
+                ("alerts", []), ("hotspots", []), ("cascade_plan", []), ("graph", {}),
+                ("cascade_depth", 0), ("total_delta_v_ms", 0.0), ("agencies_involved", []),
+                ("seed_satellites", []), ("cpi_threshold", 5.0), ("node_probabilities", {}),
+                ("ranker_review", {}), ("debris_clouds", []),
+            )},
         }
-
-        set_latest_alerts({
-            "timestamp": snapshot.get("timestamp"),
-            "alerts": result["alerts"],
-            "count": len(result["alerts"]),
-            "hotspots": result["hotspots"],
-            "graph": result["graph"],
-            "cascade_plan": result["cascade_plan"],
-            "cascade_depth": result["cascade_depth"],
-            "total_delta_v_ms": result["total_delta_v_ms"],
-            "agencies_involved": result["agencies_involved"],
-            "seed_satellites": result["seed_satellites"],
-            "cpi_threshold": result["cpi_threshold"],
-            "node_probabilities": result["node_probabilities"],
-            "ranker_review": result.get("ranker_review", {}),
-            "debris_clouds": result["debris_clouds"],
-        })
 
     return result
 
@@ -709,20 +647,19 @@ async def _recompute_alerts_pipeline(propagator) -> dict:
         await _alerts_refresher()
         return get_latest_alerts()
 
+    # Fallback when main.py has not registered its refresher (e.g. routes used
+    # stand-alone in a test): same future-window screening, no debris/ML.
     sampled_states = snapshot.get("states", [])
-    kalman_states = get_all_kalman_states()
+    sim_now = datetime.fromisoformat(snapshot["timestamp"])
     alerts = await asyncio.to_thread(
-        screen_conjunctions,
-        sampled_states,
-        kalman_states=kalman_states,
-        propagator=propagator,
+        screen_alerts, sampled_states, sim_now, propagator=propagator,
     )
     cascade_summary = await asyncio.to_thread(
         _cascade_planner.analyze_snapshot,
         sampled_states,
-        [alert.to_dict() for alert in alerts],
+        alerts,
         propagator,
-        datetime.fromisoformat(snapshot["timestamp"]),
+        sim_now,
     )
 
     debris_context_states = sampled_states
@@ -743,11 +680,11 @@ async def _recompute_alerts_pipeline(propagator) -> dict:
         cascade_summary.get("hotspots", []),
         debris_context_states,
         snapshot.get("timestamp"),
-        alerts=cascade_summary.get("alerts", [a.to_dict() for a in alerts]),
+        alerts=cascade_summary.get("alerts", alerts),
         cpi_threshold=cascade_summary.get("cpi_threshold", 5.0),
     )
 
-    serialized_alerts = cascade_summary.get("alerts", [a.to_dict() for a in alerts])
+    serialized_alerts = cascade_summary.get("alerts", alerts)
     hotspots = cascade_summary.get("hotspots", [])
     enrich_payload_with_geodetic(
         {"hotspots": hotspots, "debris_clouds": debris_clouds},

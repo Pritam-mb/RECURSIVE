@@ -569,6 +569,7 @@ class DebrisModel:
             self._last_alerts, self._last_exposure = [], {}
             return []
         F_r = np.concatenate(fr_r); F_v = np.concatenate(fr_v); F_bc = np.concatenate(fr_bc)
+        F_r0, F_v0 = F_r.copy(), F_v.copy()   # state at sim_time (or at release for pending events)
         F_alive = np.concatenate(fr_alive); F_ev = np.concatenate(fr_ev)
         F_idx = np.concatenate(fr_idx); F_rel = np.concatenate(fr_release)
 
@@ -680,6 +681,13 @@ class DebrisModel:
                 "parent_event": {"event_id": ev.event_id, "collision_utc": ev.collision_utc.isoformat(),
                                  "parent_ids": ev.parent_ids, "fragment_count": ev.result.n_total},
                 "fragment_id": f"{ev.event_id}:F{fidx:04d}",
+                "fragment_state": {
+                    "r_km": [float(x) for x in F_r0[f]],
+                    "v_kms": [float(x) for x in F_v0[f]],
+                    "epoch_utc": (sim_time + timedelta(seconds=float(F_rel[f]) * step_s)).isoformat(),
+                    "ballistic_coeff_m2_kg": float(F_bc[f]),
+                    "dynamics": "two_body+J2+drag(vallado_exp)",
+                },
                 "fragment_size_m": round(lc, 3),
                 "fragment_weight": round(ev.result.weight, 4),
                 "sat_mass_source": props["mass_source"],

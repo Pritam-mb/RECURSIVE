@@ -95,7 +95,7 @@ def build_snapshot(current_propagator: SGP4Propagator, dt: datetime) -> dict:
         {
             "norad_id": state.norad_id,
             "name": state.name,
-            "agency": infer_agency(state.name),
+            "agency": infer_agency(state.name, state.norad_id),
             "position": {
                 "x": state.x,
                 "y": state.y,

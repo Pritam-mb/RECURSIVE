@@ -169,29 +169,37 @@ class TestDebrisModelContract:
         assert build_debris_alerts([{"cpi_score": 9.0}], [], EPOCH.isoformat()) == []
 
     def test_cloud_shells_are_layered_and_monotonic(self):
-        class _State:
-            error_code = 0
-            norad_id = 1
-            name = "SAT"
-            x = RADIUS_KM
-            y = 0.0
-            z = 0.0
+        # Forecast clouds are now computed by running the NASA SBM on the
+        # actual pair state, so the hotspot must name two objects that are
+        # present (with velocities) in the TCA states.
+        import math
+
+        def _state(nid, inc_deg):
+            inc = math.radians(inc_deg)
+            return type("_State", (), dict(
+                error_code=0, norad_id=nid, name=f"SAT {nid}",
+                x=RADIUS_KM, y=0.0, z=0.0,
+                vx=0.0, vy=ORBIT_SPEED_KMS * math.cos(inc), vz=ORBIT_SPEED_KMS * math.sin(inc),
+            ))()
 
         hotspot = {
             "cpi_score": 9.0,
+            "sat1": {"id": 1}, "sat2": {"id": 2},
             "position": {"x": RADIUS_KM, "y": 0.0, "z": 0.0},
             "tca_utc": (EPOCH + timedelta(minutes=30)).isoformat(),
             "tca_minutes": 30.0,
         }
         clouds = build_debris_alerts(
             [hotspot],
-            [_State()],
+            [_state(1, 0.0), _state(2, 80.0)],
             EPOCH.isoformat(),
             alerts=[],
             cpi_threshold=5.0,
         )
 
         assert len(clouds) == 1
+        assert clouds[0]["kind"] == "forecast"
+        assert clouds[0]["fragment_count"] > 100      # SBM, not a constant
         shells = clouds[0]["shells"]
         assert len(shells) == 3
         radii = [shell["radius_km"] for shell in shells]

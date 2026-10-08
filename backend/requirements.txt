@@ -1,6 +1,6 @@
 fastapi
 uvicorn[standard]
-sgp4
+sgp4>=2.27  # 2.27+ ships an abi3 C++ wheel (accelerated SatrecArray) for py3.14
 numpy
 scipy
 filterpy

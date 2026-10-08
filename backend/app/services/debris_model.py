@@ -83,14 +83,18 @@ def forecast_breakup_cloud(r_a, v_a, id_a, name_a, r_b, v_b, id_b, name_b, *, se
         t_prev = minutes
         rn = np.linalg.norm(r, axis=1)
         ok = np.isfinite(rn) & (rn - sbm.R_EARTH_KM > sbm.REENTRY_ALT_KM)
-        if ok.sum() >= 3:
-            c = r[ok].mean(axis=0)
-            d = np.linalg.norm(r[ok] - c, axis=1)
-            p90 = float(np.percentile(d, 90))
-            p50 = float(np.percentile(d, 50))
-        else:
-            p90 = p50 = 0.0
-        timeline.append({"minutes": float(minutes), "radius_km": round(p90, 3), "radius_p50_km": round(p50, 3)})
+        # Radius per parent stream (fragments of each parent stay near a perturbed
+        # copy of its orbit; the two streams separate at the crossing speed, so
+        # a single centroid between them would not describe either cloud).
+        p90 = p50 = 0.0
+        for k in (0, 1):
+            sel = ok & (res.parent_index == k)
+            if sel.sum() >= 3:
+                d = np.linalg.norm(r[sel] - r[sel].mean(axis=0), axis=1)
+                p90 = max(p90, float(np.percentile(d, 90)))
+                p50 = max(p50, float(np.percentile(d, 50)))
+        timeline.append({"minutes": float(minutes), "radius_km": round(p90, 3), "radius_p50_km": round(p50, 3),
+                         "basis": "max over parent streams"})
     return {"result": res, "parents": [pa, pb], "timeline": timeline}
 
 
@@ -114,6 +118,8 @@ def build_debris_alerts(
     for state in states:
         if getattr(state, "error_code", 0) != 0:
             continue
+        if not all(hasattr(state, k) for k in ("vx", "vy", "vz")):
+            continue   # breakup needs the velocity at TCA; position-only states can't seed a forecast
         index[int(state.norad_id)] = len(positions)
         positions.append([float(state.x), float(state.y), float(state.z)])
         velocities.append([float(state.vx), float(state.vy), float(state.vz)])

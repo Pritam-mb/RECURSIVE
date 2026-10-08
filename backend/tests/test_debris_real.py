@@ -101,3 +101,22 @@ def test_fragment_on_satellite_path_produces_debris_alert():
     assert a["parent_event"]["fragment_count"] == ev.result.n_total
     clouds = model.get_frontend_debris_clouds([sat])
     assert clouds and clouds[0]["affected_count"] >= 1
+
+
+def test_debris_alert_carries_fragment_state_reproducing_tca():
+    t0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    model = DebrisModel()
+    r, v = _circular(700.0, 98.0)
+    ev = model.simulate_collision(r.tolist(), v.tolist(), 900.0, 900.0, 10.0,
+                                  max_fragments_simulated=20, event_id="fs-evt", collision_utc=t0)
+    f_r, f_v, bc = ev.result.r_km[:1], ev.result.v_kms[:1], ev.bc[:1]
+    fr_hit, fv_hit = sbm.propagate(f_r, f_v, bc, 600.0, max_step_s=10.0)
+    sr0, sv0 = sbm.propagate(fr_hit, -fv_hit, None, -600.0, max_step_s=10.0)
+    sat = SimpleNamespace(norad_id=7, name="S", error_code=0, x=sr0[0, 0], y=sr0[0, 1], z=sr0[0, 2],
+                          vx=sv0[0, 0], vy=sv0[0, 1], vz=sv0[0, 2])
+    a = [x for x in model.compute_debris_alerts([sat], t0, window_hours=0.5) if x["fragment_id"] == "fs-evt:F0000"][0]
+    fs = a["fragment_state"]
+    assert set(fs) >= {"r_km", "v_kms", "epoch_utc"}
+    r2, _ = sbm.propagate(np.array([fs["r_km"]]), np.array([fs["v_kms"]]), np.array([fs["ballistic_coeff_m2_kg"]]),
+                          a["tca_minutes"] * 60.0 - (datetime.fromisoformat(fs["epoch_utc"]) - t0).total_seconds())
+    assert np.linalg.norm(r2[0] - fr_hit[0]) < 1.0

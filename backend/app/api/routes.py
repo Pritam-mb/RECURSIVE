@@ -190,7 +190,7 @@ def _build_snapshot(current_propagator, dt: datetime) -> dict:
         {
             "norad_id": state.norad_id,
             "name": state.name,
-            "agency": infer_agency(state.name),
+            "agency": infer_agency(state.name, state.norad_id),
             "position": {
                 "x": state.x,
                 "y": state.y,
@@ -629,10 +629,6 @@ async def execute_maneuver(
         }
 
         if sampled_states:
-            if len(sampled_states) > 250:
-                step = max(1, len(sampled_states) // 250)
-                sampled_states = sampled_states[::step][:250]
-
             kalman_states = get_all_kalman_states()
             alerts = await asyncio.to_thread(screen_conjunctions, sampled_states, kalman_states=kalman_states, propagator=_propagator)
             cascade_summary = await asyncio.to_thread(
@@ -697,10 +693,6 @@ async def _recompute_alerts_pipeline(propagator) -> dict:
     set_latest_snapshot(snapshot)
 
     sampled_states = snapshot.get("states", [])
-    if len(sampled_states) > 250:
-        step = max(1, len(sampled_states) // 250)
-        sampled_states = sampled_states[::step][:250]
-
     kalman_states = get_all_kalman_states()
     alerts = await asyncio.to_thread(
         screen_conjunctions,
@@ -1373,11 +1365,8 @@ async def judge_manipulate_satellite(
     
     sampled_states = []
     if states:
-        if len(states) > 250:
-            step = max(1, len(states) // 250)
-            sampled_states = states[::step][:250]
-        else:
-            sampled_states = states
+        # Screen the full catalogue (the vectorised screen handles it).
+        sampled_states = states
         
         kalman_states = get_all_kalman_states()
         alerts = await asyncio.to_thread(screen_conjunctions, sampled_states, kalman_states=kalman_states, propagator=_propagator)

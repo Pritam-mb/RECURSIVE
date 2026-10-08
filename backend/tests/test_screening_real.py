@@ -122,16 +122,23 @@ def test_pair_2000km_apart_now_meeting_in_2h_is_found():
     assert len(alerts) == 1
     al = alerts[0]
 
-    def dist(t):
-        rb, _ = S.propagate_j2(rB0, vB0, t, max_substep_s=5.0)
-        return float(np.linalg.norm(prop.state(91001, t)[0] - rb))
-
-    # brute force only near the planted encounter (the full 6 h scan is slow in RK4)
-    ts = np.arange(t_enc - 120, t_enc + 120, 1.0)
-    k = int(np.argmin([dist(t) for t in ts]))
-    fine = np.arange(ts[k] - 1, ts[k] + 1, 0.001)
-    dd = [dist(t) for t in fine]
-    t_true, miss_true = float(fine[int(np.argmin(dd))]), float(min(dd))
+    # 1 s scan (incremental RK4), then 1 ms scan around the minimum.
+    t_base = t_enc - 150.0
+    rb, vb = S.propagate_j2(rB0, vB0, t_base, max_substep_s=5.0)
+    coarse = []
+    for i in range(300):
+        t = t_base + i
+        coarse.append((float(np.linalg.norm(prop.state(91001, t)[0] - rb)), t, rb, vb))
+        rb, vb = S.propagate_j2(rb, vb, 1.0, max_substep_s=1.0)
+    _, tk, rk, vk = min(coarse[1:], key=lambda c: c[0])
+    rb, vb = S.propagate_j2(rk, vk, -1.0, max_substep_s=1.0)
+    best = (np.inf, None)
+    for i in range(2000):
+        t = tk - 1.0 + i * 0.001
+        d = float(np.linalg.norm(prop.state(91001, t)[0] - rb))
+        best = min(best, (d, t))
+        rb, vb = S.propagate_j2(rb, vb, 0.001, max_substep_s=1.0)
+    miss_true, t_true = best
 
     assert abs(al["tca_hours"] * 3600.0 - t_true) < 1.0
     assert abs(al["miss_distance_km"] - miss_true) < 0.1

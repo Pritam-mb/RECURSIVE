@@ -35,12 +35,11 @@ Data generation recipe (seeded, reproducible)
 * miss vector   in the B-plane (perpendicular to relative velocity),
                   |b| log-uniform: 60% [3 m, 25 km], 40% [3 m, 3 km],
                   direction ~ U(0, 2pi)
-* TLE ages      log-uniform [0.5, 336] h per object
+* TLE ages      log-uniform [0.5, 8760] h per object (covers stale catalogue TLEs)
 * HBR           log-uniform [3, 50] m (combined hard-body radius)
 * covariance    per object diag(sigma_r^2, sigma_t^2, sigma_n^2) in RTN with the
-                  TLE-age model sigma_r = sigma_n = 0.05 km,
-                  sigma_t = 1.0 * (1 + age_h / 24) km  (same model as
-                  app.core.analytics.build_rtn_covariance; checked numerically
+                  TLE-age model sigma = SIGMA0 + GROWTH * age_days per RTN axis,
+                  imported from app.core.screening (the live Pc model; checked numerically
                   below and recorded in the model card)
 * label         Foster Pc = integral over |x| <= HBR of N(x; b, C_2d), evaluated
                   by polar Gauss-Legendre (radial) x periodic trapezoid (angular)
@@ -95,17 +94,24 @@ THRESHOLD_ELEVATED = 1e-6
 
 # ── TLE-age covariance model ─────────────────────────────────────────────────
 
+# Up to one year: bundled/offline TLE snapshots can be months old.
+TLE_AGE_MAX_H = 24.0 * 365.0
+
+
 def sigma_rtn_km(tle_age_hours: np.ndarray) -> np.ndarray:
     """Per-object 1-sigma position error (R, T, N) in km from TLE age.
 
-    Replicates app.core.analytics.build_rtn_covariance (radial/normal 50 m,
-    along-track 1 km growing linearly by 1 km per day of TLE age).
+    Uses the exact constants of the live screening covariance model
+    (app.core.screening.SIGMA0_RTN_KM / SIGMA_GROWTH_RTN_KM_PER_DAY), imported
+    rather than copied so the training labels can never drift from the Pc the
+    screening actually reports.
     """
-    age = np.asarray(tle_age_hours, dtype=float)
-    sig_t = 1.0 * (1.0 + age / 24.0)
-    sig_r = np.full_like(sig_t, 0.05)
-    sig_n = np.full_like(sig_t, 0.05)
-    return np.stack([sig_r, sig_t, sig_n], axis=-1)
+    from app.core.screening import SIGMA0_RTN_KM, SIGMA_GROWTH_RTN_KM_PER_DAY
+
+    age_days = np.asarray(tle_age_hours, dtype=float)[..., None] / 24.0
+    sigma0 = np.asarray(SIGMA0_RTN_KM, dtype=float)
+    growth = np.asarray(SIGMA_GROWTH_RTN_KM_PER_DAY, dtype=float)
+    return sigma0 + (growth * age_days)
 
 
 def _unit(v: np.ndarray) -> np.ndarray:
@@ -213,8 +219,8 @@ def generate_encounters(n: int, seed: int) -> dict[str, np.ndarray]:
     miss_vec = b2[:, 0:1] * e1 + b2[:, 1:2] * e2
     r2 = r1 + miss_vec
 
-    age1 = _loguniform(rng, 0.5, 336.0, n)
-    age2 = _loguniform(rng, 0.5, 336.0, n)
+    age1 = _loguniform(rng, 0.5, TLE_AGE_MAX_H, n)
+    age2 = _loguniform(rng, 0.5, TLE_AGE_MAX_H, n)
     hbr = _loguniform(rng, 0.003, 0.050, n)
 
     cov = _rtn_covariance(r1, v1, age1) + _rtn_covariance(r2, v2, age2)
@@ -462,7 +468,7 @@ def train(sample_count: int = SAMPLE_COUNT, seed: int = SEED, out_dir: Path | No
             "crossing_angle_deg": "85% U(10,175), 15% U(0.5,10)",
             "flight_path_angle_deg": "U(-1.5, 1.5)",
             "miss_distance_km": "60% loguniform(0.003, 25), 40% loguniform(0.003, 3)",
-            "tle_age_h": "loguniform(0.5, 336) per object",
+            "tle_age_h": f"loguniform(0.5, {TLE_AGE_MAX_H:.0f}) per object",
             "hbr_km": "loguniform(0.003, 0.050)",
             "covariance": "RTN sigma_r=sigma_n=0.05 km, sigma_t=1.0*(1+age_h/24) km per object",
             "foster_quadrature": "polar: 20-node Gauss-Legendre radius x 64-node trapezoid angle",

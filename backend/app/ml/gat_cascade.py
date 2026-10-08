@@ -582,7 +582,14 @@ class CascadeGAT:
     def _maneuver_geometry(
         self, node_features, edge_index, edge_attr, maneuver_probability
     ):
-        """Shared post-processing: cascade depth and the RSW burn recommendation."""
+        """Shared post-processing: heuristic depth and RSW burn fields.
+
+        NOTE: these formula-derived fields (ceil(p*4 + influence*1.5), linear
+        delta-v) are NOT physics. The production cascade planner ignores them:
+        published cascade depth is the BFS hop count on the alert graph and
+        manoeuvres come from re-propagation (app/services/maneuver_planner.py).
+        The GAT probability is used only as an advisory cross-check.
+        """
         summary_features = build_graph_summary_features(
             node_features, edge_index, edge_attr
         )

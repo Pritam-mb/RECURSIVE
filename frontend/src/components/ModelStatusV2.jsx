@@ -15,7 +15,10 @@ const FEATURE_LABELS = {
   altitude_km: 'altitude',
 };
 const DEFAULT_BUFFER_THRESHOLD = 500;
-const PIPELINE_OFF_NOTE = 'Extended pipeline off — set ENABLE_EXTENDED_PIPELINE=1';
+// ENABLE_EXTENDED_PIPELINE gates only optional extras (trajectory RNN recorder,
+// anomaly flags, shadow retraining, Kafka). Screening, Pc, the XGBoost surrogate,
+// decisions, cascade and debris always run.
+const PIPELINE_OFF_NOTE = 'Core pipeline running. Optional extended ML (trajectory RNN, anomaly flags, shadow retraining) is off to save RAM — set ENABLE_EXTENDED_PIPELINE=1 to enable.';
 
 // '—' when the value is unknown (status endpoint unreachable), never a fake 0.
 const fmt = (v) => (v == null ? '—' : Number(v).toLocaleString());
@@ -154,9 +157,9 @@ export default function ModelStatusV2() {
   const pipelineState = mlStatusReachable === false
     ? { cls: 'is-warning', text: 'Unreachable' }
     : pipelineEnabled === true
-      ? { cls: 'is-nominal', text: 'Pipeline on' }
+      ? { cls: 'is-nominal', text: 'Core + extended ML' }
       : pipelineOff
-        ? { cls: 'is-caution', text: 'Pipeline off' }
+        ? { cls: 'is-nominal', text: 'Core pipeline on' }
         : { cls: 'is-dim', text: 'Pending' };
 
   return (

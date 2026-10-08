@@ -66,6 +66,7 @@ FRAG_SIGMA_RATE_KMS = 0.001        # 1 m/s velocity knowledge -> growth per seco
 DEBRIS_WINDOW_HOURS = float(os.getenv("DEBRIS_WINDOW_HOURS", "6"))
 DEBRIS_STEP_S = float(os.getenv("DEBRIS_STEP_S", "30"))
 DEBRIS_THRESHOLD_KM = float(os.getenv("DEBRIS_THRESHOLD_KM", "5"))
+SAT_TRACK_MAX_STEP_S = 20.0        # RK4 substep for satellites without a TLE (two-body + J2)
 DEBRIS_MAX_ALERTS = int(os.getenv("DEBRIS_MAX_ALERTS", "50"))
 MAX_FRAGMENTS_PROPAGATED = int(os.getenv("DEBRIS_MAX_FRAGMENTS", "1000"))
 MAX_FRAGMENTS_RENDERED = 300
@@ -800,7 +801,9 @@ class DebrisModel:
             v = np.array([sats[i][3] for i in rest], float)
             R[rest, 0], V[rest, 0] = r, v
             for k in range(1, nt):
-                r, v = sbm.propagate(r, v, None, offsets[k] - offsets[k - 1], max_step_s=60.0)
+                # 20 s RK4 substeps: ~1.5 m error after 6 h in LEO (60 s gave ~200 m,
+                # i.e. ~1 sigma of the 0.2 km satellite sigma used for debris Pc).
+                r, v = sbm.propagate(r, v, None, offsets[k] - offsets[k - 1], max_step_s=SAT_TRACK_MAX_STEP_S)
                 R[rest, k], V[rest, k] = r, v
         return R, V
 

@@ -89,7 +89,7 @@ function Empty({ children, error }) {
 
 function status(res, loading, what) {
   if (loading && !res) return <Empty>Loading {what}…</Empty>;
-  if (res?.error) return <Empty error>{what}: endpoint unavailable ({res.error}) — not computed</Empty>;
+  if (res?.error) return <Empty error>{what} could not be loaded ({res.error}). Use Refresh to retry.</Empty>;
   return null;
 }
 
@@ -609,16 +609,18 @@ function AnalyticsSheet({ onClose }) {
 
   const load = useCallback(async () => {
     setLoading(true);
-    const [m, v, e1] = await Promise.all([
-      fetchJson('/api/analytics/model'),
-      fetchJson('/api/physics/validation'),
-      fetchJson('/api/physics/engines'),
-    ]);
-    // Contract allows the engine list under either path.
-    const e = e1.error ? await fetchJson('/api/propulsion/engines') : e1;
-    setModel(m);
-    setValidation(v);
-    setEngines(e.error ? e1 : e);
+    // Each section fills in as soon as its own request returns, so one slow
+    // endpoint can't hold the others on "Loading…".
+    const jobs = [
+      fetchJson('/api/analytics/model').then(setModel),
+      fetchJson('/api/physics/validation').then(setValidation),
+      fetchJson('/api/physics/engines').then(async (e1) => {
+        // Contract allows the engine list under either path.
+        const e = e1.error ? await fetchJson('/api/propulsion/engines') : e1;
+        setEngines(e.error ? e1 : e);
+      }),
+    ];
+    await Promise.allSettled(jobs);
     setFetchedAt(new Date());
     setLoading(false);
   }, []);

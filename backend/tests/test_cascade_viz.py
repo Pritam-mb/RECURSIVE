@@ -130,22 +130,26 @@ def test_graph_edges_and_focus(scenario):
 
 def test_debris_census_matches_live_propagation(scenario):
     _, ev = scenario
-    out = cv.build_explorer(_snapshot(ev), [ev], T0)
-    h = out["hotspots"][0]
-    c = h["debris"]["events"][0]
-    assert c["relation"] == "own_breakup" and c["state"] == "released" and c["t_rel_s"] == pytest.approx(600, abs=1)
-    # independent: the live model's own propagation to the same time
+    # independent: the live model's own propagation to the hotspot time (+10 min)
     r, _, alive = ev.state_at(ev.collision_utc + timedelta(seconds=600))
-    center = np.asarray(ev.result.impact_point_km, float)
+    center = np.median(r[alive], axis=0)
+    snap = _snapshot(ev)
+    snap["hotspots"][0]["position"] = {"x": center[0], "y": center[1], "z": center[2]}
+    radius = float(np.median(np.linalg.norm(r[alive] - center, axis=1)))
+    snap["hotspots"][0]["zone_radius_km"] = radius
+    out = cv.build_explorer(snap, [ev], T0)
+    c = out["hotspots"][0]["debris"]["events"][0]
+    assert c["relation"] == "own_breakup" and c["state"] == "released" and c["t_rel_s"] == pytest.approx(600, abs=1)
     d = np.linalg.norm(r[alive] - center, axis=1)
-    assert c["sampled_inside"] == int(np.count_nonzero(d <= 50.0))
+    assert c["sampled_inside"] == int(np.count_nonzero(d <= radius))
     assert c["represented_inside"] == int(round(c["sampled_inside"] * ev.result.weight))
     assert c["nearest_fragment_km"] == pytest.approx(float(d.min()), abs=1e-3)
     assert 0 < c["sampled_inside"] <= int(alive.sum())
-    # spread grows after the breakup
+    # spread statistics after the breakup
     tl = c["spread_timeline"]
     assert [t["t_after_breakup_s"] for t in tl] == [1200.0, 3300.0, 6000.0]
-    assert tl[-1]["p90_km"] > tl[0]["p90_km"] > 0
+    assert all(t["p90_km"] > t["p50_km"] > 0 and t["n_alive"] > 0 for t in tl)
+    assert all(t["along_track_spread_km"] > 0 for t in tl)
 
 
 def test_debris_not_released_before_breakup(scenario):

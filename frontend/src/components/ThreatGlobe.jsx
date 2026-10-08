@@ -457,6 +457,9 @@ function interpolateReplay(prep) {
   }
 }
 
+/** Short display name: drops "(…)" qualifiers so truncation stays readable. */
+const shortName = (name, len) => String(name ?? '').replace(/\s*\([^)]*\)?/g, '').trim().slice(0, len).toUpperCase();
+
 function formatTRel(s) {
   const sign = s < 0 ? '−' : '+';
   const v = Math.abs(Math.round(s));
@@ -1219,7 +1222,7 @@ export default function ThreatGlobe({ alerts = EMPTY, satellites = EMPTY, select
           ctx.lineWidth = 1;
           if (showLabels && threatCallouts < MAX_THREAT_CALLOUTS) {
             const miss = formatMiss(Number(th.miss_km));
-            const name = String(th.name ?? entry.name ?? `#${th.sat_id}`).slice(0, 14).toUpperCase();
+            const name = shortName(th.name ?? entry.name ?? `#${th.sat_id}`, 14);
             if (drawCallout(ctx, p, miss ? `${name}  ${miss}` : name, PALETTE.warning, W, H)) threatCallouts += 1;
           }
         }
@@ -1230,7 +1233,7 @@ export default function ThreatGlobe({ alerts = EMPTY, satellites = EMPTY, select
         if (prep && showParents) {
           for (const par of prep.parents) {
             if (par.cur.ok && par.proj.visible) {
-              drawCallout(ctx, par.proj, String(par.name).slice(0, 16).toUpperCase(), par.color, W, H);
+              drawCallout(ctx, par.proj, shortName(par.name, 16), par.color, W, H);
             }
           }
         }
@@ -1279,7 +1282,7 @@ export default function ThreatGlobe({ alerts = EMPTY, satellites = EMPTY, select
         let lx = 10;
         for (let i = 0; i < n; i += 1) {
           const txt = colorMode === 'parent'
-            ? `${String(prep.parents[i]?.name ?? (i === 0 ? 'A' : 'B')).slice(0, 12).toUpperCase()} FRAG`
+            ? `${shortName(prep.parents[i]?.name ?? (i === 0 ? 'A' : 'B'), 14)} FRAG`
             : (colorMode === 'size' ? SIZE_LEGEND : DV_LEGEND)[i];
           ctx.fillStyle = cols[i];
           ctx.fillRect(lx, 79, 6, 6);

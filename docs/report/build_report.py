@@ -991,7 +991,7 @@ def fig_cloud(res, snaps, event):
               (np.asarray(tca["position_b_eci"], float), np.asarray(tca["velocity_b_eci"], float))]
     hs = [np.cross(r, v) / np.linalg.norm(np.cross(r, v)) for r, v in states]
     plane_angle = math.degrees(math.acos(np.clip(abs(hs[0] @ hs[1]), 0, 1)))
-    fig, axes = plt.subplots(2, 3, figsize=(7.2, 4.9))
+    fig, axes = plt.subplots(2, 3, figsize=(7.2, 4.75))
     for k, ((r0, v0), h) in enumerate(zip(states, hs)):
         e1 = r0 / np.linalg.norm(r0)
         e2 = np.cross(h, e1)
@@ -2155,7 +2155,7 @@ def main():
             f"N(≥ 10 cm) = 0.1 · M<super>0.75</super> · 0.1<super>−1.71</super> → {event['total_fragments']} fragments;  "
             "log<sub>10</sub> Δv ~ N(0.9χ + 2.9, 0.4),  χ = log<sub>10</sub>(A/M)"])
     S += figure("17_breakup")
-    S += figure("18_cloud")
+    S += figure("18_cloud", width=TW * 0.78)
     S.append(PageBreak())
     S += figure("19_debris_alerts")
     S += figure("20_cascade")

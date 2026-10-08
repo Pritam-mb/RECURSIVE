@@ -651,7 +651,7 @@ const CesiumGlobe = ({ mode = 'live', alerts = EMPTY, onSatelliteSelect }) => {
     const viewer = viewerRef.current;
     if (!viewerReady || !viewer || viewer.isDestroyed()) return;
     const prims = primitivesRef.current;
-    const { orbitLines, orbitPolyline, orbitMaterial } = prims;
+    const { orbitLines, orbitPolyline } = prims;
     if (!orbitLines || !orbitPolyline) return;
 
     for (const polyline of prims.orbitSegmentPolylines) orbitLines.remove(polyline);
@@ -722,7 +722,8 @@ const CesiumGlobe = ({ mode = 'live', alerts = EMPTY, onSatelliteSelect }) => {
         show: true,
         positions: toPositions(segments[i]),
         width: 1.5,
-        material: orbitMaterial,
+        // Own material: removing a polyline destroys its material.
+        material: Cesium.Material.fromType('Color', { color: COLORS.orbit }),
         arcType: Cesium.ArcType.NONE,
         id: `selected-orbit-${i}`,
       }));
@@ -920,9 +921,15 @@ const CesiumGlobe = ({ mode = 'live', alerts = EMPTY, onSatelliteSelect }) => {
     const viewer = viewerRef.current;
     if (!viewerReady || !viewer || viewer.isDestroyed() || !impactRef.current) return;
     const imp = impactRef.current;
-    imp.setReplay(impactReplay, useStore.getState().satellites);
-    imp.setLayers(useStore.getState().layers);
-    imp.setColorMode(useStore.getState().fragmentColorMode);
+    try {
+      imp.setReplay(impactReplay, useStore.getState().satellites);
+      imp.setLayers(useStore.getState().layers);
+      imp.setColorMode(useStore.getState().fragmentColorMode);
+    } catch (err) {
+      // Never let a bad payload take the globe (or the app) down.
+      console.error('[CesiumGlobe] impact replay', err);
+      try { imp.setReplay(null); } catch { /* ignore */ }
+    }
     viewer.scene.requestRender();
   }, [viewerReady, impactReplay]);
 

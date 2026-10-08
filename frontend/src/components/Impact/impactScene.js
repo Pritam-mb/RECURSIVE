@@ -97,8 +97,10 @@ export default class ImpactScene {
       show: false,
     }));
     this.shockMatrix = new Cesium.Matrix4();
-    this.trailMaterial = Cesium.Material.fromType('Color', { color: col('#f0b429', 0.35) });
-    this.threatMaterial = Cesium.Material.fromType('Color', { color: C.warningSoft });
+    // Polyline._destroy() destroys its material, so materials are never
+    // shared between polylines (same type+uniforms still batch together).
+    this.trailMaterial = () => Cesium.Material.fromType('Color', { color: col('#f0b429', 0.35) });
+    this.threatMaterial = () => Cesium.Material.fromType('Color', { color: C.warningSoft });
 
     this.model = null;
     this.layers = {};
@@ -189,7 +191,7 @@ export default class ImpactScene {
     const stride = trailCount > 0 ? m.F / trailCount : 1;
     for (let n = 0; n < trailCount; n += 1) {
       const f = Math.floor(n * stride);
-      this.trailItems.push({ f, line: this.trailLines.add({ show: false, positions: [], width: 1, arcType: Cesium.ArcType.NONE, material: this.trailMaterial }) });
+      this.trailItems.push({ f, line: this.trailLines.add({ show: false, positions: [], width: 1, arcType: Cesium.ArcType.NONE, material: this.trailMaterial() }) });
     }
 
     for (const th of m.threatened) {
@@ -197,7 +199,7 @@ export default class ImpactScene {
         th,
         dot: this.markPoints.add({ show: false, pixelSize: 6, color: C.warning, outlineColor: C.void, outlineWidth: 1 }),
         ring: this.markPoints.add({ show: false, pixelSize: 18, color: C.clear, outlineColor: C.warning, outlineWidth: 2 }),
-        line: this.threatLines.add({ show: false, positions: [], width: 1, arcType: Cesium.ArcType.NONE, material: this.threatMaterial }),
+        line: this.threatLines.add({ show: false, positions: [], width: 1, arcType: Cesium.ArcType.NONE, material: this.threatMaterial() }),
         label: this.labels.add({
           show: false,
           text: `${th.name}  ${Number.isFinite(th.missKm) ? `${th.missKm < 10 ? th.missKm.toFixed(2) : th.missKm.toFixed(0)} km` : ''}`,

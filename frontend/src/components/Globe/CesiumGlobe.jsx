@@ -593,7 +593,15 @@ const CesiumGlobe = ({ mode = 'live', alerts = EMPTY, onSatelliteSelect }) => {
     }
     if (current.length > 1) segments.push(current);
 
-    const toPositions = (segment) => segment.map((s) => toCartesian3(s.position, new Date(s.epoch_utc)));
+    // Draw the orbit as a closed ring in space: every sample uses the Earth
+    // orientation at the first sample's time. Rotating each sample by its own
+    // time instead traces a ground track that drifts ~25° per revolution, so
+    // the path never joins up with itself.
+    const frameDate = segments.length > 0 ? new Date(segments[0][0].epoch_utc) : null;
+    const toPositions = (segment) => segment.map((s) => toCartesian3(s.position, frameDate));
+    if (segments.length === 1 && segments[0].length > 2) {
+      segments[0] = [...segments[0], segments[0][0]]; // close the loop
+    }
 
     if (segments.length > 0) {
       orbitPolyline.positions = toPositions(segments[0]);
@@ -690,10 +698,16 @@ const CesiumGlobe = ({ mode = 'live', alerts = EMPTY, onSatelliteSelect }) => {
     prims.debrisEntities = [];
 
     viewer.entities.suspendEvents();
+    // The same event can arrive from both the forecast and fragment sources;
+    // label it once so identical tags don't stack on top of each other.
+    const labelled = new Set();
     for (const { cloud, center, radii } of clouds) {
       const date = cloud.tca_utc ? new Date(cloud.tca_utc) : new Date();
       const position = toCartesian3(center, date);
       const outerKm = radii[radii.length - 1];
+      const labelText = `DEBRIS  ${cloud.fragment_count ?? 0} FRAG  R ${outerKm.toFixed(0)} KM`;
+      const showLabel = !labelled.has(labelText);
+      labelled.add(labelText);
 
       // Faint nested shells; innermost slightly denser.
       radii.forEach((radiusKm, index) => {
@@ -719,8 +733,8 @@ const CesiumGlobe = ({ mode = 'live', alerts = EMPTY, onSatelliteSelect }) => {
           outlineColor: COLORS.void,
           outlineWidth: 1,
         },
-        label: {
-          text: `DEBRIS  ${cloud.fragment_count ?? 0} FRAG  R ${outerKm.toFixed(0)} KM`,
+        label: showLabel ? {
+          text: labelText,
           font: SMALL_LABEL_FONT,
           fillColor: COLORS.debrisText,
           style: Cesium.LabelStyle.FILL,
@@ -730,7 +744,7 @@ const CesiumGlobe = ({ mode = 'live', alerts = EMPTY, onSatelliteSelect }) => {
           pixelOffset: new Cesium.Cartesian2(0, -12),
           horizontalOrigin: Cesium.HorizontalOrigin.CENTER,
           verticalOrigin: Cesium.VerticalOrigin.BOTTOM,
-        },
+        } : undefined,
       }));
     }
     viewer.entities.resumeEvents();

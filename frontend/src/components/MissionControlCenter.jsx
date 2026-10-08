@@ -149,13 +149,25 @@ export default function MissionControlCenter({ alerts = [] }) {
           <SysCell label="Ranker" state={rankerState} title={rankerTitle} />
         </div>
         {rankerReview?.degraded ? (
-          <div className="tq-sys-note is-warning">
-            CASCADE RANKER DEGRADED: {rankerReview.degraded_reason || 'primary ranker unavailable'}
+          <div
+            className="tq-sys-note is-warning"
+            title={`Cascade ranker degraded: ${rankerReview.degraded_reason || 'primary ranker unavailable'}`}
+          >
+            <span className="tq-sys-note-tag">Ranker</span>
+            <span className="tq-sys-note-text">
+              Degraded · {rankerReview.degraded_reason || 'primary ranker unavailable'}
+            </span>
           </div>
         ) : rankerReview?.disagreement_count ? (
-          <div className="tq-sys-note is-caution">
-            {rankerReview.disagreement_count} node(s) disputed by the {String(rankerReview.cross_check || 'gnn').toUpperCase()}{' '}
-            cross-check (max Δ {rankerReview.max_disagreement}). GAT scores were used.
+          <div
+            className="tq-sys-note is-caution"
+            title={`${rankerReview.disagreement_count} node(s) disputed by the ${String(rankerReview.cross_check || 'gnn').toUpperCase()} cross-check (max Δ ${rankerReview.max_disagreement}). GAT scores were used.`}
+          >
+            <span className="tq-sys-note-tag">Ranker</span>
+            <span className="tq-sys-note-text">
+              {rankerReview.disagreement_count} disputed by {String(rankerReview.cross_check || 'gnn').toUpperCase()}
+              {' '}· max Δ {Number(rankerReview.max_disagreement ?? 0).toFixed(2)} · using GAT
+            </span>
           </div>
         ) : null}
       </div>

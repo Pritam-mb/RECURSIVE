@@ -64,14 +64,43 @@
 .tq-sys-cell .ui-status.is-warning { color: var(--c-warning); }
 
 .tq-sys-note {
-  padding: var(--s-1) var(--s-3);
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  height: 24px;
+  padding: 0 var(--s-3);
   border-top: 1px solid var(--c-line);
   font-family: var(--font-data);
   font-size: var(--fs-micro);
-  line-height: 1.5;
+  color: var(--c-text-dim);
+  cursor: help;
 }
-.tq-sys-note.is-warning { background: var(--c-warning-soft); }
-.tq-sys-note.is-caution { background: var(--c-caution-soft); }
+/* State shows as a small caps tag; the detail text stays neutral. */
+.tq-sys-note-tag {
+  flex: 0 0 auto;
+  font-family: var(--font-label);
+  font-weight: 600;
+  letter-spacing: var(--track-caps);
+  text-transform: uppercase;
+}
+.tq-sys-note-tag::before {
+  content: '';
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-right: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  vertical-align: 1px;
+}
+.tq-sys-note.is-warning .tq-sys-note-tag { color: var(--c-warning); }
+.tq-sys-note.is-caution .tq-sys-note-tag { color: var(--c-caution); }
+.tq-sys-note-text {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
 
 /* ── Filter tabs ────────────────────────────────────────────────────── */
 .tq-tabs {
@@ -112,6 +141,9 @@
 }
 .tq-colhead {
   flex: 0 0 auto;
+  /* Reserve the same scrollbar gutter as .tq-list so columns line up. */
+  overflow: hidden;
+  scrollbar-gutter: stable;
   padding: 5px var(--s-3) 5px calc(var(--s-3) + 3px);
   border-bottom: 1px solid var(--c-line);
   background: var(--c-panel);
@@ -123,6 +155,7 @@
   flex: 1 1 auto;
   min-height: 0;
   overflow-y: auto;
+  scrollbar-gutter: stable;
 }
 
 .tq-empty {

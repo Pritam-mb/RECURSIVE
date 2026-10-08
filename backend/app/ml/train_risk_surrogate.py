@@ -115,6 +115,15 @@ def sigma_rtn_km(tle_age_hours: np.ndarray) -> np.ndarray:
     return sigma0 + (growth * age_days)
 
 
+def _covariance_recipe_text() -> str:
+    """Model-card description of the label covariance, generated from the live constants."""
+    from app.core.screening import SIGMA0_RTN_KM, SIGMA_GROWTH_RTN_KM_PER_DAY
+
+    return (f"per object diagonal RTN, sigma_RTN = {tuple(SIGMA0_RTN_KM)} km + "
+            f"{tuple(SIGMA_GROWTH_RTN_KM_PER_DAY)} km/day x TLE age (app.core.screening "
+            f"TLE-age model); both objects summed in ECI, projected onto the B-plane")
+
+
 def _unit(v: np.ndarray) -> np.ndarray:
     return v / np.linalg.norm(v, axis=-1, keepdims=True)
 
@@ -513,7 +522,7 @@ def train(sample_count: int = SAMPLE_COUNT, seed: int = SEED, out_dir: Path | No
             "miss_distance_km": "60% loguniform(0.003, 25), 40% loguniform(0.003, 3)",
             "tle_age_h": f"loguniform(0.5, {TLE_AGE_MAX_H:.0f}) per object",
             "hbr_km": "loguniform(0.003, 0.050)",
-            "covariance": "RTN sigma_r=sigma_n=0.05 km, sigma_t=1.0*(1+age_h/24) km per object",
+            "covariance": _covariance_recipe_text(),
             "foster_quadrature": "polar: 20-node Gauss-Legendre radius x 64-node trapezoid angle",
             "target": "log10(max(Pc, 1e-12))",
             "missing_feature_masking": "radial 30%, altitude 30%, both TLE ages 15%",

@@ -180,7 +180,7 @@
     "miss_distance_km": "60% loguniform(0.003, 25), 40% loguniform(0.003, 3)",
     "tle_age_h": "loguniform(0.5, 8760) per object",
     "hbr_km": "loguniform(0.003, 0.050)",
-    "covariance": "RTN sigma_r=sigma_n=0.05 km, sigma_t=1.0*(1+age_h/24) km per object",
+    "covariance": "per object diagonal RTN, sigma_RTN = (0.1, 0.5, 0.15) km + (0.1, 1.0, 0.1) km/day x TLE age (app.core.screening TLE-age model); both objects summed in ECI, projected onto the B-plane",
     "foster_quadrature": "polar: 20-node Gauss-Legendre radius x 64-node trapezoid angle",
     "target": "log10(max(Pc, 1e-12))",
     "missing_feature_masking": "radial 30%, altitude 30%, both TLE ages 15%"

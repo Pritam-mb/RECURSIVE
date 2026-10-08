@@ -1,1 +1,1 @@
-{"_fetched_utc": "2026-10-08T09:49:14.833685+00:00", "_endpoint": "GET /api/simulation/time", "data": {"offset_hours": 0.0, "simulation_time": "2026-10-08T09:49:14.828370+00:00", "real_time": "2026-10-08T09:49:14.828398+00:00"}}
+{"_fetched_utc": "2026-10-08T09:50:33.357365+00:00", "_endpoint": "GET /api/simulation/time", "data": {"offset_hours": 0.0, "simulation_time": "2026-10-08T09:50:33.354448+00:00", "real_time": "2026-10-08T09:50:33.354474+00:00"}}

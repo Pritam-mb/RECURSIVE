@@ -302,6 +302,11 @@ export default class ImpactScene {
       this.dirty = false;
     }
     const animating = this.animate(perf, t);
+    if (import.meta.env.DEV) {
+      // TEMP perf probe (removed after verification)
+      const pr = (window.__impactPerf ||= { frames: 0, ms: 0, renders: 0 });
+      pr.frames += 1; pr.ms += performance.now() - perf; if (changed || animating) pr.renders += 1;
+    }
     return changed || animating;
   }
 

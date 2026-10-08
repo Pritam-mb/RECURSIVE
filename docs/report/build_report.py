@@ -875,7 +875,7 @@ def fig_options(rm, alert):
                   edgecolor=INK, lw=0.5, zorder=4)
         k = seen[round(o["delta_v_ms"], 3)]
         seen[round(o["delta_v_ms"], 3)] += 1
-        a.annotate(f"#{i + 1}", (o["delta_v_ms"], pc), xytext=(7, 6 - 11 * k), textcoords="offset points",
+        a.annotate(f"#{i + 1}", (o["delta_v_ms"], pc), xytext=(7 + 17 * k, -3), textcoords="offset points",
                    fontsize=6.3, weight="bold", color=INK)
     a.axhline(alert["probability_of_collision"], color=BAD, ls="--", lw=0.8)
     a.text(0.02, alert["probability_of_collision"] * 1.8, f"before burn {alert['probability_of_collision']:.1e}",

@@ -175,7 +175,8 @@ export function parseReplay(replay, satellites = []) {
         tcaRel: (tcaMs - collisionMs) / 1000,
         missKm: Number(t.miss_km),
         pc: Number(t.pc),
-        fragIndex: t.fragment_id != null ? fragIndexById.get(String(t.fragment_id)) ?? -1 : -1,
+        fragIndex: fragIndexById.get(String(t.fragment_id))
+          ?? (Number.isInteger(t.fragment_display_index) && t.fragment_display_index < F ? t.fragment_display_index : -1),
         track: trackCache.get(key),
       };
     })

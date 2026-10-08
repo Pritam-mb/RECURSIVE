@@ -13,6 +13,7 @@ import {
   extrapolate,
   observeActivity,
 } from '../utils/motion';
+import { onFlyTo, playheadNow } from './Impact/impactClock';
 
 // Mirrors the design tokens in index.css (canvas can't read CSS vars cheaply).
 const PALETTE = {
@@ -299,7 +300,7 @@ const finiteOr = (v, d) => {
 };
 function bucketOf(v, edges) {
   const n = Number(v);
-  if (v == null || !Number.isFinite(n)) return 2; // unknown → base amber
+  if (v == null || !Number.isFinite(n)) return 0; // unknown → first bin (same as the 3D globe)
   let b = 0;
   while (b < edges.length && n >= edges[b]) b += 1;
   return b;
@@ -573,6 +574,8 @@ export default function ThreatGlobe({ alerts = EMPTY, satellites = EMPTY, select
       lastInteractMs: -Infinity,
       autoBlend: 1,
       resetting: false,
+      // Fly-to target (impact console "fly to impact"): eased in the loop.
+      flying: false, flyLon: 0, flyLat: 0,
     };
     // Pointer state (declared before the loop reads it).
     const pointers = new Map();
@@ -664,7 +667,13 @@ export default function ThreatGlobe({ alerts = EMPTY, satellites = EMPTY, select
         prevTRel = Number.NaN;
         flashStartMs = -Infinity;
       }
-      const tRel = finiteOr(impact?.tRelS, 0);
+      // While playing, the store tRelS is only published at ≤ 10 Hz: use the
+      // shared smooth playhead (Impact/impactClock), clamped to the window.
+      let tRel = finiteOr(impact?.tRelS, 0);
+      if (prep && impact?.playing) {
+        const smooth = playheadNow();
+        if (Number.isFinite(smooth)) tRel = Math.max(prep.t[0], Math.min(prep.t[prep.nS - 1], smooth));
+      }
       if (prep) {
         if (prevTRel < 0 && tRel >= 0) flashStartMs = nowMs; // crossed the collision
         prevTRel = tRel;
@@ -1311,6 +1320,15 @@ export default function ThreatGlobe({ alerts = EMPTY, satellites = EMPTY, select
         if (Math.abs(nav.vLon) < 0.05) nav.vLon = 0;
         if (Math.abs(nav.vLat) < 0.05) nav.vLat = 0;
       }
+      if (nav.flying) {
+        const k = 1 - Math.exp(-5 * dt);
+        const dLon = ((((nav.flyLon - nav.lon) % 360) + 540) % 360) - 180; // shortest way round
+        nav.lon += dLon * k;
+        nav.lat += (nav.flyLat - nav.lat) * k;
+        nav.lastInteractMs = nowMs; // hold the view on the target a while
+        nav.autoBlend = 0;
+        if (Math.abs(dLon) < 0.1 && Math.abs(nav.flyLat - nav.lat) < 0.1) nav.flying = false;
+      }
       if (nav.resetting) {
         const k = 1 - Math.exp(-8 * dt);
         nav.lat += (0 - nav.lat) * k;
@@ -1346,6 +1364,7 @@ export default function ThreatGlobe({ alerts = EMPTY, satellites = EMPTY, select
       nav.lastInteractMs = performance.now();
       nav.autoBlend = 0;
       nav.resetting = false;
+      nav.flying = false;
     };
     const localX = (evt) => evt.clientX - canvas.getBoundingClientRect().left;
     const localY = (evt) => evt.clientY - canvas.getBoundingClientRect().top;
@@ -1457,10 +1476,26 @@ export default function ThreatGlobe({ alerts = EMPTY, satellites = EMPTY, select
     canvas.addEventListener('wheel', onWheel, { passive: false });
     canvas.addEventListener('dblclick', onDblClick);
 
+    // "Fly to impact" from the impact console: turn the collision point to face us.
+    const stopFly = onFlyTo((target) => {
+      const e = target?.eci;
+      if (!Array.isArray(e) || e.length < 3) return;
+      const x = Number(e[0]); const y = Number(e[1]); const z = Number(e[2]);
+      const r = Math.hypot(x, y, z);
+      if (!(r > 0)) return;
+      nav.flyLon = Math.atan2(y, x) * RAD2DEG;
+      nav.flyLat = Math.max(-MAX_TILT_DEG, Math.min(MAX_TILT_DEG, Math.asin(z / r) * RAD2DEG));
+      nav.flying = true;
+      nav.resetting = false;
+      nav.vLon = 0;
+      nav.vLat = 0;
+    });
+
     // Pause when the tab is hidden or the canvas is offscreen.
     const stopActivity = observeActivity(canvas, (active) => (active ? start() : stop()));
 
     return () => {
+      stopFly();
       stopActivity();
       stop();
       ro.disconnect();

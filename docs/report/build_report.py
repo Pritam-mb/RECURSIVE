@@ -989,9 +989,14 @@ def fig_cloud(res, snaps, event):
 
     RE = 6378.137
     r0 = np.asarray(event["tca"]["position_a_eci"], float)
-    rn = r0 / np.linalg.norm(r0)
-    az0 = math.degrees(math.atan2(rn[1], rn[0]))
-    el0 = math.degrees(math.asin(rn[2]))
+    tca = event["tca"]
+    ha = np.cross(r0, np.asarray(tca["velocity_a_eci"], float)); ha /= np.linalg.norm(ha)
+    hb = np.cross(np.asarray(tca["position_b_eci"], float), np.asarray(tca["velocity_b_eci"], float)); hb /= np.linalg.norm(hb)
+    cam = ha + hb
+    cam = cam / np.linalg.norm(cam) if np.linalg.norm(cam) > 1e-6 else ha
+    az0 = math.degrees(math.atan2(cam[1], cam[0]))
+    el0 = math.degrees(math.asin(np.clip(cam[2], -1, 1)))
+    plane_angle = math.degrees(math.acos(np.clip(abs(ha @ hb), -1, 1)))
     u, v = np.mgrid[0:2 * np.pi:36j, 0:np.pi:18j]
     ex, ey, ez = RE * np.cos(u) * np.sin(v), RE * np.sin(u) * np.sin(v), RE * np.cos(v)
     names = [p_["name"][:22] for p_ in event["parents"]]
@@ -999,7 +1004,7 @@ def fig_cloud(res, snaps, event):
     L = 8200.0
     for idx, (t, r) in enumerate(snaps.items()):
         a = fig.add_subplot(1, 3, idx + 1, projection="3d")
-        a.plot_surface(ex, ey, ez, color="#c9daef", alpha=0.35, linewidth=0, shade=True, zorder=0)
+        a.plot_surface(ex, ey, ez, color="#c9daef", alpha=0.25, linewidth=0, shade=True, zorder=0)
         a.plot_wireframe(ex, ey, ez, color="#9fb6d3", linewidth=0.25, rstride=3, cstride=3, alpha=0.6)
         alive = np.linalg.norm(r, axis=1) - RE >= 100
         for k, col in ((0, CAT[0]), (1, CAT[1])):
@@ -1009,20 +1014,16 @@ def fig_cloud(res, snaps, event):
         a.scatter([r0[0]], [r0[1]], [r0[2]], marker="x", color=BAD, s=22, depthshade=False)
         a.set_xlim(-L, L); a.set_ylim(-L, L); a.set_zlim(-L, L)
         a.set_box_aspect((1, 1, 1))
-        a.view_init(elev=el0 + 20, azim=az0 + 35)
+        a.view_init(elev=el0, azim=az0)
         a.set_title(f"+{t} min: {int(alive.sum())} fragments > 100 km", fontsize=7.5, loc="center", pad=0)
-        a.tick_params(labelsize=4.5, pad=0)
-        for axis in (a.xaxis, a.yaxis, a.zaxis):
-            axis.pane.set_alpha(0.0)
-            axis._axinfo["grid"]["color"] = GRID
-        a.set_xlabel("x [km]", fontsize=5.5, labelpad=-8); a.set_ylabel("y [km]", fontsize=5.5, labelpad=-8)
-        a.set_zlabel("z [km]", fontsize=5.5, labelpad=-8)
+        a.set_axis_off()
     fig.legend(loc="lower center", ncol=3, fontsize=6.3, markerscale=4, bbox_to_anchor=(0.5, 0.0))
     fig.subplots_adjust(left=0.0, right=1.0, top=0.93, bottom=0.1, wspace=0.0)
     return save(fig, "18_cloud", "Fragments from the reproduced breakup propagated with app.core.breakup.propagate "
                 "(RK4, two-body + J2 + Vallado drag, Cd·A/M), shown in 3-D ECI/TEME at true scale (equal axes, Earth "
-                "sphere R = 6378 km) for both parents; camera placed above the impact point (×). Fragments below 100 km "
-                "are removed.")
+                "sphere R = 6378 km, axes ±8200 km) for both parents. Camera looks along the bisector of the two "
+                "parents' orbit normals (planes {:.0f}° apart), so both streams appear as tilted rings; × = impact point. "
+                "Fragments below 100 km are removed.".format(plane_angle))
 
 
 def fig_debris_alerts(alerts_deb):

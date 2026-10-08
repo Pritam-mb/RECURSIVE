@@ -650,7 +650,9 @@ const CesiumGlobe = ({ mode = 'live', alerts = EMPTY, onSatelliteSelect }) => {
     for (const hotspot of list) {
       const position = toCartesian3(hotspot.position, new Date(hotspot.tca_utc));
       const score = Number(hotspot.hotspot_score || 0);
-      const radiusM = Number(hotspot.zone_radius_km || 100) * 1000;
+      // No computed zone radius → draw the marker only, never an invented sphere.
+      const radiusKm = Number(hotspot.zone_radius_km);
+      const radiusM = Number.isFinite(radiusKm) && radiusKm > 0 ? radiusKm * 1000 : null;
 
       prims.hotspotPoints.add({
         position,
@@ -659,6 +661,7 @@ const CesiumGlobe = ({ mode = 'live', alerts = EMPTY, onSatelliteSelect }) => {
         outlineColor: COLORS.void,
         outlineWidth: 1,
       });
+      if (radiusM == null) continue;
       prims.hotspotEntities.push(viewer.entities.add({
         position,
         ellipsoid: {

@@ -280,7 +280,7 @@ const ConjunctionPredictor = () => {
             {topAlert && (
               <>
                 <dt>P(collision)</dt>
-                <dd>{(topAlert.p_collision * 100).toFixed(6)}%</dd>
+                <dd>{topAlert.p_collision == null ? '—' : `${(topAlert.p_collision * 100).toFixed(6)}%`}</dd>
                 <dt>CPI</dt>
                 <dd className={severityClass(topAlert.severity)}>
                   {topAlert.cpi_score?.toFixed(1)} ({topAlert.severity})

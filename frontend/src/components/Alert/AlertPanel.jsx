@@ -69,7 +69,7 @@ export default function AlertPanel() {
                   (sat) => sat.norad_id === alert.sat1?.id || sat.norad_id === alert.sat2?.id,
                 ),
               );
-              const zoneRadiusKm = Number(alert.zone_radius_km || 100);
+              const zoneRadiusKm = alert.zone_radius_km == null ? null : Number(alert.zone_radius_km);
               const affectedSatellites = relatedCloud?.affected_satellites || [];
               const collisionHours = Number(alert.tca_hours ?? (Number(alert.tca_minutes || 0) / 60.0));
               const collisionTime = formatUtc(alert.tca_utc);
@@ -117,7 +117,7 @@ export default function AlertPanel() {
                         : '---'}
                     </dd>
                     <dt>Wave</dt>
-                    <dd>Hotspot zone radius {zoneRadiusKm.toFixed(0)} km</dd>
+                    <dd>Hotspot zone radius {Number.isFinite(zoneRadiusKm) ? `${zoneRadiusKm.toFixed(0)} km` : '—'}</dd>
                     <dt>Action</dt>
                     <dd>Move the affected satellite(s) to fallback trajectory before {fallbackDeadline}</dd>
                     <dt>Risk</dt>
@@ -200,7 +200,7 @@ export default function AlertPanel() {
                 <div key={`${hotspot.sat1?.id}-${hotspot.sat2?.id}-${index}`} className="sim-dl-group">
                   <dt>{hotspot.sat1?.name || 'SAT-1'} × {hotspot.sat2?.name || 'SAT-2'}</dt>
                   <dd>
-                    {Number(hotspot.hotspot_score || 0).toFixed(2)} | T{Number(hotspot.tca_minutes || 0).toFixed(0)}m | R{Number(hotspot.zone_radius_km || 100).toFixed(0)}km
+                    {hotspot.hotspot_score == null ? '—' : Number(hotspot.hotspot_score).toFixed(2)} | T{hotspot.tca_minutes == null ? '—' : `${Number(hotspot.tca_minutes).toFixed(0)}m`} | R{hotspot.zone_radius_km == null ? '—' : `${Number(hotspot.zone_radius_km).toFixed(0)}km`}
                   </dd>
                 </div>
               ))}

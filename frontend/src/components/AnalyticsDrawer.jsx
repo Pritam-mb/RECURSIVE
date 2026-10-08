@@ -480,7 +480,8 @@ function PhysicsValidation({ res, loading }) {
                   <td className="num">{sig(c?.our_value)}</td>
                   <td className="num">{sig(c?.reference_value)}</td>
                   <td className="num">{sig(c?.abs_error, 3)}</td>
-                  <td className="num">{num(c?.rel_error) == null ? DASH : `${(num(c.rel_error) * 100).toPrecision(3)}%`}</td>
+                  <td className="num">{num(c?.rel_error) == null || num(c?.reference_value) === 0 || Math.abs(num(c.rel_error)) > 1e6
+                    ? DASH : `${(num(c.rel_error) * 100).toPrecision(3)}%`}</td>
                   <td className="num">{sig(c?.tolerance, 3)}</td>
                   <td>
                     {c?.pass === true ? <span className="ax-chip is-pass">PASS</span>

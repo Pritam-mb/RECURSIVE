@@ -133,6 +133,7 @@ function freshPrimitives() {
     hotspotKey: null,
     debrisEntities: [],
     debrisPoints: null,
+    debrisLabels: [],
     debrisKey: null,
     focusedItem: null,
     map: new Map(),
@@ -778,6 +779,8 @@ const CesiumGlobe = ({ mode = 'live', alerts = EMPTY, onSatelliteSelect }) => {
     for (const entity of prims.debrisEntities) viewer.entities.remove(entity);
     prims.debrisEntities = [];
     if (prims.debrisPoints) prims.debrisPoints.removeAll();
+    if (prims.labels) for (const l of prims.debrisLabels) prims.labels.remove(l);
+    prims.debrisLabels = [];
 
     viewer.entities.suspendEvents();
     // The same event can arrive from both the forecast and fragment sources;
@@ -817,15 +820,18 @@ const CesiumGlobe = ({ mode = 'live', alerts = EMPTY, onSatelliteSelect }) => {
         }));
       });
 
-      prims.debrisEntities.push(viewer.entities.add({
+      prims.debrisPoints?.add({
         position,
-        point: {
-          pixelSize: 6,
-          color: COLORS.debrisCore,
-          outlineColor: COLORS.void,
-          outlineWidth: 1,
-        },
-        label: showLabel ? {
+        pixelSize: 6,
+        color: COLORS.debrisCore,
+        outlineColor: COLORS.void,
+        outlineWidth: 1,
+      });
+      // In the shared LabelCollection (drawn after the satellite billboards)
+      // so dots don't paint over the tag; still depth-tested against the globe.
+      if (showLabel && prims.labels) {
+        prims.debrisLabels.push(prims.labels.add({
+          position,
           text: label,
           font: SMALL_LABEL_FONT,
           fillColor: COLORS.debrisText,
@@ -836,8 +842,8 @@ const CesiumGlobe = ({ mode = 'live', alerts = EMPTY, onSatelliteSelect }) => {
           pixelOffset: new Cesium.Cartesian2(0, -12),
           horizontalOrigin: Cesium.HorizontalOrigin.CENTER,
           verticalOrigin: Cesium.VerticalOrigin.BOTTOM,
-        } : undefined,
-      }));
+        }));
+      }
     }
     viewer.entities.resumeEvents();
     viewer.scene.requestRender();

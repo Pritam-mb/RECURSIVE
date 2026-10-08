@@ -1,10 +1,20 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useMemo, useCallback } from 'react';
 import ThreatCard from './ThreatCard';
+import { severityLabel } from '../utils/severity';
 import useStore from '../store/useStore';
 import { apiPost, apiDelete } from '../utils/api';
 import { markEdgeResolved } from '../utils/cascadeGraph';
+import '../styles/threats.css';
 
 const TABS = ['ALL', 'CRITICAL', 'WARNING', 'WATCH'];
+
+function SysCell({ label, state, title }) {
+  return (
+    <div className="tq-sys-cell" title={title}>
+      <span className={`ui-status is-${state}`}>{label}</span>
+    </div>
+  );
+}
 
 export default function MissionControlCenter({ alerts = [] }) {
   const [activeTab, setActiveTab] = useState('ALL');
@@ -15,21 +25,22 @@ export default function MissionControlCenter({ alerts = [] }) {
   const cascadeGraph = useStore((s) => s.cascadeGraph);
   const rankerReview = useStore((s) => s.rankerReview);
 
-  const filteredAlerts = alerts
-    .filter((a) => {
-      if (activeTab === 'ALL') return true;
-      const cpi = Number(a.cpi_score ?? 0);
-      if (activeTab === 'CRITICAL') return cpi >= 8 || a.severity?.toUpperCase() === 'CRITICAL';
-      if (activeTab === 'WARNING') return (cpi >= 5 && cpi < 8) || a.severity?.toUpperCase() === 'WARNING';
-      if (activeTab === 'WATCH') return cpi < 5 && a.severity?.toUpperCase() !== 'CRITICAL' && a.severity?.toUpperCase() !== 'WARNING';
-      return true;
-    })
-    .sort((a, b) => Number(b.cpi_score ?? 0) - Number(a.cpi_score ?? 0));
+  const filteredAlerts = useMemo(
+    () =>
+      alerts
+        .filter((a) => {
+          if (activeTab === 'ALL') return true;
+          return severityLabel(a) === activeTab;
+        })
+        .sort((a, b) => Number(b.cpi_score ?? 0) - Number(a.cpi_score ?? 0)),
+    [alerts, activeTab]
+  );
 
   // System status indicators
   const pipeline = wsConnected;
-  const mlTrained = (modelMetrics?.classification_models ?? []).some(
-    (m) => (m.metrics?.samples ?? 0) > 0
+  const mlTrained = useMemo(
+    () => (modelMetrics?.classification_models ?? []).some((m) => (m.metrics?.samples ?? 0) > 0),
+    [modelMetrics]
   );
   // Physics health reflects whether a physics engine is actually reporting, not
   // a hardcoded true. "unknown" until a signal is observed.
@@ -74,12 +85,16 @@ export default function MissionControlCenter({ alerts = [] }) {
     }
   };
 
-  const handleDecision = (decision, alert) => {
-    if (decision === 'APPROVE' || decision === 'MODIFY') {
-      const alertId = alert.id ?? `${alert.sat1?.id}-${alert.sat2?.id}`;
-      setCascadeGraph(markEdgeResolved(cascadeGraph, alertId));
-    }
-  };
+  // Stable across the per-second re-renders so memoized ThreatCards can skip work.
+  const handleDecision = useCallback(
+    (decision, alert) => {
+      if (decision === 'APPROVE' || decision === 'MODIFY') {
+        const alertId = alert.id ?? `${alert.sat1?.id}-${alert.sat2?.id}`;
+        setCascadeGraph(markEdgeResolved(cascadeGraph, alertId));
+      }
+    },
+    [cascadeGraph, setCascadeGraph]
+  );
 
   const handleLoadCascadeDemo = () =>
     runAction('demo', 'Load Cascade Demo', () =>
@@ -97,127 +112,115 @@ export default function MissionControlCenter({ alerts = [] }) {
   const handleResetTime = () =>
     runAction('reset', 'Reset Time', () => apiPost('/api/simulation/reset', {}));
 
+  const backendState = wsConnected ? 'nominal' : 'warning';
+  const pipelineState = pipeline ? 'nominal' : 'warning';
+  const mlState = mlTrained ? 'nominal' : 'caution';
+  const physicsState = physicsOk === true ? 'nominal' : physicsOk === false ? 'warning' : 'caution';
+  const rankerState = rankerReview?.degraded ? 'warning' : rankerReview?.disagreement_count ? 'caution' : 'nominal';
+  const rankerTitle = rankerReview?.degraded
+    ? rankerReview.degraded_reason || 'Primary cascade ranker unavailable'
+    : `Primary ${(rankerReview?.primary || 'gat').toUpperCase()}, cross-check ${(rankerReview?.cross_check || 'gnn').toUpperCase()}` +
+      (rankerReview?.disagreement_count
+        ? ` — ${rankerReview.disagreement_count} disputed (max Δ ${rankerReview.max_disagreement})`
+        : ' — no disputed nodes');
+
+  const sysStates = [backendState, pipelineState, mlState, physicsState, rankerState];
+  const overall = sysStates.includes('warning') ? 'warning' : sysStates.includes('caution') ? 'caution' : 'nominal';
+  const overallLabel = overall === 'warning' ? 'Sys fault' : overall === 'caution' ? 'Sys degraded' : 'Sys nominal';
+
   return (
-    <div className="mcc-column">
-      {/* Section 1: System status */}
-      <div className="mcc-section">
-        <div className="mcc-section-header">
-          <span className="mcc-section-title">System Status</span>
-        </div>
-        <div className="sys-status-row">
-          <div className="sys-indicator">
-            <div className={`sys-indicator-dot ${wsConnected ? 'green' : 'red'}`} />
-            <div className="sys-indicator-label">BACKEND</div>
-          </div>
-          <div className="sys-indicator">
-            <div className={`sys-indicator-dot ${pipeline ? 'green' : 'red'}`} />
-            <div className="sys-indicator-label">PIPELINE</div>
-          </div>
-          <div className="sys-indicator">
-            <div className={`sys-indicator-dot ${mlTrained ? 'green' : 'amber'}`} />
-            <div className="sys-indicator-label">ML</div>
-          </div>
-          <div className="sys-indicator">
-            <div className={`sys-indicator-dot ${physicsOk === true ? 'green' : physicsOk === false ? 'red' : 'amber'}`} />
-            <div className="sys-indicator-label">PHYSICS</div>
-          </div>
-          <div
-            className="sys-indicator"
-            title={
-              rankerReview?.degraded
-                ? rankerReview.degraded_reason || 'Primary cascade ranker unavailable'
-                : `Primary ${(rankerReview?.primary || 'gat').toUpperCase()}, cross-check ${(rankerReview?.cross_check || 'gnn').toUpperCase()}` +
-                  (rankerReview?.disagreement_count
-                    ? ` — ${rankerReview.disagreement_count} disputed (max Δ ${rankerReview.max_disagreement})`
-                    : ' — no disputed nodes')
-            }
-          >
-            <div
-              className={`sys-indicator-dot ${
-                rankerReview?.degraded ? 'red' : rankerReview?.disagreement_count ? 'amber' : 'green'
-              }`}
-            />
-            <div className="sys-indicator-label">RANKER</div>
-          </div>
+    <section className="tq-root" aria-label="Conjunction queue">
+      {/* Panel header */}
+      <header className="tq-header">
+        <span className="ui-label tq-title">Conjunction Queue</span>
+        <span className={`tq-count ${alerts.length > 0 ? 'is-active' : ''}`}>
+          {String(alerts.length).padStart(2, '0')} ACTIVE
+        </span>
+        <span className={`ui-status tq-header-status is-${overall}`}>{overallLabel}</span>
+      </header>
+
+      {/* System status */}
+      <div className="tq-sys">
+        <div className="tq-sys-row">
+          <SysCell label="Backend" state={backendState} />
+          <SysCell label="Pipeline" state={pipelineState} />
+          <SysCell label="ML" state={mlState} />
+          <SysCell label="Physics" state={physicsState} />
+          <SysCell label="Ranker" state={rankerState} title={rankerTitle} />
         </div>
         {rankerReview?.degraded ? (
-          <div className="sys-status-note" style={{ color: 'var(--alert-red)' }}>
+          <div className="tq-sys-note is-warning">
             CASCADE RANKER DEGRADED: {rankerReview.degraded_reason || 'primary ranker unavailable'}
           </div>
         ) : rankerReview?.disagreement_count ? (
-          <div className="sys-status-note" style={{ color: 'var(--alert-amber, #f5a623)' }}>
+          <div className="tq-sys-note is-caution">
             {rankerReview.disagreement_count} node(s) disputed by the {String(rankerReview.cross_check || 'gnn').toUpperCase()}{' '}
             cross-check (max Δ {rankerReview.max_disagreement}). GAT scores were used.
           </div>
         ) : null}
       </div>
 
-      {/* Section 2: Threat Queue */}
-      <div className="threat-queue">
-        <div className="mcc-section-header">
-          <span className="mcc-section-title">
-            Threat Queue
-          </span>
-          <span style={{ fontFamily: 'var(--mono)', fontSize: 10, color: alerts.length > 0 ? 'var(--alert-red)' : 'var(--text-dim)' }}>
-            {alerts.length} ACTIVE
-          </span>
-        </div>
-
-        {/* Filter tabs */}
-        <div className="threat-filter-tabs">
-          {TABS.map((tab) => (
-            <button
-              key={tab}
-              type="button"
-              className={`threat-tab ${activeTab === tab ? 'active' : ''}`}
-              onClick={() => setActiveTab(tab)}
-            >
-              {tab}
-            </button>
-          ))}
-        </div>
-
-        {/* Cards */}
-        <div className="threat-cards-list">
-          {filteredAlerts.length === 0 ? (
-            <div className="threat-empty">
-              {activeTab === 'ALL'
-                ? 'No active conjunction alerts'
-                : `No ${activeTab} alerts`}
-            </div>
-          ) : (
-            filteredAlerts.map((alert) => (
-              <ThreatCard
-                key={alert.id ?? `${alert.sat1?.id}-${alert.sat2?.id}`}
-                alert={alert}
-                isSelected={selectedAlertId === alert.id}
-                onDecision={handleDecision}
-              />
-            ))
-          )}
-        </div>
+      {/* Filter tabs */}
+      <div className="tq-tabs" role="tablist">
+        {TABS.map((tab) => (
+          <button
+            key={tab}
+            type="button"
+            role="tab"
+            aria-selected={activeTab === tab}
+            className={`tq-tab ${activeTab === tab ? 'is-active' : ''}`}
+            onClick={() => setActiveTab(tab)}
+          >
+            {tab}
+          </button>
+        ))}
       </div>
 
-      {/* Section 3: Quick Actions */}
-      <div className="quick-actions">
-        <button type="button" className="qa-btn" disabled={busyAction !== null} onClick={handleLoadCascadeDemo}>
-          ▶ Load Cascade Demo
-        </button>
-        <button type="button" className="qa-btn" disabled={busyAction !== null} onClick={handleSimulateCollision}>
-          ● Simulate Collision
-        </button>
-        <button type="button" className="qa-btn" disabled={busyAction !== null} onClick={handleClearDebris}>
-          ✕ Clear Debris
-        </button>
-        <button type="button" className="qa-btn" disabled={busyAction !== null} onClick={handleResetTime}>
-          ↺ Reset Time
-        </button>
-        {actionError && (
-          <div className="error-banner" style={{ marginTop: 6 }}>
-            {actionError}
+      {/* Column header (aligns with each row's metric line) */}
+      <div className="tq-colhead" aria-hidden="true">
+        <span className="ui-label">TCA</span>
+        <span className="ui-label tq-num">Miss km</span>
+        <span className="ui-label tq-num">Pc</span>
+        <span className="ui-label tq-num">Casc</span>
+        <span className="ui-label tq-num">CPI</span>
+      </div>
+
+      {/* Rows */}
+      <div className="tq-list">
+        {filteredAlerts.length === 0 ? (
+          <div className="tq-empty">
+            {activeTab === 'ALL' ? 'No active conjunction alerts' : `No ${activeTab} alerts`}
           </div>
+        ) : (
+          filteredAlerts.map((alert) => (
+            <ThreatCard
+              key={alert.id ?? `${alert.sat1?.id}-${alert.sat2?.id}`}
+              alert={alert}
+              isSelected={selectedAlertId === alert.id}
+              onDecision={handleDecision}
+            />
+          ))
         )}
       </div>
-    </div>
+
+      {/* Quick actions */}
+      <div className="tq-footer">
+        <div className="tq-footer-grid">
+          <button type="button" className="ui-btn" disabled={busyAction !== null} onClick={handleLoadCascadeDemo}>
+            Load Cascade Demo
+          </button>
+          <button type="button" className="ui-btn" disabled={busyAction !== null} onClick={handleSimulateCollision}>
+            Simulate Collision
+          </button>
+          <button type="button" className="ui-btn" disabled={busyAction !== null} onClick={handleClearDebris}>
+            Clear Debris
+          </button>
+          <button type="button" className="ui-btn" disabled={busyAction !== null} onClick={handleResetTime}>
+            Reset Time
+          </button>
+        </div>
+        {actionError && <div className="tq-error" role="alert">{actionError}</div>}
+      </div>
+    </section>
   );
 }

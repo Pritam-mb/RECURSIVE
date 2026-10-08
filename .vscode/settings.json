@@ -1,0 +1,37 @@
+{
+  // Keep VS Code light: don't watch/index/search build output, deps, caches or big data files.
+  "files.watcherExclude": {
+    "**/node_modules/**": true,
+    "**/dist/**": true,
+    "**/.vite/**": true,
+    "**/__pycache__/**": true,
+    "**/.pytest_cache/**": true,
+    "**/.venv/**": true,
+    "**/venv/**": true,
+    "**/backend/app/ml/artifacts/**": true,
+    "**/backend/app/simulation/tle-data.txt": true,
+    "**/.git/objects/**": true
+  },
+  "search.exclude": {
+    "**/node_modules": true,
+    "**/dist": true,
+    "**/__pycache__": true,
+    "**/backend/app/ml/artifacts": true,
+    "**/backend/app/simulation/tle-data.txt": true,
+    "**/package-lock.json": true
+  },
+  "files.exclude": {
+    "**/__pycache__": true,
+    "**/.pytest_cache": true
+  },
+  "python.analysis.exclude": [
+    "**/node_modules",
+    "**/dist",
+    "**/__pycache__",
+    "**/backend/app/ml/artifacts",
+    "frontend"
+  ],
+  "python.analysis.indexing": false,
+  "typescript.tsserver.maxTsServerMemory": 2048,
+  "editor.largeFileOptimizations": true
+}

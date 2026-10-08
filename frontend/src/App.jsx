@@ -13,6 +13,7 @@ import MetricsDrawer from './components/MetricsDrawer';
 import useStore from './store/useStore';
 import { buildCascadeGraph } from './utils/cascadeGraph';
 import './App.css';
+import './styles/shell.css';
 
 const wsBaseUrl = (window.location.origin || '').replace(/^http/, 'ws');
 const alertPollMs = 30000;
@@ -20,13 +21,8 @@ const heartbeatPollMs = 20000;
 
 function GlobeLoader() {
   return (
-    <div style={{
-      width: '100%', height: '100%', background: '#000',
-      display: 'flex', alignItems: 'center', justifyContent: 'center',
-    }}>
-      <span style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-dim)', letterSpacing: 2 }}>
-        LOADING GLOBE…
-      </span>
+    <div className="sh-globe-loader">
+      <span className="ui-label">Loading globe</span>
     </div>
   );
 }
@@ -190,52 +186,72 @@ function App() {
   }, [alerts, setCascadeGraph]);
 
   return (
-    <div className="mission-control">
-      {/* Offline banner (fixed, above everything) */}
+    <div className="sh-app">
+      {/* Offline banner (fixed, under the header) */}
       <ConnectionBanner />
 
-      {/* Row 1: Header (48px) */}
+      {/* Row 1: Header / status bar */}
       <Header />
 
-      {/* Row 2: Dual globe + mission control center */}
-      <div className="main-grid">
-        <div className="live-globe-panel">
-          <div className="panel-label">LIVE CATALOG</div>
-          <Suspense fallback={<GlobeLoader />}>
-            <CesiumGlobe
-              mode="live"
-              satellites={satellites}
+      {/* Row 2: Live globe | mission control center | threat globe */}
+      <div className="sh-main">
+        <section className="sh-globe" aria-label="Live catalog globe">
+          <div className="sh-globe-viewport">
+            <Suspense fallback={<GlobeLoader />}>
+              <CesiumGlobe
+                mode="live"
+                satellites={satellites}
+                alerts={alerts}
+                selectedSatId={selectedSatelliteId}
+                onSatelliteSelect={setSelectedSatelliteId}
+                agencyFilter={agencyFilter}
+              />
+            </Suspense>
+          </div>
+          <span className="sh-globe-label">
+            <span className="ui-label">Live Catalog</span>
+            <span className="sh-globe-label-meta">{satellites.length} OBJ</span>
+          </span>
+        </section>
+
+        <div className="sh-cell sh-cell--fixed">
+          <MissionControlCenter alerts={alerts} />
+        </div>
+
+        <section className="sh-globe" aria-label="Threat analysis globe">
+          <div className="sh-globe-viewport">
+            <ThreatGlobe
               alerts={alerts}
+              satellites={satellites}
               selectedSatId={selectedSatelliteId}
-              onSatelliteSelect={setSelectedSatelliteId}
-              agencyFilter={agencyFilter}
             />
-          </Suspense>
-        </div>
-
-        <MissionControlCenter alerts={alerts} />
-
-        <div className="threat-globe-panel">
-          <div className="panel-label">THREAT ANALYSIS</div>
-          <ThreatGlobe
-            alerts={alerts}
-            satellites={satellites}
-            selectedSatId={selectedSatelliteId}
-          />
-        </div>
+          </div>
+          <span className="sh-globe-label">
+            <span className="ui-label">Threat Analysis</span>
+            <span className="sh-globe-label-meta">{alerts.length} CONJ</span>
+          </span>
+        </section>
       </div>
 
-      {/* Row 3: Telemetry strip (72px) */}
-      <TelemetryStrip selectedSatId={selectedSatelliteId} />
+      {/* Row 3: Telemetry strip */}
+      <div className="sh-cell">
+        <TelemetryStrip selectedSatId={selectedSatelliteId} />
+      </div>
 
       {/* Row 4: Bottom three panels */}
-      <div className="bottom-grid">
-        <UplinkDownlinkV2 selectedSatId={selectedSatelliteId} />
-        <CascadeDiagram graph={cascadeGraph} />
-        <ModelStatusV2 />
+      <div className="sh-bottom">
+        <div className="sh-cell">
+          <UplinkDownlinkV2 selectedSatId={selectedSatelliteId} />
+        </div>
+        <div className="sh-cell">
+          <CascadeDiagram graph={cascadeGraph} />
+        </div>
+        <div className="sh-cell">
+          <ModelStatusV2 />
+        </div>
       </div>
 
-      {/* Preserved floating drawers (simulation & metrics controls) */}
+      {/* Floating side sheets (toggled from the header) */}
       <MetricsDrawer />
       <SimulationDrawer />
     </div>

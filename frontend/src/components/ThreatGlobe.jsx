@@ -1,12 +1,40 @@
-import { useRef, useEffect, useCallback } from 'react';
+import { useRef, useEffect, useMemo } from 'react';
 import useTestMode from '../hooks/useTestMode';
 import useStore from '../store/useStore';
+import {
+  CORRECTION_DECAY_S,
+  MAX_EXTRAPOLATION_S,
+  correctionFor,
+  estimateSimRate,
+  extrapolate,
+  observeActivity,
+} from '../utils/motion';
+
+// Mirrors the design tokens in index.css (canvas can't read CSS vars cheaply).
+const PALETTE = {
+  void: '#030508',
+  sphere: '#070a0e',
+  line: '#1a212b',
+  lineStrong: '#27303c',
+  text: '#c3cbd5',
+  dim: '#6b7685',
+  bright: '#eef2f6',
+  accent: '#4c8dff',
+  info: '#7cc4ff',
+  nominal: '#3ccf7a',
+  caution: '#f0b429',
+  warning: '#ff5a4f',
+};
+const MONO_9 = "500 9px 'IBM Plex Mono', ui-monospace, Consolas, monospace";
+const CAPS_10 = "600 10px 'Barlow Semi Condensed', 'Barlow', 'Segoe UI', sans-serif";
 
 const TWO_PI = Math.PI * 2;
 const DEG = Math.PI / 180;
-// ... (rest of COAST_LINES definition unchanged)
-// Let's keep from eciToLatLon to ThreatGlobe component
-
+const FRAME_INTERVAL_MS = 1000 / 30;
+const MAX_DPR = 1.5;
+const ROTATION_DEG_PER_S = 4.8;
+const MAX_CONJUNCTION_LABELS = 3;
+const EMPTY = [];
 
 // Simplified coastline data as lat/lon polylines (very compressed)
 // Each sub-array is a connected polyline [[lat,lon],...]
@@ -25,493 +53,522 @@ const COAST_LINES = [
   [[-14,130],[-13,136],[-12,136],[-12,135],[-14,130],[-15,129],[-16,123],[-22,114],[-31,115],[-35,117],[-35,118],[-38,140],[-39,144],[-37,147],[-37,150],[-33,152],[-28,153],[-24,152],[-22,150],[-19,147],[-18,147],[-17,146],[-16,145],[-14,144],[-11,143],[-12,142],[-12,136],[-12,132],[-14,130]],
 ];
 
-/**
- * Convert ECI x,y,z (km) to latitude/longitude (degrees).
- * Treats ECI ≈ ECEF for visualization purposes (acceptable since we only
- * care about approximate globe positions, not precise ground tracks).
- */
-function eciToLatLon(x, y, z) {
-  const r = Math.sqrt(x * x + y * y + z * z);
-  if (r < 1) return null;
-  const lat = Math.asin(Math.max(-1, Math.min(1, z / r))) / DEG;
-  const lon = Math.atan2(y, x) / DEG;
-  return { lat, lon };
+// ── Precomputed geometry ──────────────────────────────────────────────────
+// Everything is stored as unit vectors so per-frame projection is a few
+// multiplies (no trig, no allocation).
+
+function latLonToUnit(lat, lon, out, i) {
+  const phi = lat * DEG;
+  const lam = lon * DEG;
+  const c = Math.cos(phi);
+  out[i] = c * Math.cos(lam);
+  out[i + 1] = c * Math.sin(lam);
+  out[i + 2] = Math.sin(phi);
 }
 
-/**
- * Orthographic projection.
- * viewLon: the longitude (deg) currently centred in the view.
- * Returns { sx, sy, visible } in canvas pixel space.
- */
-function orthoProject(lat, lon, viewLon, cx, cy, R) {
-  const φ = lat * DEG;
-  const λ = (lon - viewLon) * DEG;
-
-  const x = Math.cos(φ) * Math.sin(λ);
-  const y = Math.sin(φ);
-  const z = Math.cos(φ) * Math.cos(λ); // depth component
-
-  return {
-    sx: cx + x * R,
-    sy: cy - y * R,
-    visible: z >= -0.15, // include slightly past the limb for smooth appearance
-    depth: z,
-  };
+function toUnitPolyline(points) {
+  const arr = new Float32Array(points.length * 3);
+  points.forEach(([lat, lon], k) => latLonToUnit(lat, lon, arr, k * 3));
+  return arr;
 }
 
-function drawCoastlines(ctx, viewLon, cx, cy, R) {
-  ctx.strokeStyle = 'rgba(100,140,100,0.35)';
-  ctx.lineWidth = 0.7;
-  for (const line of COAST_LINES) {
-    ctx.beginPath();
-    let penDown = false;
-    for (const [lat, lon] of line) {
-      const p = orthoProject(lat, lon, viewLon, cx, cy, R);
-      if (!p.visible) { penDown = false; continue; }
-      if (!penDown) { ctx.moveTo(p.sx, p.sy); penDown = true; }
-      else ctx.lineTo(p.sx, p.sy);
-    }
-    ctx.stroke();
-  }
-}
+const COAST_UNIT = COAST_LINES.map(toUnitPolyline);
 
-function drawGrid(ctx, viewLon, cx, cy, R) {
-  ctx.strokeStyle = 'rgba(255,255,255,0.06)';
-  ctx.lineWidth = 0.5;
-  // Latitude lines every 30°
+const GRID_UNIT = (() => {
+  const lines = [];
   for (let lat = -60; lat <= 60; lat += 30) {
-    ctx.beginPath();
-    let penDown = false;
-    for (let lon = -180; lon <= 180; lon += 3) {
-      const p = orthoProject(lat, lon, viewLon, cx, cy, R);
-      if (!p.visible) { penDown = false; continue; }
-      if (!penDown) { ctx.moveTo(p.sx, p.sy); penDown = true; }
-      else ctx.lineTo(p.sx, p.sy);
-    }
-    ctx.stroke();
+    const pts = [];
+    for (let lon = -180; lon <= 180; lon += 4) pts.push([lat, lon]);
+    lines.push(toUnitPolyline(pts));
   }
-  // Longitude lines every 30°
   for (let lon = 0; lon < 360; lon += 30) {
-    ctx.beginPath();
-    let penDown = false;
-    for (let lat = -90; lat <= 90; lat += 3) {
-      const p = orthoProject(lat, lon, viewLon, cx, cy, R);
-      if (!p.visible) { penDown = false; continue; }
-      if (!penDown) { ctx.moveTo(p.sx, p.sy); penDown = true; }
-      else ctx.lineTo(p.sx, p.sy);
-    }
-    ctx.stroke();
+    const pts = [];
+    for (let lat = -90; lat <= 90; lat += 4) pts.push([lat, lon]);
+    lines.push(toUnitPolyline(pts));
   }
+  return lines;
+})();
+
+/**
+ * Orthographic view state for one frame. Rotating the globe is a rotation
+ * about the polar axis, so a unit vector (ux, uy, uz) projects to
+ *   sx = cx + (uy·cosV − ux·sinV)·R,  sy = cy − uz·R,  depth = ux·cosV + uy·sinV
+ */
+const view = { cx: 0, cy: 0, R: 1, cosV: 1, sinV: 0 };
+
+function strokeUnitPolylines(ctx, lines) {
+  const { cx, cy, R, cosV, sinV } = view;
+  ctx.beginPath();
+  for (const arr of lines) {
+    let penDown = false;
+    for (let i = 0; i < arr.length; i += 3) {
+      const ux = arr[i];
+      const uy = arr[i + 1];
+      if ((ux * cosV) + (uy * sinV) < 0) { penDown = false; continue; }
+      const sx = cx + (((uy * cosV) - (ux * sinV)) * R);
+      const sy = cy - (arr[i + 2] * R);
+      if (penDown) ctx.lineTo(sx, sy);
+      else { ctx.moveTo(sx, sy); penDown = true; }
+    }
+  }
+  ctx.stroke();
 }
 
-function satColor(cpi) {
-  if (cpi >= 8) return { fill: '#ef4444', glow: 'rgba(239,68,68,0.3)' };
-  if (cpi >= 5) return { fill: '#eab308', glow: 'rgba(234,179,8,0.3)' };
-  return { fill: '#4a90d9', glow: 'rgba(74,144,217,0.2)' };
+/** Projects an ECI km vector (≈ earth-fixed for display) into `out`. */
+function projectEci(x, y, z, out) {
+  const r = Math.sqrt((x * x) + (y * y) + (z * z));
+  if (!(r > 1)) { out.visible = false; return out; }
+  const ux = x / r;
+  const uy = y / r;
+  const { cx, cy, R, cosV, sinV } = view;
+  out.sx = cx + (((uy * cosV) - (ux * sinV)) * R);
+  out.sy = cy - ((z / r) * R);
+  out.visible = (ux * cosV) + (uy * sinV) >= 0;
+  return out;
 }
 
-export default function ThreatGlobe({ alerts = [], satellites = [], selectedSatId }) {
+function threatColor(cpi) {
+  if (cpi >= 8) return PALETTE.warning;
+  if (cpi >= 5) return PALETTE.caution;
+  return null;
+}
+
+function formatMiss(km) {
+  if (!(km > 0)) return '';
+  return km < 1 ? `${(km * 1000).toFixed(0)} M` : `${km.toFixed(1)} KM`;
+}
+
+function formatTca(alert) {
+  if (alert.tca_utc) return `TCA ${alert.tca_utc.slice(11, 16)}Z`;
+  const h = Number(alert.tca_hours ?? 0);
+  return h > 0 ? `T-${h.toFixed(1)}H` : '';
+}
+
+/** Greedy label placement: reserves and returns true if the box is free. */
+function reserve(placed, x, y, w, h) {
+  for (let i = 0; i < placed.length; i += 4) {
+    if (x < placed[i] + placed[i + 2] && x + w > placed[i]
+      && y < placed[i + 1] + placed[i + 3] && y + h > placed[i + 1]) return false;
+  }
+  placed.push(x, y, w, h);
+  return true;
+}
+
+/** Solid dark tag with a 1px hairline border; text vertically centred. */
+function drawTag(ctx, x, y, w, h, text, color) {
+  ctx.fillStyle = PALETTE.void;
+  ctx.fillRect(x, y, w, h);
+  ctx.strokeStyle = PALETTE.lineStrong;
+  ctx.lineWidth = 1;
+  ctx.strokeRect(x + 0.5, y + 0.5, w - 1, h - 1);
+  ctx.fillStyle = color;
+  ctx.fillText(text, x + 5, y + (h / 2) + 0.5);
+}
+
+const testPosA = { sx: 0, sy: 0, visible: false };
+const testPosB = { sx: 0, sy: 0, visible: false };
+const scratchProj = { sx: 0, sy: 0, visible: false };
+const placedBoxes = [];
+
+export default function ThreatGlobe({ alerts = EMPTY, satellites = EMPTY, selectedSatId }) {
   const canvasRef = useRef(null);
-  const stateRef = useRef({ viewLon: 80, animId: null, frame: 0 });
   const testActive = useTestMode((s) => s.testActive);
   const testSatellites = useTestMode((s) => s.testSatellites);
   const computed = useTestMode((s) => s.computed);
   const debrisClouds = useStore((s) => s.debrisClouds);
-  // Track satellite index order so labels alternate left/right
-  const satIndexRef = useRef(new Map());
+  const snapshotTimestamp = useStore((s) => s.snapshotTimestamp);
 
-  const draw = useCallback(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const ctx = canvas.getContext('2d');
-    const W = canvas.width;
-    const H = canvas.height;
-    const cx = W / 2;
-    const cy = H / 2;
-    const R = Math.min(W, H) * 0.44;
-
-    const { viewLon, frame } = stateRef.current;
-
-    ctx.clearRect(0, 0, W, H);
-
-    // ── Globe sphere background ────────────────────────────────────────────
-    const grd = ctx.createRadialGradient(cx - R * 0.25, cy - R * 0.25, R * 0.05, cx, cy, R);
-    grd.addColorStop(0, '#0d1a2a');
-    grd.addColorStop(0.6, '#060d14');
-    grd.addColorStop(1, '#020608');
-    ctx.beginPath();
-    ctx.arc(cx, cy, R, 0, TWO_PI);
-    ctx.fillStyle = grd;
-    ctx.fill();
-
-    // Subtle limb glow
-    const limbGrd = ctx.createRadialGradient(cx, cy, R * 0.8, cx, cy, R);
-    limbGrd.addColorStop(0, 'transparent');
-    limbGrd.addColorStop(1, 'rgba(74,144,217,0.12)');
-    ctx.beginPath();
-    ctx.arc(cx, cy, R, 0, TWO_PI);
-    ctx.fillStyle = limbGrd;
-    ctx.fill();
-
-    // Clip everything to globe circle
-    ctx.save();
-    ctx.beginPath();
-    ctx.arc(cx, cy, R, 0, TWO_PI);
-    ctx.clip();
-
-    // ── Grid ─────────────────────────────────────────────────────────────
-    drawGrid(ctx, viewLon, cx, cy, R);
-
-    // ── Coastlines ───────────────────────────────────────────────────────
-    drawCoastlines(ctx, viewLon, cx, cy, R);
-
-    // ── Debris Clouds ─────────────────────────────────────────────────────
-    if (debrisClouds && debrisClouds.length > 0) {
-      for (const cloud of debrisClouds) {
-        const center = cloud.center_eci_km;
-        if (!center) continue;
-        const ll = eciToLatLon(center.x, center.y, center.z);
-        if (!ll) continue;
-        const p = orthoProject(ll.lat, ll.lon, viewLon, cx, cy, R);
-        if (!p.visible) continue;
-
-        const radiusPx = Math.max(14, (cloud.radius_km_now || 100) * (R / 6371.0));
-        const pulse = 0.5 + 0.5 * Math.sin(frame * 0.07);
-        
-        ctx.save();
-        // Pulsing outer glow
-        ctx.beginPath();
-        ctx.arc(p.sx, p.sy, radiusPx + 6 + pulse * 4, 0, TWO_PI);
-        ctx.fillStyle = `rgba(168, 85, 247, ${0.08 * pulse})`;
-        ctx.fill();
-
-        // Translucent purple fill
-        ctx.beginPath();
-        ctx.arc(p.sx, p.sy, radiusPx, 0, TWO_PI);
-        ctx.fillStyle = 'rgba(168, 85, 247, 0.18)';
-        ctx.fill();
-
-        // Dashed purple outline (animated)
-        ctx.strokeStyle = `rgba(168, 85, 247, ${0.6 + 0.3 * pulse})`;
-        ctx.lineWidth = 1.5;
-        ctx.setLineDash([5, 3]);
-        ctx.lineDashOffset = -frame * 0.3;
-        ctx.stroke();
-        ctx.setLineDash([]);
-
-        // Inner hazard ring
-        ctx.beginPath();
-        ctx.arc(p.sx, p.sy, Math.max(4, radiusPx * 0.35), 0, TWO_PI);
-        ctx.strokeStyle = 'rgba(251, 113, 133, 0.85)';
-        ctx.lineWidth = 1;
-        ctx.stroke();
-
-        // Center X marker
-        const xs = 3;
-        ctx.strokeStyle = 'rgba(251, 113, 133, 0.9)';
-        ctx.lineWidth = 1;
-        ctx.beginPath(); ctx.moveTo(p.sx - xs, p.sy - xs); ctx.lineTo(p.sx + xs, p.sy + xs); ctx.stroke();
-        ctx.beginPath(); ctx.moveTo(p.sx + xs, p.sy - xs); ctx.lineTo(p.sx - xs, p.sy + xs); ctx.stroke();
-
-        // Label — title
-        ctx.font = 'bold 9px JetBrains Mono, monospace';
-        ctx.fillStyle = 'rgba(216, 180, 254, 1)';
-        ctx.textAlign = 'center';
-        ctx.fillText('⚠ DEBRIS FIELD', p.sx, p.sy - radiusPx - 14);
-
-        // Fragment count
-        ctx.font = '8px JetBrains Mono, monospace';
-        ctx.fillStyle = 'rgba(168, 85, 247, 0.95)';
-        ctx.fillText(`${cloud.fragment_count || 0} FRAGMENTS`, p.sx, p.sy - radiusPx - 4);
-
-        // Radius
-        const radStr = cloud.radius_km_now ? `r=${cloud.radius_km_now.toFixed(0)}km` : '';
-        if (radStr) {
-          ctx.fillStyle = 'rgba(168, 85, 247, 0.7)';
-          ctx.fillText(radStr, p.sx, p.sy + radiusPx + 10);
-        }
-        ctx.restore();
-      }
-    }
-
-    // ── Crossing Trajectories (Orbits) for Test Mode ──────────────────────
-    if (testActive && computed?.trajectoryA && computed?.trajectoryB) {
-      // Draw Trajectory A (Cyan)
-      ctx.strokeStyle = 'rgba(6, 182, 212, 0.7)';
-      ctx.lineWidth = 1.5;
-      ctx.beginPath();
-      let penDown = false;
-      for (const pt of computed.trajectoryA) {
-        const ll = eciToLatLon(pt[1], pt[2], pt[3]);
-        if (!ll) continue;
-        const p = orthoProject(ll.lat, ll.lon, viewLon, cx, cy, R);
-        if (!p.visible) {
-          penDown = false;
-          continue;
-        }
-        if (!penDown) {
-          ctx.moveTo(p.sx, p.sy);
-          penDown = true;
-        } else {
-          ctx.lineTo(p.sx, p.sy);
-        }
-      }
-      ctx.stroke();
-
-      // Draw Trajectory B (Magenta)
-      ctx.strokeStyle = 'rgba(236, 72, 153, 0.7)';
-      ctx.lineWidth = 1.5;
-      ctx.beginPath();
-      penDown = false;
-      for (const pt of computed.trajectoryB) {
-        const ll = eciToLatLon(pt[1], pt[2], pt[3]);
-        if (!ll) continue;
-        const p = orthoProject(ll.lat, ll.lon, viewLon, cx, cy, R);
-        if (!p.visible) {
-          penDown = false;
-          continue;
-        }
-        if (!penDown) {
-          ctx.moveTo(p.sx, p.sy);
-          penDown = true;
-        } else {
-          ctx.lineTo(p.sx, p.sy);
-        }
-      }
-      ctx.stroke();
-    }
-
-    // ── Build alert-satellite lookup ──────────────────────────────────────
-    const alertSatIds = new Set();
-    const satCpiMap = new Map(); // satId → max cpi
+  // Alert-derived lookups, rebuilt only when alerts change (not per frame).
+  const threat = useMemo(() => {
+    const cpiById = new Map();
+    const bump = (id, cpi) => {
+      if (id == null) return;
+      const key = Number(id);
+      if ((cpiById.get(key) ?? -1) < cpi) cpiById.set(key, cpi);
+    };
     for (const a of alerts) {
       const cpi = Number(a.cpi_score ?? 0);
-      if (a.sat1?.id != null) {
-        alertSatIds.add(Number(a.sat1.id));
-        satCpiMap.set(Number(a.sat1.id), Math.max(satCpiMap.get(Number(a.sat1.id)) ?? 0, cpi));
+      bump(a.sat1?.id, cpi);
+      bump(a.sat2?.id, cpi);
+    }
+    const ranked = [...alerts].sort((a, b) => Number(b.cpi_score ?? 0) - Number(a.cpi_score ?? 0));
+    return { cpiById, ranked };
+  }, [alerts]);
+
+  // Latest inputs for the render loop, so new snapshots don't restart it.
+  const propsRef = useRef(null);
+  propsRef.current = { threat, alertCount: alerts.length, selectedSatId, testActive, testSatellites, computed, debrisClouds };
+
+  // Per-satellite dead-reckoning state (see utils/motion.js).
+  const motionRef = useRef({ sats: new Map(), lastSimMs: null, lastWallMs: 0, simRate: 1 });
+
+  useEffect(() => {
+    const motion = motionRef.current;
+    const nowMs = performance.now();
+    const parsed = snapshotTimestamp ? Date.parse(snapshotTimestamp) : Number.NaN;
+    const simMs = Number.isFinite(parsed) ? parsed : null;
+    // Same or slightly older snapshot (REST/WS race): sync membership only.
+    const stale = simMs != null && motion.lastSimMs != null
+      && simMs <= motion.lastSimMs && simMs > motion.lastSimMs - 10000;
+    if (!stale) {
+      if (simMs != null) {
+        motion.simRate = estimateSimRate(motion.lastSimMs, motion.lastWallMs, simMs, nowMs, motion.simRate);
+        motion.lastSimMs = simMs;
       }
-      if (a.sat2?.id != null) {
-        alertSatIds.add(Number(a.sat2.id));
-        satCpiMap.set(Number(a.sat2.id), Math.max(satCpiMap.get(Number(a.sat2.id)) ?? 0, cpi));
-      }
+      motion.lastWallMs = nowMs;
     }
 
-    // ── Conjunction lines ─────────────────────────────────────────────────
-    const satPosMap = new Map(); // satId → {lat,lon,sx,sy,visible}
-    let alertSatObjs = satellites.filter((s) => alertSatIds.has(Number(s.norad_id)));
-
-    if (testActive && testSatellites.a && testSatellites.b) {
-      const satAId = Number(testSatellites.a.norad_id);
-      const satBId = Number(testSatellites.b.norad_id);
-      
-      const testSatA = {
-        norad_id: satAId,
-        name: testSatellites.a.name,
-        position: testSatellites.a.position,
-      };
-      const testSatB = {
-        norad_id: satBId,
-        name: testSatellites.b.name,
-        position: testSatellites.b.position,
-      };
-      
-      alertSatObjs = [testSatA, testSatB, ...alertSatObjs];
-      
-      alertSatIds.add(satAId);
-      alertSatIds.add(satBId);
-      if (!satCpiMap.has(satAId)) satCpiMap.set(satAId, 10.0);
-      if (!satCpiMap.has(satBId)) satCpiMap.set(satBId, 10.0);
-    }
-
-    // Build a stable index order for label offset alternation
-    let satIdx = 0;
-    satIndexRef.current = new Map();
-    for (const sat of alertSatObjs) {
+    const stamp = (motion.stamp = (motion.stamp || 0) + 1);
+    for (const sat of satellites) {
+      if (!sat.position) continue;
       const id = Number(sat.norad_id);
-      if (!satIndexRef.current.has(id)) {
-        satIndexRef.current.set(id, satIdx++);
+      let entry = motion.sats.get(id);
+      if (!entry) {
+        const { x, y, z } = sat.position;
+        entry = {
+          name: sat.name,
+          base: sat.position,
+          velocity: sat.velocity ?? null,
+          correction: null,
+          corrBuf: { x: 0, y: 0, z: 0 },
+          render: { x, y, z },
+          proj: { sx: 0, sy: 0, visible: false },
+          stamp,
+        };
+        motion.sats.set(id, entry);
+        continue;
       }
+      entry.stamp = stamp;
+      entry.name = sat.name;
+      if (stale) continue;
+      entry.correction = correctionFor(entry.render, sat.position, entry.corrBuf);
+      entry.base = sat.position;
+      entry.velocity = sat.velocity ?? null;
     }
-
-    for (const sat of alertSatObjs) {
-      const pos = sat.position ?? {};
-      const ll = eciToLatLon(pos.x ?? 0, pos.y ?? 0, pos.z ?? 0);
-      if (!ll) continue;
-      const proj = orthoProject(ll.lat, ll.lon, viewLon, cx, cy, R);
-      satPosMap.set(Number(sat.norad_id), { ...proj, ll });
+    for (const [id, entry] of motion.sats) {
+      if (entry.stamp !== stamp) motion.sats.delete(id);
     }
-
-    for (const alert of alerts) {
-      const pA = satPosMap.get(alert.sat1?.id);
-      const pB = satPosMap.get(alert.sat2?.id);
-      if (!pA || !pB || !pA.visible || !pB.visible) continue;
-      const cpi = Number(alert.cpi_score ?? 0);
-      const color = cpi >= 8 ? 'rgba(239,68,68,0.55)'
-        : cpi >= 5 ? 'rgba(234,179,8,0.4)'
-        : 'rgba(74,144,217,0.3)';
-
-      // Pulsing dashed line
-      ctx.setLineDash([6, 4]);
-      ctx.lineDashOffset = -frame * 0.4;
-      ctx.strokeStyle = color;
-      ctx.lineWidth = cpi >= 8 ? 1.5 : 1;
-      ctx.beginPath();
-      ctx.moveTo(pA.sx, pA.sy);
-      ctx.lineTo(pB.sx, pB.sy);
-      ctx.stroke();
-      ctx.setLineDash([]);
-
-      // Distance label on midpoint
-      const missKm = Number(alert.miss_distance_km ?? 0);
-      if (missKm > 0 && pA.visible && pB.visible) {
-        const midX = (pA.sx + pB.sx) / 2;
-        const midY = (pA.sy + pB.sy) / 2;
-        const distStr = missKm < 1 ? `${(missKm * 1000).toFixed(0)}m` : `${missKm.toFixed(1)}km`;
-        ctx.save();
-        ctx.font = '7px JetBrains Mono, monospace';
-        const tw = ctx.measureText(distStr).width;
-        ctx.fillStyle = 'rgba(6,13,20,0.88)';
-        ctx.fillRect(midX - tw / 2 - 3, midY - 6, tw + 6, 12);
-        ctx.fillStyle = cpi >= 8 ? '#ef4444' : cpi >= 5 ? '#eab308' : '#4a90d9';
-        ctx.textAlign = 'center';
-        ctx.textBaseline = 'middle';
-        ctx.fillText(distStr, midX, midY);
-        ctx.restore();
-      }
-
-      // TCA time label
-      const tcaHours = Number(alert.tca_hours ?? 0);
-      const tcaUtc = alert.tca_utc;
-      if ((tcaHours > 0 || tcaUtc) && pA.visible && pB.visible) {
-        const midX = (pA.sx + pB.sx) / 2;
-        const midY = (pA.sy + pB.sy) / 2 - 14;
-        let tcaStr = '';
-        if (tcaUtc) {
-          // Show time portion only: HH:MM UTC
-          tcaStr = `TCA ${tcaUtc.slice(11, 16)} UTC`;
-        } else if (tcaHours > 0) {
-          tcaStr = `TCA ${tcaHours.toFixed(1)}h`;
-        }
-        if (tcaStr) {
-          ctx.save();
-          ctx.font = '7px JetBrains Mono, monospace';
-          const tw2 = ctx.measureText(tcaStr).width;
-          ctx.fillStyle = 'rgba(6,13,20,0.85)';
-          ctx.fillRect(midX - tw2 / 2 - 3, midY - 6, tw2 + 6, 11);
-          ctx.fillStyle = 'rgba(251, 191, 36, 0.95)';
-          ctx.textAlign = 'center';
-          ctx.textBaseline = 'middle';
-          ctx.fillText(tcaStr, midX, midY);
-          ctx.restore();
-        }
-      }
-    }
-
-    // ── Satellites ────────────────────────────────────────────────────────
-    for (const [satId, proj] of satPosMap.entries()) {
-      if (!proj.visible) continue;
-      const cpi = satCpiMap.get(satId) ?? 0;
-      const { fill, glow } = satColor(cpi);
-      const isSelected = satId === selectedSatId;
-      const r = isSelected ? 6 : (cpi >= 8 ? 5 : 4);
-
-      // Glow halo
-      ctx.beginPath();
-      ctx.arc(proj.sx, proj.sy, r + 4, 0, TWO_PI);
-      ctx.fillStyle = glow;
-      ctx.fill();
-
-      // Dot
-      ctx.beginPath();
-      ctx.arc(proj.sx, proj.sy, r, 0, TWO_PI);
-      ctx.fillStyle = fill;
-      ctx.fill();
-
-      if (isSelected) {
-        ctx.beginPath();
-        ctx.arc(proj.sx, proj.sy, r + 2, 0, TWO_PI);
-        ctx.strokeStyle = '#ffffff';
-        ctx.lineWidth = 1;
-        ctx.stroke();
-      }
-
-      // Pulse ring for critical
-      if (cpi >= 8) {
-        const pulse = 0.5 + 0.5 * Math.sin(frame * 0.1);
-        ctx.beginPath();
-        ctx.arc(proj.sx, proj.sy, r + 4 + pulse * 4, 0, TWO_PI);
-        ctx.strokeStyle = `rgba(239,68,68,${0.4 * pulse})`;
-        ctx.lineWidth = 1;
-        ctx.stroke();
-      }
-
-      // Label — alternate left/right based on stable insertion order
-      const sat = alertSatObjs.find((s) => Number(s.norad_id) === satId);
-      if (sat) {
-        const label = sat.name?.slice(0, 14) ?? `#${satId}`;
-        ctx.font = '8px JetBrains Mono, monospace';
-        ctx.fillStyle = fill;
-
-        // Even-indexed satellites label right, odd label left
-        const idxOrder = satIndexRef.current.get(satId) ?? 0;
-        if (idxOrder % 2 === 1) {
-          ctx.save();
-          ctx.textAlign = 'right';
-          ctx.fillText(label, proj.sx - r - 3, proj.sy + 3);
-          ctx.restore();
-        } else {
-          ctx.fillText(label, proj.sx + r + 3, proj.sy + 3);
-        }
-      }
-    }
-
-    ctx.restore();
-
-    // ── Globe border ─────────────────────────────────────────────────────
-    ctx.beginPath();
-    ctx.arc(cx, cy, R, 0, TWO_PI);
-    ctx.strokeStyle = 'rgba(74,144,217,0.2)';
-    ctx.lineWidth = 1;
-    ctx.stroke();
-
-    // ── Labels overlay ───────────────────────────────────────────────────
-    ctx.font = '8px JetBrains Mono, monospace';
-    ctx.fillStyle = 'rgba(107,114,128,0.8)';
-    ctx.fillText(`${alerts.length} ACTIVE CONJUNCTIONS`, 8, H - 8);
-    ctx.fillText(`${alertSatIds.size} SATELLITES AT RISK`, 8, H - 18);
-  }, [alerts, satellites, selectedSatId]);
+  }, [satellites, snapshotTimestamp]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
-    if (!canvas) return;
+    if (!canvas) return undefined;
+    const ctx = canvas.getContext('2d', { alpha: true });
+    const size = { w: 0, h: 0, dpr: 1 };
+    let rafId = 0;
+    let running = false;
+    let lastFrameMs = 0;
+    let lastTickMs = 0;
+    let viewLon = 80;
 
-    // Resize canvas to container
-    const ro = new ResizeObserver(() => {
-      canvas.width = canvas.offsetWidth;
-      canvas.height = canvas.offsetHeight;
-    });
-    ro.observe(canvas);
-    canvas.width = canvas.offsetWidth;
-    canvas.height = canvas.offsetHeight;
-
-    const tick = () => {
-      stateRef.current.viewLon += 0.08; // slow rotation
-      stateRef.current.frame++;
-      draw();
-      stateRef.current.animId = requestAnimationFrame(tick);
+    // Backing store sized only on resize, DPR capped.
+    const resize = () => {
+      const rect = canvas.getBoundingClientRect();
+      size.dpr = Math.min(window.devicePixelRatio || 1, MAX_DPR);
+      size.w = rect.width;
+      size.h = rect.height;
+      const bw = Math.max(1, Math.round(size.w * size.dpr));
+      const bh = Math.max(1, Math.round(size.h * size.dpr));
+      if (canvas.width !== bw) canvas.width = bw;
+      if (canvas.height !== bh) canvas.height = bh;
     };
-    stateRef.current.animId = requestAnimationFrame(tick);
+    const ro = new ResizeObserver(resize);
+    ro.observe(canvas);
+    resize();
+
+    const draw = (nowMs) => {
+      const W = size.w;
+      const H = size.h;
+      if (W < 2 || H < 2) return;
+      const {
+        threat: { cpiById, ranked },
+        alertCount, selectedSatId: selectedId, testActive: tActive,
+        testSatellites: tSats, computed: comp, debrisClouds: clouds,
+      } = propsRef.current;
+      const motion = motionRef.current;
+
+      view.cx = W / 2;
+      view.cy = H / 2;
+      view.R = Math.min(W, H) * 0.44;
+      view.cosV = Math.cos(viewLon * DEG);
+      view.sinV = Math.sin(viewLon * DEG);
+      const { cx, cy, R } = view;
+
+      placedBoxes.length = 0;
+      ctx.setTransform(size.dpr, 0, 0, size.dpr, 0, 0);
+      ctx.clearRect(0, 0, W, H);
+      ctx.textBaseline = 'middle';
+      ctx.textAlign = 'left';
+
+      // ── Sphere, graticule, coastlines ──────────────────────────────────
+      ctx.beginPath();
+      ctx.arc(cx, cy, R, 0, TWO_PI);
+      ctx.fillStyle = PALETTE.sphere;
+      ctx.fill();
+
+      ctx.save();
+      ctx.beginPath();
+      ctx.arc(cx, cy, R, 0, TWO_PI);
+      ctx.clip();
+
+      ctx.lineWidth = 1;
+      ctx.strokeStyle = PALETTE.line;
+      strokeUnitPolylines(ctx, GRID_UNIT);
+      ctx.strokeStyle = PALETTE.lineStrong;
+      strokeUnitPolylines(ctx, COAST_UNIT);
+
+      // ── Debris clouds: thin dashed rings, slow breathing opacity ───────
+      if (clouds && clouds.length > 0) {
+        ctx.font = MONO_9;
+        ctx.setLineDash([3, 3]);
+        ctx.strokeStyle = PALETTE.caution;
+        const breathe = 0.45 + (0.15 * Math.sin(nowMs / 1000 * (TWO_PI / 6)));
+        for (const cloud of clouds) {
+          const c = cloud.center_eci_km;
+          if (!c) continue;
+          const p = projectEci(c.x ?? 0, c.y ?? 0, c.z ?? 0, scratchProj);
+          if (!p.visible) continue;
+          const radiusPx = Math.max(10, (cloud.radius_km_now || 100) * (R / 6371.0));
+          ctx.globalAlpha = breathe;
+          ctx.beginPath();
+          ctx.arc(p.sx, p.sy, radiusPx, 0, TWO_PI);
+          ctx.stroke();
+          ctx.globalAlpha = 1;
+          ctx.setLineDash([]);
+          const text = `DEBRIS ${cloud.fragment_count || 0} FRAG`;
+          const tw = ctx.measureText(text).width + 10;
+          const bx = p.sx - (tw / 2);
+          const by = p.sy - radiusPx - 16;
+          if (reserve(placedBoxes, bx, by, tw, 13)) drawTag(ctx, bx, by, tw, 13, text, PALETTE.caution);
+          ctx.setLineDash([3, 3]);
+        }
+        ctx.setLineDash([]);
+        ctx.globalAlpha = 1;
+      }
+
+      // ── Test-mode trajectories ─────────────────────────────────────────
+      if (tActive && comp?.trajectoryA && comp?.trajectoryB) {
+        ctx.lineWidth = 1;
+        for (let k = 0; k < 2; k += 1) {
+          const traj = k === 0 ? comp.trajectoryA : comp.trajectoryB;
+          ctx.strokeStyle = k === 0 ? PALETTE.accent : PALETTE.info;
+          ctx.globalAlpha = 0.6;
+          ctx.beginPath();
+          let penDown = false;
+          for (const pt of traj) {
+            const p = projectEci(pt[1], pt[2], pt[3], scratchProj);
+            if (!p.visible) { penDown = false; continue; }
+            if (penDown) ctx.lineTo(p.sx, p.sy);
+            else { ctx.moveTo(p.sx, p.sy); penDown = true; }
+          }
+          ctx.stroke();
+        }
+        ctx.globalAlpha = 1;
+      }
+
+      // ── Advance + project every satellite (no allocation) ──────────────
+      const wallSeconds = Math.min((performance.now() - motion.lastWallMs) / 1000, MAX_EXTRAPOLATION_S);
+      const simSeconds = wallSeconds * (motion.simRate || 1);
+      const correctionWeight = Math.exp(-wallSeconds / CORRECTION_DECAY_S);
+      for (const entry of motion.sats.values()) {
+        const r = extrapolate(entry.base, entry.velocity, simSeconds, entry.correction, correctionWeight, entry.render);
+        projectEci(r.x, r.y, r.z, entry.proj);
+      }
+
+      const testA = tActive && tSats?.a && tSats?.b ? tSats.a : null;
+      const testB = testA ? tSats.b : null;
+      const testIdA = testA ? Number(testA.norad_id) : null;
+      const testIdB = testB ? Number(testB.norad_id) : null;
+      if (testA) {
+        const pa = testA.position || {};
+        const pb = testB.position || {};
+        projectEci(pa.x ?? 0, pa.y ?? 0, pa.z ?? 0, testPosA);
+        projectEci(pb.x ?? 0, pb.y ?? 0, pb.z ?? 0, testPosB);
+      }
+      const posOf = (id) => {
+        if (id === testIdA) return testPosA;
+        if (id === testIdB) return testPosB;
+        return motion.sats.get(id)?.proj ?? null;
+      };
+      const cpiOf = (id) => ((id === testIdA || id === testIdB) ? 10 : (cpiById.get(id) ?? 0));
+
+      // Nominal satellites: one batched path of tiny dim dots.
+      ctx.fillStyle = PALETTE.dim;
+      ctx.globalAlpha = 0.7;
+      ctx.beginPath();
+      for (const [id, entry] of motion.sats) {
+        const p = entry.proj;
+        if (!p.visible || threatColor(cpiOf(id))) continue;
+        ctx.rect(p.sx - 0.75, p.sy - 0.75, 1.5, 1.5);
+      }
+      ctx.fill();
+      ctx.globalAlpha = 1;
+
+      // ── Conjunction lines (+ a pill for the top few) ───────────────────
+      ctx.font = MONO_9;
+      ctx.lineWidth = 1;
+      ctx.setLineDash([4, 3]);
+      let pillCount = 0;
+      const labelledIds = [];
+      const pills = [];
+      for (const alert of ranked) {
+        const idA = Number(alert.sat1?.id);
+        const idB = Number(alert.sat2?.id);
+        const pA = posOf(idA);
+        const pB = posOf(idB);
+        if (!pA || !pB || !pA.visible || !pB.visible) continue;
+        const cpi = Number(alert.cpi_score ?? 0);
+        const isTop = pillCount < MAX_CONJUNCTION_LABELS;
+        const color = threatColor(cpi);
+        ctx.strokeStyle = isTop && color ? color : PALETTE.lineStrong;
+        ctx.globalAlpha = isTop ? 0.7 : 0.9;
+        ctx.beginPath();
+        ctx.moveTo(pA.sx, pA.sy);
+        ctx.lineTo(pB.sx, pB.sy);
+        ctx.stroke();
+        if (!isTop) continue;
+        pillCount += 1;
+        labelledIds.push(idA, idB);
+        pills.push(alert, pA, pB);
+      }
+      ctx.setLineDash([]);
+      ctx.globalAlpha = 1;
+
+      // ── Threatened + selected satellites ───────────────────────────────
+      const drawThreatDot = (id, p) => {
+        if (!p || !p.visible) return;
+        const color = threatColor(cpiOf(id));
+        if (color) {
+          ctx.fillStyle = color;
+          ctx.beginPath();
+          ctx.arc(p.sx, p.sy, cpiOf(id) >= 8 ? 2.5 : 2, 0, TWO_PI);
+          ctx.fill();
+        }
+        if (id === selectedId) {
+          if (!color) {
+            ctx.fillStyle = PALETTE.accent;
+            ctx.beginPath();
+            ctx.arc(p.sx, p.sy, 2, 0, TWO_PI);
+            ctx.fill();
+          }
+          ctx.strokeStyle = PALETTE.accent;
+          ctx.lineWidth = 1;
+          ctx.beginPath();
+          ctx.arc(p.sx, p.sy, 5, 0, TWO_PI);
+          ctx.stroke();
+        }
+      };
+      // Caution first, warning on top.
+      for (let pass = 0; pass < 2; pass += 1) {
+        for (const [id, cpi] of cpiById) {
+          if ((pass === 0) === (cpi >= 8)) continue;
+          if (id === testIdA || id === testIdB) continue;
+          drawThreatDot(id, posOf(id));
+        }
+      }
+      if (testA) {
+        drawThreatDot(testIdA, testPosA);
+        drawThreatDot(testIdB, testPosB);
+      }
+      if (selectedId != null && !cpiById.has(Number(selectedId))) {
+        const sid = Number(selectedId);
+        drawThreatDot(sid, posOf(sid));
+      }
+
+      // ── Labels: pills first (they matter most), then names ────────────
+      for (let i = 0; i < pills.length; i += 3) {
+        const alert = pills[i];
+        const pA = pills[i + 1];
+        const pB = pills[i + 2];
+        const miss = formatMiss(Number(alert.miss_distance_km ?? 0));
+        const tca = formatTca(alert);
+        const text = miss && tca ? `${miss}  ${tca}` : (miss || tca);
+        if (!text) continue;
+        const w = ctx.measureText(text).width + 10;
+        const x = ((pA.sx + pB.sx) / 2) - (w / 2);
+        const y = ((pA.sy + pB.sy) / 2) - 7;
+        if (!reserve(placedBoxes, x, y, w, 14)) continue;
+        drawTag(ctx, x, y, w, 14, text, threatColor(Number(alert.cpi_score ?? 0)) || PALETTE.text);
+      }
+
+      const nameLabel = (id) => {
+        const p = posOf(id);
+        if (!p || !p.visible) return;
+        const name = id === testIdA ? testA.name : id === testIdB ? testB.name : motion.sats.get(id)?.name;
+        const text = (name ?? `#${id}`).slice(0, 14).toUpperCase();
+        const w = ctx.measureText(text).width + 10;
+        const h = 14;
+        const y = p.sy - (h / 2);
+        let x = p.sx + 7;
+        if (!reserve(placedBoxes, x, y, w, h)) {
+          x = p.sx - 7 - w;
+          if (!reserve(placedBoxes, x, y, w, h)) return;
+        }
+        drawTag(ctx, x, y, w, h, text, id === Number(selectedId) ? PALETTE.bright : PALETTE.text);
+      };
+      if (selectedId != null) nameLabel(Number(selectedId));
+      for (const id of labelledIds) {
+        if (id !== Number(selectedId)) nameLabel(id);
+      }
+
+      ctx.restore();
+
+      // ── Limb + readout ─────────────────────────────────────────────────
+      ctx.beginPath();
+      ctx.arc(cx, cy, R + 0.5, 0, TWO_PI);
+      ctx.strokeStyle = PALETTE.lineStrong;
+      ctx.lineWidth = 1;
+      ctx.stroke();
+
+      ctx.font = CAPS_10;
+      if ('letterSpacing' in ctx) ctx.letterSpacing = '1.4px';
+      ctx.fillStyle = PALETTE.dim;
+      ctx.textBaseline = 'alphabetic';
+      ctx.fillText(`${cpiById.size} AT RISK`, 10, H - 24);
+      ctx.fillText(`${alertCount} CONJUNCTIONS`, 10, H - 10);
+      if ('letterSpacing' in ctx) ctx.letterSpacing = '0px';
+    };
+
+    const tick = (nowMs) => {
+      rafId = 0;
+      if (!running) return;
+      rafId = requestAnimationFrame(tick);
+      if (nowMs - lastFrameMs < FRAME_INTERVAL_MS - 1) return; // ~30 fps cap
+      lastFrameMs = nowMs;
+      // Time-based rotation, independent of frame rate and pauses.
+      const dt = Math.min((nowMs - lastTickMs) / 1000, 0.1);
+      lastTickMs = nowMs;
+      viewLon = (viewLon + (ROTATION_DEG_PER_S * dt)) % 360;
+      draw(nowMs);
+    };
+
+    const start = () => {
+      if (running) return;
+      running = true;
+      lastTickMs = performance.now();
+      lastFrameMs = 0;
+      rafId = requestAnimationFrame(tick);
+    };
+    const stop = () => {
+      running = false;
+      if (rafId) cancelAnimationFrame(rafId);
+      rafId = 0;
+    };
+
+    // Pause when the tab is hidden or the canvas is offscreen.
+    const stopActivity = observeActivity(canvas, (active) => (active ? start() : stop()));
 
     return () => {
+      stopActivity();
+      stop();
       ro.disconnect();
-      if (stateRef.current.animId) cancelAnimationFrame(stateRef.current.animId);
     };
-  }, [draw]);
+  }, []);
 
   return (
     <canvas
       ref={canvasRef}
-      style={{ width: '100%', height: '100%', display: 'block', cursor: 'crosshair' }}
+      style={{ width: '100%', height: '100%', display: 'block', cursor: 'crosshair', background: PALETTE.void }}
     />
   );
 }

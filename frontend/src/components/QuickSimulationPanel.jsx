@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import useTestMode from '../hooks/useTestMode';
+import '../styles/drawers.css';
 
 const QUICK_EPOCH = '2026-05-09T05:40:00Z';
 
@@ -72,29 +73,28 @@ export default function QuickSimulationPanel() {
   };
 
   return (
-    <div className="panel quick-sim-panel">
-      <div className="panel-header">
-        <span className="panel-title">Simulation Controls</span>
-        <span className="mono" style={{ fontSize: 11 }}>VISIBLE</span>
+    <div className="ui-panel dr-card">
+      <div className="ui-panel-header">
+        <span className="ui-label">Simulation Controls</span>
+        <span className={`ui-status ${testActive ? 'is-caution' : 'is-dim'}`}>
+          {testActive ? 'Test active' : 'Standby'}
+        </span>
       </div>
 
-      <div className="quick-sim-copy">
-        Use the quick buttons below to load the collision demo without scrolling.
-      </div>
+      <div className="dr-card-body">
+        <p className="dr-copy">Load the collision demo scenario or toggle test mode.</p>
 
-      <div className="btn-row" style={{ marginTop: 10 }}>
-        <button className="btn btn-execute" type="button" onClick={loadCollisionDemo}>
-          Load Collision Demo
-        </button>
-      </div>
+        <div className="dr-actions">
+          <button className="ui-btn ui-btn--primary" type="button" onClick={loadCollisionDemo}>
+            Load Collision Demo
+          </button>
+          <button className="ui-btn" type="button" onClick={() => setTestActive(!testActive)}>
+            Toggle Test Mode
+          </button>
+        </div>
 
-      <div className="btn-row" style={{ marginTop: 8 }}>
-        <button className="btn" type="button" onClick={() => setTestActive(!testActive)}>
-          Toggle Test Mode
-        </button>
+        {status && <div className="dr-note" role="status">{status}</div>}
       </div>
-
-      {status && <div className="status-banner mono" style={{ marginTop: 10 }}>{status}</div>}
     </div>
   );
 }

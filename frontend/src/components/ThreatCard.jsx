@@ -1,27 +1,17 @@
-import { useState } from 'react';
+import { useState, memo } from 'react';
 import { useTCACountdown } from '../utils/tcaCountdown';
 import BPlaneDiagram from './BPlaneDiagram';
+import { severityLabel } from '../utils/severity';
 import { apiPost } from '../utils/api';
 import useStore from '../store/useStore';
+import '../styles/threats.css';
 
-function cpiClass(cpi) {
-  if (cpi >= 8) return 'critical';
-  if (cpi >= 5) return 'warning';
-  return 'watch';
-}
-
-function severityLabel(alert) {
-  const cpi = Number(alert.cpi_score ?? 0);
-  if (alert.severity) return alert.severity.toUpperCase();
-  if (cpi >= 8) return 'CRITICAL';
-  if (cpi >= 5) return 'WARNING';
-  return 'WATCH';
-}
-
-function cpiBarColor(cpi) {
-  if (cpi >= 8) return 'var(--alert-red)';
-  if (cpi >= 5) return 'var(--alert-yellow)';
-  return '#4a90d9';
+// Display state (warning / caution / nominal) from CPI, escalated by an
+// explicit backend severity when that is higher.
+function rowState(cpi, severity) {
+  if (cpi >= 8 || severity === 'CRITICAL') return 'warning';
+  if (cpi >= 5 || severity === 'WARNING') return 'caution';
+  return 'nominal';
 }
 
 function formatPc(pc) {
@@ -31,7 +21,7 @@ function formatPc(pc) {
   return n.toExponential(1);
 }
 
-export default function ThreatCard({ alert, isSelected, onDecision }) {
+function ThreatCard({ alert, isSelected, onDecision }) {
   const [expanded, setExpanded] = useState(false);
   const [showDvEditor, setShowDvEditor] = useState(false);
   const [customDv, setCustomDv] = useState(0.1);
@@ -42,15 +32,16 @@ export default function ThreatCard({ alert, isSelected, onDecision }) {
 
   const cpi = Number(alert.cpi_score ?? 0);
   const severity = severityLabel(alert);
+  const state = rowState(cpi, severity);
   const pc = Number(alert.p_collision ?? alert.probability_of_collision ?? 0);
-  const tcaFromUtc = alert.tca_utc ? (new Date(alert.tca_utc).getTime() - Date.now()) / 3_600_000 : NaN;
-  const tcaHours = Number.isFinite(tcaFromUtc)
-    ? tcaFromUtc
-    : Number(alert.tca_hours ?? (Number(alert.tca_minutes ?? NaN) / 60));
-  const { formatted, urgent, critical } = useTCACountdown(tcaHours);
+  const tcaHours = Number(alert.tca_hours ?? (Number(alert.tca_minutes ?? NaN) / 60));
+  const { formatted, urgent, critical } = useTCACountdown(tcaHours, alert.tca_utc);
+  const tcaState = critical ? 'is-warning' : urgent ? 'is-caution' : '';
 
   const sat1 = alert.sat1 ?? {};
   const sat2 = alert.sat2 ?? {};
+  const sat1Name = sat1.name ?? `#${sat1.id}`;
+  const sat2Name = sat2.name ?? `#${sat2.id}`;
   const missKm = Number(alert.miss_distance_km ?? 0);
   const relVelKmh = Number(alert.relative_speed_kmh ?? alert.relative_speed_kh ?? 0);
   const relVelKms = (relVelKmh / 3600).toFixed(2);
@@ -106,75 +97,66 @@ export default function ThreatCard({ alert, isSelected, onDecision }) {
     setSelectedAlertId(isSelected ? null : alert.id);
   };
 
+  const handleHeadKey = (e) => {
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault();
+      handleCardClick();
+    }
+  };
+
   return (
     <div
-      className={`threat-card severity-${severity} ${isSelected ? 'selected' : ''}`}
+      className={`tq-row is-${state}${isSelected ? ' is-selected' : ''}${expanded ? ' is-expanded' : ''}`}
       id={`threat-card-${alert.id ?? 'unknown'}`}
     >
-      {/* Collapsed header — always visible */}
-      <div className="threat-card-header" onClick={handleCardClick}>
-        <span className={`severity-badge ${severity}`}>{severity}</span>
-        <span className={`cpi-score ${cpiClass(cpi)}`}>CPI {cpi.toFixed(1)}</span>
-      </div>
-
-      {/* Satellite pair row */}
-      <div className="threat-sat-row">
-        <span className="agency-badge">{sat1.agency ?? '—'}</span>
-        <span className="threat-sat-name">{sat1.name ?? `#${sat1.id}`}</span>
-        <span className="threat-arrow">→</span>
-        <span className="agency-badge">{sat2.agency ?? '—'}</span>
-        <span className="threat-sat-name">{sat2.name ?? `#${sat2.id}`}</span>
-      </div>
-
-      {/* Metrics row */}
-      <div className="threat-metrics-row">
-        <span className="threat-metric">Miss: <strong>{missKm.toFixed(1)}km</strong></span>
-        <span className="threat-metric">Pc: <strong>{formatPc(pc)}</strong></span>
-        <span className="threat-metric">TCA: <strong>{tcaHours.toFixed(1)}h</strong></span>
-        <span className="threat-metric">Casc: <strong>{cascadeCount}</strong></span>
-      </div>
-
-      {/* CPI progress bar */}
-      <div className="threat-cpi-bar">
-        <div
-          className="threat-cpi-fill"
-          style={{ width: `${Math.min(cpi / 10, 1) * 100}%`, background: cpiBarColor(cpi) }}
-        />
-      </div>
-
-      {/* TCA countdown */}
-      <div className="threat-tca-countdown" style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-start', gap: '4px' }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
-          <span className="tca-label">TCA</span>
-          <span className={`tca-time ${critical ? 'critical' : urgent ? 'urgent' : ''}`}>
-            {formatted}
+      {/* Collapsed summary — always visible */}
+      <div
+        className="tq-row-head"
+        role="button"
+        tabIndex={0}
+        aria-expanded={expanded}
+        onClick={handleCardClick}
+        onKeyDown={handleHeadKey}
+      >
+        <div className="tq-row-top">
+          <span className="tq-pair" title={`${sat1Name} / ${sat2Name}`}>
+            {sat1Name}
+            <span className="tq-pair-sep">/</span>
+            {sat2Name}
           </span>
+          <span className={`tq-sev is-${state}`}>{severity}</span>
+          <span className="tq-chev" aria-hidden="true">{expanded ? '−' : '+'}</span>
         </div>
-        {alert.tca_utc && (
-          <div style={{
-            display: 'flex', alignItems: 'center', gap: '4px',
-            background: critical ? 'rgba(239,68,68,0.1)' : urgent ? 'rgba(234,179,8,0.1)' : 'rgba(74,144,217,0.1)',
-            borderRadius: 4, padding: '2px 6px',
-            border: `1px solid ${critical ? 'rgba(239,68,68,0.3)' : urgent ? 'rgba(234,179,8,0.3)' : 'rgba(74,144,217,0.3)'}`,
-          }}>
-            <span style={{ fontSize: '9px', color: 'var(--text-dim)', fontFamily: 'var(--mono)' }}>⏱ COLLISION:</span>
-            <span style={{
-              fontSize: '9px', fontFamily: 'var(--mono)', fontWeight: 700,
-              color: critical ? 'var(--alert-red)' : urgent ? 'var(--alert-yellow)' : '#4a90d9',
-              letterSpacing: '0.5px',
-            }}>
-              {alert.tca_utc.replace('T', ' ').substring(0, 19)} UTC
+
+        <div className="tq-row-sub">
+          {(sat1.agency || sat2.agency) && (
+            <span className="tq-agency">{sat1.agency ?? '—'} / {sat2.agency ?? '—'}</span>
+          )}
+          {alert.tca_utc && (
+            <span className="tq-utc">
+              TCA {alert.tca_utc.replace('T', ' ').substring(0, 19)}Z
             </span>
-          </div>
-        )}
+          )}
+        </div>
+
+        <div className="tq-metrics">
+          <span className={`tq-tca ${tcaState}`}>{formatted}</span>
+          <span className="tq-num">{missKm.toFixed(1)}</span>
+          <span className="tq-num">{formatPc(pc)}</span>
+          <span className="tq-num">{cascadeCount}</span>
+          <span className={`tq-num tq-cpi is-${state}`}>{cpi.toFixed(1)}</span>
+        </div>
+
+        <div className={`tq-meter is-${state}`} aria-hidden="true">
+          <div className="tq-meter-fill" style={{ width: `${Math.min(Math.max(cpi, 0) / 10, 1) * 100}%` }} />
+        </div>
       </div>
 
-      {/* Expanded section */}
+      {/* Expanded detail */}
       {expanded && (
-        <div className="threat-card-expanded">
-          {/* B-plane diagram */}
-          <div>
-            <div className="threat-section-label">B-Plane Geometry</div>
+        <div className="tq-detail">
+          <div className="tq-bplane">
+            <span className="ui-label tq-section-label">B-Plane Geometry</span>
             <BPlaneDiagram
               btKm={btKm}
               bnKm={bnKm}
@@ -183,93 +165,81 @@ export default function ThreatCard({ alert, isSelected, onDecision }) {
               angleRad={angleRad}
               hbrKm={hbrKm}
             />
-            <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 4 }}>
-              <span style={{ fontSize: 8, color: 'var(--text-dim)', fontFamily: 'var(--mono)' }}>
-                σ_a={semiMajorM.toFixed(0)}m σ_b={semiMinorM.toFixed(0)}m
-              </span>
+            <div className="tq-bplane-caption">
+              σa {semiMajorM.toFixed(0)} m · σb {semiMinorM.toFixed(0)} m
             </div>
           </div>
 
-          {/* Encounter details */}
           <div>
-            <div className="threat-section-label">Encounter Details</div>
-            <div className="threat-detail-grid">
-              <div className="threat-detail-row"><span>Miss distance</span><span>{missKm.toFixed(3)} km</span></div>
-              <div className="threat-detail-row"><span>Relative velocity</span><span>{relVelKms} km/s</span></div>
-              <div className="threat-detail-row"><span>Combined HBR</span><span>{hbrKm.toFixed(3)} km</span></div>
-              <div className="threat-detail-row"><span>B-plane Bt</span><span>{btKm.toFixed(3)} km</span></div>
-              <div className="threat-detail-row"><span>B-plane Bn</span><span>{bnKm.toFixed(3)} km</span></div>
-              <div className="threat-detail-row"><span>Method</span><span>Foster 1992</span></div>
-            </div>
+            <span className="ui-label tq-section-label">Encounter</span>
+            <dl className="tq-dl">
+              <dt>TCA (est)</dt><dd>{tcaHours.toFixed(1)} h</dd>
+              <dt>Miss distance</dt><dd>{missKm.toFixed(3)} km</dd>
+              <dt>Rel velocity</dt><dd>{relVelKms} km/s</dd>
+              <dt>Combined HBR</dt><dd>{hbrKm.toFixed(3)} km</dd>
+              <dt>B-plane Bt</dt><dd>{btKm.toFixed(3)} km</dd>
+              <dt>B-plane Bn</dt><dd>{bnKm.toFixed(3)} km</dd>
+              <dt>Method</dt><dd>Foster 1992</dd>
+            </dl>
           </div>
 
-          {/* Recommended maneuver */}
           <div>
-            <div className="threat-section-label">Recommended Maneuver</div>
-            <div className="threat-detail-grid">
-              <div className="threat-detail-row">
-                <span>Satellite</span><span>{sat1.name ?? `#${sat1.id}`}</span>
-              </div>
-              <div className="threat-detail-row">
-                <span>Delta-V</span><span>{deltaV.toFixed(2)} m/s prograde</span>
-              </div>
-              <div className="threat-detail-row">
-                <span>Fuel cost</span><span>{fuelCost.toFixed(1)}%</span>
-              </div>
-              <div className="threat-detail-row">
-                <span>New miss</span><span style={{ color: 'var(--alert-green)' }}>{newMissKm.toFixed(2)} km</span>
-              </div>
+            <span className="ui-label tq-section-label">Recommended Maneuver</span>
+            <dl className="tq-dl">
+              <dt>Satellite</dt><dd title={sat1Name}>{sat1Name}</dd>
+              <dt>Delta-V</dt><dd>{deltaV.toFixed(2)} m/s prograde</dd>
+              <dt>Fuel cost</dt><dd>{fuelCost.toFixed(1)} %</dd>
+              <dt>New miss</dt><dd className="is-nominal">{newMissKm.toFixed(2)} km</dd>
               {newPc != null && (
-                <div className="threat-detail-row">
-                  <span>New Pc</span><span style={{ color: 'var(--alert-green)' }}>{formatPc(newPc)}</span>
-                </div>
+                <>
+                  <dt>New Pc</dt><dd className="is-nominal">{formatPc(newPc)}</dd>
+                </>
               )}
-            </div>
+            </dl>
           </div>
 
-          {/* Cascade section */}
           {cascadeCount > 0 && (
             <div>
-              <div className="threat-section-label">Cascade Impact</div>
-              <div style={{ fontFamily: 'var(--mono)', fontSize: 9, color: 'var(--text-dim)' }}>
+              <span className="ui-label tq-section-label">Cascade Impact</span>
+              <div className="tq-note">
                 Maneuver affects {cascadeCount} other satellite{cascadeCount !== 1 ? 's' : ''}
               </div>
             </div>
           )}
 
-          {/* Inline dV editor */}
           {showDvEditor && (
-            <div className="dv-editor">
-              <label>Custom Delta-V (m/s)</label>
-              <input
-                type="range"
-                min={0.01}
-                max={2.0}
-                step={0.01}
-                value={customDv}
-                onChange={(e) => setCustomDv(Number(e.target.value))}
-              />
-              <div className="dv-editor-value">{customDv.toFixed(2)} m/s</div>
+            <div className="tq-dv">
+              <label className="ui-label" htmlFor={`tq-dv-${alert.id ?? 'unknown'}`}>Custom Delta-V (m/s)</label>
+              <div className="tq-dv-row">
+                <input
+                  id={`tq-dv-${alert.id ?? 'unknown'}`}
+                  className="tq-dv-range"
+                  type="range"
+                  min={0.01}
+                  max={2.0}
+                  step={0.01}
+                  value={customDv}
+                  onChange={(e) => setCustomDv(Number(e.target.value))}
+                />
+                <span className="tq-dv-value">{customDv.toFixed(2)} m/s</span>
+              </div>
               <button
                 type="button"
-                className="td-btn modify"
+                className="ui-btn ui-btn--primary"
                 disabled={submitting}
                 onClick={() => handleDecision('MODIFY', customDv)}
               >
-                {submitting ? 'Submitting...' : 'Execute Modified Maneuver'}
+                {submitting ? 'Submitting…' : 'Execute Modified Maneuver'}
               </button>
             </div>
           )}
 
-          {decisionError && (
-            <div className="error-banner">{decisionError}</div>
-          )}
+          {decisionError && <div className="tq-error" role="alert">{decisionError}</div>}
 
-          {/* Decision buttons */}
-          <div className="threat-decision-btns">
+          <div className="tq-actions">
             <button
               type="button"
-              className="td-btn approve"
+              className="ui-btn ui-btn--primary"
               disabled={submitting}
               onClick={() => handleDecision('APPROVE')}
             >
@@ -277,7 +247,8 @@ export default function ThreatCard({ alert, isSelected, onDecision }) {
             </button>
             <button
               type="button"
-              className="td-btn modify"
+              className="ui-btn"
+              aria-pressed={showDvEditor}
               disabled={submitting}
               onClick={() => setShowDvEditor((v) => !v)}
             >
@@ -285,7 +256,7 @@ export default function ThreatCard({ alert, isSelected, onDecision }) {
             </button>
             <button
               type="button"
-              className="td-btn reject"
+              className="ui-btn ui-btn--danger"
               disabled={submitting}
               onClick={() => handleDecision('REJECT')}
             >
@@ -297,3 +268,5 @@ export default function ThreatCard({ alert, isSelected, onDecision }) {
     </div>
   );
 }
+
+export default memo(ThreatCard);

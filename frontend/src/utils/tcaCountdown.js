@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useMemo } from 'react';
 
 /**
  * formatTCA(tcaHours)
@@ -29,33 +29,30 @@ export function formatTCA(tcaHours) {
 }
 
 /**
- * useTCACountdown(tcaHours)
- * React hook that counts down every second from the given TCA hours value.
+ * useTCACountdown(tcaHours, tcaUtc)
+ * Counts down once per second toward a fixed target time. The target is
+ * `tcaUtc` when given, otherwise "now + tcaHours" captured when that value
+ * changes. Anchoring to an absolute time (rather than re-deriving hours from
+ * Date.now() each render) keeps the hook's inputs stable between renders.
  * Returns { formatted, urgent, critical }
  */
-export function useTCACountdown(tcaHoursInitial) {
-  const [remaining, setRemaining] = useState(() =>
-    tcaHoursInitial != null && Number.isFinite(tcaHoursInitial) ? tcaHoursInitial : null
-  );
-  const startRef = useRef(Date.now());
-  const initialRef = useRef(tcaHoursInitial);
+export function useTCACountdown(tcaHours, tcaUtc) {
+  const targetMs = useMemo(() => {
+    if (tcaUtc) {
+      const parsed = Date.parse(tcaUtc);
+      if (Number.isFinite(parsed)) return parsed;
+    }
+    return tcaHours != null && Number.isFinite(tcaHours) ? Date.now() + (tcaHours * 3_600_000) : null;
+  }, [tcaHours, tcaUtc]);
 
-  // Reset when the prop changes
-  useEffect(() => {
-    initialRef.current = tcaHoursInitial;
-    startRef.current = Date.now();
-    setRemaining(tcaHoursInitial);
-  }, [tcaHoursInitial]);
+  const [nowMs, setNowMs] = useState(() => Date.now());
 
   useEffect(() => {
-    if (remaining == null) return;
-    const id = setInterval(() => {
-      const elapsedHours = (Date.now() - startRef.current) / 3_600_000;
-      const next = (initialRef.current ?? 0) - elapsedHours;
-      setRemaining(next < 0 ? 0 : next);
-    }, 1000);
+    if (targetMs == null) return undefined;
+    setNowMs(Date.now());
+    const id = setInterval(() => setNowMs(Date.now()), 1000);
     return () => clearInterval(id);
-  }, [remaining == null]); // eslint-disable-line
+  }, [targetMs]);
 
-  return formatTCA(remaining);
+  return formatTCA(targetMs == null ? null : Math.max(0, (targetMs - nowMs) / 3_600_000));
 }

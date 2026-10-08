@@ -1,51 +1,95 @@
-import React, { useEffect, useRef } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import * as Cesium from 'cesium';
 import 'cesium/Build/Cesium/Widgets/widgets.css';
 import useStore from '../../store/useStore';
 import useTestMode from '../../hooks/useTestMode';
 import { computeGmst, eciToCesiumCartesian } from '../../utils/coords';
+import {
+  CORRECTION_DECAY_S,
+  MAX_EXTRAPOLATION_S,
+  correctionFor,
+  estimateSimRate,
+  extrapolate,
+  observeActivity,
+} from '../../utils/motion';
 
-// Set Ion token
-Cesium.Ion.defaultAccessToken = import.meta.env.VITE_CESIUM_TOKEN;
+// Only talk to Cesium Ion when a token is configured. Nothing below needs Ion
+// (no base layer, no geocoder, ellipsoid terrain), so without a token the app
+// makes no Ion/Bing requests at all.
+const CESIUM_TOKEN = import.meta.env.VITE_CESIUM_TOKEN;
+if (CESIUM_TOKEN) Cesium.Ion.defaultAccessToken = CESIUM_TOKEN;
+
+// Mirrors the design tokens in index.css (canvas/WebGL can't read CSS vars).
+const PALETTE = {
+  void: '#030508',
+  line: '#1a212b',
+  lineStrong: '#27303c',
+  text: '#c3cbd5',
+  dim: '#6b7685',
+  bright: '#eef2f6',
+  accent: '#4c8dff',
+  info: '#7cc4ff',
+  nominal: '#3ccf7a',
+  caution: '#f0b429',
+  warning: '#ff5a4f',
+};
+const css = (hex, alpha = 1) => Cesium.Color.fromCssColorString(hex).withAlpha(alpha);
+const COLORS = {
+  void: css(PALETTE.void),
+  satNominal: css(PALETTE.text, 0.5),
+  satHover: css(PALETTE.bright, 1),
+  satSelected: css(PALETTE.accent, 1),
+  satSelectedA: css(PALETTE.accent, 1),
+  satSelectedB: css(PALETTE.info, 1),
+  satCaution: css(PALETTE.caution, 0.95),
+  satWarning: css(PALETTE.warning, 0.95),
+  orbit: css(PALETTE.accent, 0.6),
+  labelText: css(PALETTE.bright, 1),
+  labelBg: css(PALETTE.void, 0.92),
+  hotspotCore: css(PALETTE.warning, 0.95),
+  hotspotZone: css(PALETTE.warning, 0.07),
+  debrisCore: css(PALETTE.caution, 0.95),
+  debrisText: css(PALETTE.caution, 1),
+  approach: {
+    nominal: css(PALETTE.nominal, 0.8),
+    caution: css(PALETTE.caution, 0.85),
+    warning: css(PALETTE.warning, 0.9),
+  },
+};
+const LABEL_FONT = "500 11px 'IBM Plex Mono', ui-monospace, monospace";
+const SMALL_LABEL_FONT = "500 10px 'IBM Plex Mono', ui-monospace, monospace";
 
 const SATELLITE_DEFAULT_SCALE = 0.26;
 const SATELLITE_HOVER_SCALE = 0.34;
 const SATELLITE_SELECTED_SCALE = 0.42;
-const SATELLITE_SCALE_BY_DISTANCE = new Cesium.NearFarScalar(
-  1000000.0,
-  1.4,
-  30000000.0,
-  0.2,
-);
+const SATELLITE_SCALE_BY_DISTANCE = new Cesium.NearFarScalar(1.0e6, 1.4, 3.0e7, 0.2);
 const ORBIT_BREAK_DISTANCE_KM = 8000;
-const ZERO_VELOCITY = { vx: 0, vy: 0, vz: 0 };
+const MAX_HOTSPOTS = 20;
+const HOVER_PICK_INTERVAL_MS = 60;
+const EMPTY = [];
 
-function eciToCesiumCartesianFast(eciPos, cosG, sinG) {
+// Threat level per satellite: 0 nominal, 1 caution, 2 warning.
+const THREAT_CAUTION = 1;
+const THREAT_WARNING = 2;
+
+// Reused every frame by the motion loop. BillboardCollection copies the value
+// on assignment (Billboard.position setter does Cartesian3.clone into its own
+// storage), so one scratch is safe to share across all billboards.
+const SCRATCH_CARTESIAN = new Cesium.Cartesian3();
+
+function normalizeId(id) {
+  if (id == null) return null;
+  const n = Number(id);
+  return Number.isNaN(n) ? id : n;
+}
+
+function toCartesian3(eci, date) {
+  const c = eciToCesiumCartesian(eci, date);
+  return new Cesium.Cartesian3(c.x, c.y, c.z);
+}
+
+function freshPrimitives() {
   return {
-    x: (eciPos.x * cosG + eciPos.y * sinG) * 1000,
-    y: (-eciPos.x * sinG + eciPos.y * cosG) * 1000,
-    z: eciPos.z * 1000,
-  };
-}
-
-function setBillboardPosition(billboard, cartesian) {
-  // Always assign a new position instance to ensure Cesium detects the property change
-  billboard.position = new Cesium.Cartesian3(cartesian.x, cartesian.y, cartesian.z);
-}
-
-const CesiumGlobe = ({ mode = 'live', alerts = [], onSatelliteSelect }) => {
-  const viewerRef = useRef(null);
-  const containerRef = useRef(null);
-  const motionRef = useRef({
-    snapshotPositions: new Map(),
-    previousSnapshotPositions: new Map(),
-    lastSnapshotTimestampMs: null,
-    previousSnapshotTimestampMs: null,
-    lastSnapshotReceivedPerfMs: 0,
-    snapshotIntervalMs: 1000,
-    animationFrameId: null,
-  });
-  const primitivesRef = useRef({
     billboards: null,
     labels: null,
     orbitLines: null,
@@ -56,24 +100,53 @@ const CesiumGlobe = ({ mode = 'live', alerts = [], onSatelliteSelect }) => {
     approachLine: null,
     approachMaterial: null,
     hotspotPoints: null,
-    hotspotZones: [],
+    hotspotEntities: [],
+    hotspotKey: null,
     debrisEntities: [],
+    debrisKey: null,
+    focusedItem: null,
     map: new Map(),
-  });
-  useEffect(() => {
-    if (!containerRef.current || viewerRef.current) return;
-    let viewer = null;
-    let rafId = null;
-    let ro = null;
+  };
+}
 
-    // Defer by one animation frame so the CSS Grid has committed its layout.
-    // Without this, Cesium reads zero/wrong container dimensions and either
-    // places the camera at the wrong distance or overflows the container.
-    rafId = requestAnimationFrame(() => {
+function freshMotion() {
+  return {
+    snapshotPositions: new Map(),
+    lastSnapshotTimestampMs: null,
+    lastSnapshotReceivedPerfMs: 0,
+    simRate: 1,
+    settled: false,
+  };
+}
+
+const CesiumGlobe = ({ mode = 'live', alerts = EMPTY, onSatelliteSelect }) => {
+  const containerRef = useRef(null);
+  const viewerRef = useRef(null);
+  const motionRef = useRef(freshMotion());
+  const primitivesRef = useRef(freshPrimitives());
+  const onSelectRef = useRef(onSatelliteSelect);
+  onSelectRef.current = onSatelliteSelect;
+  // Flips once the viewer exists so data effects re-run against it.
+  const [viewerReady, setViewerReady] = useState(false);
+
+  // ── Viewer lifecycle ────────────────────────────────────────────────────
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container) return undefined;
+    let viewer = null;
+    let handler = null;
+    let stopActivity = null;
+    let pickTimer = null;
+    let removePreUpdate = null;
+    let clearHover = null;
+
+    // Defer one frame so the CSS grid has committed its layout; Cesium reads
+    // the container size at construction.
+    const startRaf = requestAnimationFrame(() => {
       if (!containerRef.current) return;
 
-      viewer = new Cesium.Viewer(containerRef.current, {
-        imageryProvider: false,
+      viewer = new Cesium.Viewer(container, {
+        baseLayer: false, // Cesium >= 1.104: no Bing/Ion imagery
         baseLayerPicker: false,
         geocoder: false,
         homeButton: false,
@@ -86,174 +159,217 @@ const CesiumGlobe = ({ mode = 'live', alerts = [], onSatelliteSelect }) => {
         infoBox: false,
         selectionIndicator: false,
         creditContainer: document.createElement('div'),
+        skyBox: false,
+        skyAtmosphere: false,
+        shadows: false,
+        // Render only when something changed; the motion loop requests
+        // frames while satellites move. Capped at 30 fps.
+        requestRenderMode: true,
+        maximumRenderTimeChange: Infinity,
+        targetFrameRate: 30,
+        useBrowserRecommendedResolution: false,
+        msaaSamples: 1,
+        orderIndependentTranslucency: false,
+        contextOptions: {
+          webgl: {
+            alpha: false,
+            antialias: false,
+            depth: true,
+            stencil: false,
+            preserveDrawingBuffer: false,
+            powerPreference: 'default',
+          },
+        },
       });
+      viewerRef.current = viewer;
 
-      viewer.scene.requestRenderMode = false;
+      // Effective DPR <= 1.25.
+      viewer.resolutionScale = Math.min(1, 1.25 / (window.devicePixelRatio || 1));
 
-      // Threat mode: red-tinted space background
-      if (mode === 'threat') {
-        viewer.scene.backgroundColor = Cesium.Color.fromCssColorString('#0a0005');
-      }
-      viewer.scene.maximumRenderTimeChange = 0;
-      viewer.scene.fxaa = false;
+      const { scene } = viewer;
+      scene.backgroundColor = COLORS.void;
+      if (scene.postProcessStages?.fxaa) scene.postProcessStages.fxaa.enabled = false;
+      if (scene.sun) scene.sun.show = false;
+      if (scene.moon) scene.moon.show = false;
+      scene.fog.enabled = false;
+      scene.highDynamicRange = false;
 
-      // Add local imagery
-      Cesium.SingleTileImageryProvider.fromUrl('/earth-realistic-8k.webp').then((provider) => {
-        if (!viewer.isDestroyed()) {
-          viewer.imageryLayers.addImageryProvider(provider);
-          viewer.scene.requestRender();
-        }
-      }).catch(console.error);
+      const { globe } = scene;
+      globe.baseColor = COLORS.void;
+      globe.showGroundAtmosphere = false;
+      globe.enableLighting = false;
+      globe.depthTestAgainstTerrain = false;
+      globe.maximumScreenSpaceError = 3;
+      globe.tileCacheSize = 100;
+      globe.showSkirts = false;
+      globe.preloadAncestors = false;
 
-      // Black background, no atmosphere glow
-      viewer.scene.backgroundColor = Cesium.Color.BLACK;
-      viewer.scene.sun.show = false;
-      viewer.scene.moon.show = false;
-      viewer.scene.skyBox.show = false;
-      viewer.scene.skyAtmosphere.show = false;
-      viewer.scene.fog.enabled = false;
-      viewer.scene.globe.showGroundAtmosphere = false;
-      viewer.scene.globe.enableLighting = false;
-      viewer.scene.globe.depthTestAgainstTerrain = false;
+      Cesium.SingleTileImageryProvider.fromUrl('/earth-4k.webp')
+        .then((provider) => {
+          if (!viewer || viewer.isDestroyed()) return;
+          const layer = viewer.imageryLayers.addImageryProvider(provider);
+          // Muted, desaturated earth so state colours carry the signal.
+          layer.brightness = 0.55;
+          layer.contrast = 1.1;
+          layer.saturation = 0.3;
+          scene.requestRender();
+        })
+        .catch((err) => console.error('[CesiumGlobe] imagery', err));
 
-      // Set initial camera to see Earth from space
-      viewer.camera.setView({
-        destination: Cesium.Cartesian3.fromDegrees(30, 20, 25000000),
-      });
+      viewer.camera.setView({ destination: Cesium.Cartesian3.fromDegrees(30, 20, 25000000) });
 
-      // Force Cesium to measure the real container size right now,
-      // then re-render so the globe fills the panel correctly.
-      viewer.resize();
-      viewer.scene.requestRender();
-
-      // Track container size changes (flex/grid can resize it later)
-      ro = new ResizeObserver(() => {
-        if (viewer && !viewer.isDestroyed()) {
-          viewer.resize();
-          viewer.scene.requestRender();
-        }
-      });
-      ro.observe(containerRef.current);
-
-      // Initialize Collections for high-performance rendering
-      const billboards = new Cesium.BillboardCollection({
+      // Primitive collections (one draw call each, far cheaper than entities).
+      const prims = primitivesRef.current;
+      prims.billboards = scene.primitives.add(new Cesium.BillboardCollection({
         blendOption: Cesium.BlendOption.TRANSLUCENT,
-      });
-      const labels = new Cesium.LabelCollection();
-      const orbitLines = new Cesium.PolylineCollection();
-      const hotspotPoints = new Cesium.PointPrimitiveCollection();
-      viewer.scene.primitives.add(billboards);
-      viewer.scene.primitives.add(labels);
-      viewer.scene.primitives.add(orbitLines);
-      viewer.scene.primitives.add(hotspotPoints);
+      }));
+      prims.labels = scene.primitives.add(new Cesium.LabelCollection());
+      prims.orbitLines = scene.primitives.add(new Cesium.PolylineCollection());
+      prims.hotspotPoints = scene.primitives.add(new Cesium.PointPrimitiveCollection());
 
-      const focusLabel = labels.add({
+      prims.focusLabel = prims.labels.add({
         show: false,
         text: '',
-        font: '11px JetBrains Mono',
-        fillColor: Cesium.Color.fromCssColorString('#f3f4f6'),
-        outlineColor: Cesium.Color.BLACK,
-        outlineWidth: 2,
-        style: Cesium.LabelStyle.FILL_AND_OUTLINE,
-        pixelOffset: new Cesium.Cartesian2(15, -5),
+        font: LABEL_FONT,
+        fillColor: COLORS.labelText,
+        style: Cesium.LabelStyle.FILL,
+        showBackground: true,
+        backgroundColor: COLORS.labelBg,
+        backgroundPadding: new Cesium.Cartesian2(6, 4),
+        horizontalOrigin: Cesium.HorizontalOrigin.LEFT,
+        verticalOrigin: Cesium.VerticalOrigin.CENTER,
+        pixelOffset: new Cesium.Cartesian2(12, 0),
         disableDepthTestDistance: Number.POSITIVE_INFINITY,
       });
 
-      const orbitMaterial = Cesium.Material.fromType('Color');
-      orbitMaterial.uniforms.color = Cesium.Color.fromCssColorString('#22c55e').withAlpha(0.8);
+      prims.orbitMaterial = Cesium.Material.fromType('Color');
+      prims.orbitMaterial.uniforms.color = COLORS.orbit;
+      prims.approachMaterial = Cesium.Material.fromType('Color');
+      prims.approachMaterial.uniforms.color = COLORS.approach.nominal;
 
-      const approachMaterial = Cesium.Material.fromType('Color');
-      approachMaterial.uniforms.color = Cesium.Color.fromCssColorString('#22c55e').withAlpha(0.9);
-
-      const orbitPolyline = orbitLines.add({
+      prims.orbitPolyline = prims.orbitLines.add({
         show: false,
         positions: [],
-        width: 2,
-        material: orbitMaterial,
+        width: 1,
+        material: prims.orbitMaterial,
         arcType: Cesium.ArcType.NONE,
         id: 'selected-orbit',
       });
-
-      const approachLine = orbitLines.add({
+      prims.approachLine = prims.orbitLines.add({
         show: false,
         positions: [],
-        width: 2,
-        material: approachMaterial,
+        width: 1,
+        material: prims.approachMaterial,
         arcType: Cesium.ArcType.NONE,
         id: 'approach-line',
       });
 
-      primitivesRef.current.billboards = billboards;
-      primitivesRef.current.labels = labels;
-      primitivesRef.current.orbitLines = orbitLines;
-      primitivesRef.current.focusLabel = focusLabel;
-      primitivesRef.current.orbitPolyline = orbitPolyline;
-      primitivesRef.current.orbitMaterial = orbitMaterial;
-      primitivesRef.current.approachLine = approachLine;
-      primitivesRef.current.approachMaterial = approachMaterial;
-      primitivesRef.current.hotspotPoints = hotspotPoints;
-      primitivesRef.current.hotspotZones = [];
-      primitivesRef.current.debrisEntities = [];
+      // ── Per-frame dead reckoning, driven by Cesium's own (30 fps, pausable)
+      // render loop instead of a separate rAF. preUpdate fires before the
+      // request-render check, so requesting here renders this same frame.
+      removePreUpdate = scene.preUpdate.addEventListener(() => {
+        const motion = motionRef.current;
+        const { map, focusedItem, focusLabel } = primitivesRef.current;
+        if (motion.lastSnapshotTimestampMs == null || map.size === 0) return;
 
-      // Hover and click handlers for satellite focus
-      const handler = new Cesium.ScreenSpaceEventHandler(viewer.scene.canvas);
-      const updateHoveredSatellite = (position) => {
-        const picked = viewer.scene.pick(position);
-        const nextHoveredId = Cesium.defined(picked) && typeof picked.id === 'number'
-          ? picked.id
-          : null;
-        const store = useStore.getState();
+        const rawWallSeconds = (performance.now() - motion.lastSnapshotReceivedPerfMs) / 1000;
+        // Stream stalled: positions are frozen at the cap; stop rendering.
+        if (rawWallSeconds > MAX_EXTRAPOLATION_S) {
+          if (motion.settled) return;
+          motion.settled = true;
+        }
+        const wallSeconds = Math.min(rawWallSeconds, MAX_EXTRAPOLATION_S);
+        const simSeconds = wallSeconds * (motion.simRate || 1);
+        const correctionWeight = Math.exp(-wallSeconds / CORRECTION_DECAY_S);
 
-        if (store.hoveredSatelliteId !== nextHoveredId) {
-          store.setHoveredSatelliteId(nextHoveredId);
+        const gmst = computeGmst(new Date(motion.lastSnapshotTimestampMs + (simSeconds * 1000)));
+        const cosG = Math.cos(gmst);
+        const sinG = Math.sin(gmst);
+
+        for (const item of map.values()) {
+          const r = extrapolate(
+            item.eciPosition,
+            item.eciVelocity,
+            simSeconds,
+            item.correction,
+            correctionWeight,
+            item.renderEci,
+          );
+          SCRATCH_CARTESIAN.x = ((r.x * cosG) + (r.y * sinG)) * 1000;
+          SCRATCH_CARTESIAN.y = ((-r.x * sinG) + (r.y * cosG)) * 1000;
+          SCRATCH_CARTESIAN.z = r.z * 1000;
+          item.billboard.position = SCRATCH_CARTESIAN;
         }
 
-        viewer.scene.requestRender();
-        return nextHoveredId;
+        if (focusedItem && focusLabel.show) {
+          focusLabel.position = focusedItem.billboard.position;
+        }
+        scene.requestRender();
+      });
+
+      // ── Hover / click picking (scene.pick is a render pass: throttle it).
+      handler = new Cesium.ScreenSpaceEventHandler(scene.canvas);
+      const pendingPos = new Cesium.Cartesian2();
+      const pickAt = (position) => {
+        const picked = scene.pick(position);
+        const id = Cesium.defined(picked) && typeof picked.id === 'number' ? picked.id : null;
+        const store = useStore.getState();
+        if (store.hoveredSatelliteId !== id) store.setHoveredSatelliteId(id);
+        return id;
       };
-
       handler.setInputAction((movement) => {
-        updateHoveredSatellite(movement.endPosition);
+        Cesium.Cartesian2.clone(movement.endPosition, pendingPos);
+        if (pickTimer != null) return;
+        pickTimer = setTimeout(() => {
+          pickTimer = null;
+          if (viewer && !viewer.isDestroyed()) pickAt(pendingPos);
+        }, HOVER_PICK_INTERVAL_MS);
       }, Cesium.ScreenSpaceEventType.MOUSE_MOVE);
-
       handler.setInputAction((click) => {
-        const pickedId = updateHoveredSatellite(click.position);
-        if (pickedId) {
-          useStore.getState().setSelectedSatelliteId(pickedId);
-          if (onSatelliteSelect) onSatelliteSelect(pickedId);
+        const id = pickAt(click.position);
+        if (id != null) {
+          useStore.getState().setSelectedSatelliteId(id);
+          onSelectRef.current?.(id);
         }
       }, Cesium.ScreenSpaceEventType.LEFT_CLICK);
 
-      const clearHover = () => {
+      clearHover = () => {
+        if (pickTimer != null) { clearTimeout(pickTimer); pickTimer = null; }
         const store = useStore.getState();
-        if (store.hoveredSatelliteId !== null) {
-          store.setHoveredSatelliteId(null);
-        }
-        viewer.scene.requestRender();
+        if (store.hoveredSatelliteId !== null) store.setHoveredSatelliteId(null);
       };
+      scene.canvas.addEventListener('mouseleave', clearHover);
 
-      viewer.scene.canvas.addEventListener('mouseleave', clearHover);
-      viewerRef.current = viewer;
+      // ── Pause the whole render loop when the tab is hidden or the globe
+      // is scrolled offscreen.
+      stopActivity = observeActivity(container, (active) => {
+        if (!viewer || viewer.isDestroyed()) return;
+        viewer.useDefaultRenderLoop = active;
+        if (active) scene.requestRender();
+      });
 
-      // Store cleanup handles so the return callback can reach them
-      viewerRef._handler = handler;
-      viewerRef._clearHover = clearHover;
+      setViewerReady(true);
     });
 
     return () => {
-      if (rafId) cancelAnimationFrame(rafId);
-      if (ro) ro.disconnect();
-      const v = viewerRef.current;
-      if (v) {
-        try { viewerRef._handler?.destroy(); } catch (_) {}
-        try { v.scene.canvas.removeEventListener('mouseleave', viewerRef._clearHover); } catch (_) {}
-        if (!v.isDestroyed()) v.destroy();
+      cancelAnimationFrame(startRaf);
+      if (pickTimer != null) clearTimeout(pickTimer);
+      if (stopActivity) stopActivity();
+      if (removePreUpdate) removePreUpdate();
+      if (viewer && !viewer.isDestroyed()) {
+        if (clearHover) viewer.scene.canvas.removeEventListener('mouseleave', clearHover);
+        if (handler && !handler.isDestroyed()) handler.destroy();
+        // Destroys every primitive, entity and the WebGL context.
+        viewer.destroy();
       }
       viewerRef.current = null;
+      primitivesRef.current = freshPrimitives();
+      motionRef.current = freshMotion();
+      setViewerReady(false);
     };
   }, []);
 
-  // Update satellite positions when store changes
+  // ── Store subscriptions ─────────────────────────────────────────────────
   const satellites = useStore((s) => s.satellites);
   const agencyFilter = useStore((s) => s.agencyFilter);
   const selectedSatelliteId = useStore((s) => s.selectedSatelliteId);
@@ -270,627 +386,397 @@ const CesiumGlobe = ({ mode = 'live', alerts = [], onSatelliteSelect }) => {
   const computed = useTestMode((s) => s.computed);
   const selectedAId = useTestMode((s) => s.selectedA?.norad_id ?? null);
   const selectedBId = useTestMode((s) => s.selectedB?.norad_id ?? null);
-  // In threat mode only render satellites that appear in alerts
-  const alertSatIds = React.useMemo(() => {
+
+  // In threat mode only render satellites that appear in alerts.
+  const alertSatIds = useMemo(() => {
     if (mode !== 'threat') return null;
     const ids = new Set();
     for (const a of alerts) {
-      if (a.sat1?.id != null) ids.add(a.sat1.id);
-      if (a.sat2?.id != null) ids.add(a.sat2.id);
+      if (a.sat1?.id != null) ids.add(normalizeId(a.sat1.id));
+      if (a.sat2?.id != null) ids.add(normalizeId(a.sat2.id));
     }
     return ids;
   }, [mode, alerts]);
 
-  const visibleSats = React.useMemo(() => {
+  const visibleSats = useMemo(() => {
     let base = agencyFilter
       ? satellites.filter((sat) => agencyFilter.includes(sat.agency))
       : satellites;
-    if (alertSatIds !== null) {
-      base = base.filter((s) => alertSatIds.has(s.norad_id));
-    }
+    if (alertSatIds !== null) base = base.filter((s) => alertSatIds.has(normalizeId(s.norad_id)));
     return base;
   }, [satellites, agencyFilter, alertSatIds]);
 
-  useEffect(() => {
-    const viewer = viewerRef.current;
-    if (!viewer || viewer.isDestroyed()) return;
-
-    const { billboards, focusLabel, map } = primitivesRef.current;
-    if (!billboards || !focusLabel) return;
-
-    const parsedSnapshotTimestampMs = snapshotTimestamp ? Date.parse(snapshotTimestamp) : Number.NaN;
-    const snapshotTimestampMs = Number.isFinite(parsedSnapshotTimestampMs)
-      ? parsedSnapshotTimestampMs
-      : Date.now();
-    const previousSnapshotTimestampMs = motionRef.current.lastSnapshotTimestampMs;
-
-    // IMPORTANT: Ignore duplicate updates from REST vs WS race conditions.
-    // If we process a duplicate timestamp, it resets our animation elapsed time to 0,
-    // violently ripping the satellite back to its starting block.
-    if (previousSnapshotTimestampMs != null) {
-      if (snapshotTimestampMs === previousSnapshotTimestampMs) {
-        return; // Ignore exact duplicates
-      }
-      // If timestamp went backwards (REST poll resolving after WS update), ignore it
-      if (snapshotTimestampMs < previousSnapshotTimestampMs && snapshotTimestampMs > previousSnapshotTimestampMs - 10000) {
-        return; 
+  // Threat level per satellite from conjunction CPI and debris exposure.
+  const threatLevels = useMemo(() => {
+    const levels = new Map();
+    const bump = (id, level) => {
+      if (id == null || level <= 0) return;
+      const key = normalizeId(id);
+      if ((levels.get(key) ?? 0) < level) levels.set(key, level);
+    };
+    for (const a of alerts) {
+      const cpi = Number(a.cpi_score ?? 0);
+      const level = cpi >= 8 ? THREAT_WARNING : cpi >= 5 ? THREAT_CAUTION : 0;
+      bump(a.sat1?.id, level);
+      bump(a.sat2?.id, level);
+    }
+    for (const cloud of debrisClouds || EMPTY) {
+      for (const sat of cloud.affected_satellites || EMPTY) {
+        bump(sat.norad_id, sat.risk_band === 'high' ? THREAT_WARNING : THREAT_CAUTION);
       }
     }
+    return levels;
+  }, [alerts, debrisClouds]);
 
-    const previousSnapshotPositions = motionRef.current.snapshotPositions;
-    const nextSnapshotPositions = new Map();
-    const nextSnapshotVelocities = new Map();
-    const existingIds = new Set();
-    const focusedSatelliteId = useStore.getState().hoveredSatelliteId;
-    const defaultColor = Cesium.Color.WHITE.withAlpha(0.55);
-    const deltaSeconds = previousSnapshotTimestampMs != null
-      ? Math.max((snapshotTimestampMs - previousSnapshotTimestampMs) / 1000, 0.001)
-      : 1;
+  // ── Snapshot ingest: add/remove billboards, re-baseline dead reckoning ──
+  useEffect(() => {
+    const viewer = viewerRef.current;
+    if (!viewerReady || !viewer || viewer.isDestroyed()) return;
+    const prims = primitivesRef.current;
+    const { billboards, map } = prims;
+    if (!billboards) return;
+    const motion = motionRef.current;
+
+    const parsed = snapshotTimestamp ? Date.parse(snapshotTimestamp) : Number.NaN;
+    const snapshotMs = Number.isFinite(parsed) ? parsed : Date.now();
+    const prevMs = motion.lastSnapshotTimestampMs;
+    // REST/WS races can deliver the same or an older snapshot; re-baselining
+    // on those would yank dots backwards. Still sync membership (filters).
+    const isNewSnapshot = prevMs == null
+      || (snapshotMs !== prevMs && !(snapshotMs < prevMs && snapshotMs > prevMs - 10000));
+    const deltaSeconds = prevMs != null ? Math.max((snapshotMs - prevMs) / 1000, 0.001) : 1;
+    const prevPositions = motion.snapshotPositions;
+    const nextPositions = isNewSnapshot ? new Map() : prevPositions;
+    const seen = new Set();
 
     for (const sat of visibleSats) {
-      existingIds.add(sat.norad_id);
-      nextSnapshotPositions.set(sat.norad_id, sat.position);
+      if (!sat.position) continue;
+      const id = sat.norad_id;
+      seen.add(id);
+      let item = map.get(id);
+      if (item && !isNewSnapshot) continue;
 
-      const previousPosition = previousSnapshotPositions.get(sat.norad_id);
-      const snapshotVelocity = sat.velocity
-        ? {
-            vx: sat.velocity.vx || 0,
-            vy: sat.velocity.vy || 0,
-            vz: sat.velocity.vz || 0,
-          }
-        : null;
-      const derivedVelocity = previousPosition
-        ? {
-            vx: (sat.position.x - previousPosition.x) / deltaSeconds,
-            vy: (sat.position.y - previousPosition.y) / deltaSeconds,
-            vz: (sat.position.z - previousPosition.z) / deltaSeconds,
-          }
-        : ZERO_VELOCITY;
-      const velocity = snapshotVelocity || derivedVelocity;
+      let velocity = null;
+      if (sat.velocity) {
+        velocity = { vx: sat.velocity.vx || 0, vy: sat.velocity.vy || 0, vz: sat.velocity.vz || 0 };
+      } else {
+        const prev = prevPositions.get(id);
+        if (prev) {
+          velocity = {
+            vx: (sat.position.x - prev.x) / deltaSeconds,
+            vy: (sat.position.y - prev.y) / deltaSeconds,
+            vz: (sat.position.z - prev.z) / deltaSeconds,
+          };
+        }
+      }
+      if (isNewSnapshot) nextPositions.set(id, sat.position);
 
-      let item = map.get(sat.norad_id);
       if (item) {
-        item.previousEciPosition = item.eciPosition || sat.position;
-        item.previousEciVelocity = item.eciVelocity || velocity;
         item.name = sat.name;
-        item.agencyColor = sat.agency_color || null;
         item.eciPosition = sat.position;
         item.eciVelocity = velocity;
-        item.snapshotEpochUtc = sat.epoch_utc || null;
+        // Carry the gap to where the dot is drawn now as a decaying offset.
+        item.correction = correctionFor(item.renderEci, sat.position, item.correctionBuf);
       } else {
-        const satColor = sat.agency_color
-          ? Cesium.Color.fromCssColorString(sat.agency_color).withAlpha(0.7)
-          : defaultColor;
-        const billboard = billboards.add({
-          position: new Cesium.Cartesian3(),
-          image: '/dot-medium.png',
-          color: satColor,
-          scale: SATELLITE_DEFAULT_SCALE,
-          scaleByDistance: SATELLITE_SCALE_BY_DISTANCE,
-          id: sat.norad_id,
-        });
-
+        const { x, y, z } = sat.position;
         item = {
-          billboard,
+          billboard: billboards.add({
+            position: new Cesium.Cartesian3(x * 1000, y * 1000, z * 1000),
+            image: '/dot-medium.png',
+            color: COLORS.satNominal,
+            scale: SATELLITE_DEFAULT_SCALE,
+            scaleByDistance: SATELLITE_SCALE_BY_DISTANCE,
+            id,
+          }),
           name: sat.name,
-          agencyColor: sat.agency_color || null,
-          previousEciPosition: sat.position,
-          previousEciVelocity: velocity,
           eciPosition: sat.position,
           eciVelocity: velocity,
-          snapshotEpochUtc: sat.epoch_utc || null,
+          renderEci: { x, y, z },
+          correction: null,
+          correctionBuf: { x: 0, y: 0, z: 0 },
         };
-        map.set(sat.norad_id, item);
+        map.set(id, item);
       }
-
-      nextSnapshotVelocities.set(sat.norad_id, velocity);
     }
 
-    // Remove entities no longer in the satellite list
-    for (const [id, item] of map.entries()) {
-      if (!existingIds.has(id)) {
+    for (const [id, item] of map) {
+      if (!seen.has(id)) {
         billboards.remove(item.billboard);
         map.delete(id);
+        if (prims.focusedItem === item) prims.focusedItem = null;
       }
     }
 
-    motionRef.current.snapshotPositions = nextSnapshotPositions;
-    motionRef.current.previousSnapshotPositions = previousSnapshotPositions;
-    motionRef.current.snapshotVelocities = nextSnapshotVelocities;
-    motionRef.current.previousSnapshotTimestampMs = previousSnapshotTimestampMs;
-    motionRef.current.lastSnapshotTimestampMs = snapshotTimestampMs;
-    motionRef.current.lastSnapshotReceivedPerfMs = performance.now();
-    motionRef.current.snapshotIntervalMs = previousSnapshotTimestampMs != null
-      ? Math.max(snapshotTimestampMs - previousSnapshotTimestampMs, 250)
-      : 1000;
-
-    const updateDate = new Date(snapshotTimestampMs);
-    const gmst = computeGmst(updateDate);
-    const cosG = Math.cos(gmst);
-    const sinG = Math.sin(gmst);
-
-    for (const item of map.values()) {
-      if (!item.eciPosition) continue;
-      const cartesian = eciToCesiumCartesianFast(item.eciPosition, cosG, sinG);
-      setBillboardPosition(item.billboard, cartesian);
+    if (isNewSnapshot) {
+      const nowPerf = performance.now();
+      motion.simRate = estimateSimRate(prevMs, motion.lastSnapshotReceivedPerfMs, snapshotMs, nowPerf, motion.simRate || 1);
+      motion.snapshotPositions = nextPositions;
+      motion.lastSnapshotTimestampMs = snapshotMs;
+      motion.lastSnapshotReceivedPerfMs = nowPerf;
+      motion.settled = false;
     }
-
-    const focusedItem = focusedSatelliteId != null ? map.get(focusedSatelliteId) : null;
-    if (focusedItem) {
-      focusLabel.show = true;
-      focusLabel.text = focusedItem.name;
-      focusLabel.position = focusedItem.billboard.position;
-    } else {
-      focusLabel.show = false;
-    }
-
     viewer.scene.requestRender();
-  }, [visibleSats, snapshotTimestamp]);
+  }, [viewerReady, visibleSats, snapshotTimestamp]);
 
+  // ── Billboard styling: colour only for state ────────────────────────────
   useEffect(() => {
     const viewer = viewerRef.current;
-    if (!viewer || viewer.isDestroyed()) return;
+    if (!viewerReady || !viewer || viewer.isDestroyed()) return;
+    const prims = primitivesRef.current;
+    const { map, focusLabel } = prims;
+    if (!focusLabel) return;
 
-    const {
-      billboards,
-      orbitPolyline,
-      orbitLines,
-      orbitMaterial,
-      orbitSegmentPolylines,
-      map,
-      focusLabel,
-    } = primitivesRef.current;
-    if (!billboards || !orbitPolyline || !orbitLines || !orbitMaterial || !focusLabel) return;
+    const aId = normalizeId(selectedAId);
+    const bId = normalizeId(selectedBId);
 
-    for (const polyline of orbitSegmentPolylines || []) {
-      orbitLines.remove(polyline);
-    }
-    primitivesRef.current.orbitSegmentPolylines = [];
-
-    const selectedColor = Cesium.Color.fromCssColorString('#22c55e');
-    const selectedAColor = Cesium.Color.fromCssColorString('#22c55e');
-    const selectedBColor = Cesium.Color.fromCssColorString('#eab308');
-    const hoverColor = Cesium.Color.WHITE.withAlpha(0.95);
-    const defaultColor = Cesium.Color.WHITE.withAlpha(0.55);
-    const affectedHighColor = Cesium.Color.fromCssColorString('#ef4444').withAlpha(0.9);
-    const affectedMediumColor = Cesium.Color.fromCssColorString('#f97316').withAlpha(0.85);
-    const affectedLowColor = Cesium.Color.fromCssColorString('#eab308').withAlpha(0.8);
-    const normalizedAId = selectedAId == null
-      ? null
-      : (Number.isNaN(Number(selectedAId)) ? selectedAId : Number(selectedAId));
-    const normalizedBId = selectedBId == null
-      ? null
-      : (Number.isNaN(Number(selectedBId)) ? selectedBId : Number(selectedBId));
-
-    const affectedRisk = new Map();
-    for (const cloud of debrisClouds || []) {
-      for (const sat of cloud.affected_satellites || []) {
-        const satId = sat.norad_id;
-        if (satId == null) continue;
-        const band = sat.risk_band || 'low';
-        const existing = affectedRisk.get(satId);
-        if (!existing || (existing === 'low' && band !== 'low') || (existing === 'medium' && band === 'high')) {
-          affectedRisk.set(satId, band);
-        }
-      }
-    }
-
-    for (const [id, item] of map.entries()) {
+    for (const [id, item] of map) {
+      const isA = aId != null && id === aId;
+      const isB = bId != null && id === bId;
       const isSelected = id === selectedSatelliteId;
       const isHovered = id === hoveredSatelliteId;
-      const isSelectedA = normalizedAId != null && id === normalizedAId;
-      const isSelectedB = normalizedBId != null && id === normalizedBId;
+      const threat = threatLevels.get(id) ?? 0;
+      const bb = item.billboard;
 
-      if (isSelectedA) {
-        item.billboard.color = selectedAColor;
-      } else if (isSelectedB) {
-        item.billboard.color = selectedBColor;
-      } else if (isSelected) {
-        item.billboard.color = selectedColor;
-      } else if (isHovered) {
-        item.billboard.color = hoverColor;
-      } else {
-        const riskBand = affectedRisk.get(id);
-        if (riskBand === 'high') {
-          item.billboard.color = affectedHighColor;
-        } else if (riskBand === 'medium') {
-          item.billboard.color = affectedMediumColor;
-        } else if (riskBand === 'low') {
-          item.billboard.color = affectedLowColor;
-        } else {
-          const agencyColor = item.agencyColor
-            ? Cesium.Color.fromCssColorString(item.agencyColor).withAlpha(0.7)
-            : defaultColor;
-          item.billboard.color = agencyColor;
-        }
-      }
+      if (isA) bb.color = COLORS.satSelectedA;
+      else if (isB) bb.color = COLORS.satSelectedB;
+      else if (isSelected) bb.color = COLORS.satSelected;
+      else if (threat === THREAT_WARNING) bb.color = COLORS.satWarning;
+      else if (threat === THREAT_CAUTION) bb.color = COLORS.satCaution;
+      else if (isHovered) bb.color = COLORS.satHover;
+      else bb.color = COLORS.satNominal;
 
-      if (isSelectedA || isSelectedB || isSelected) {
-        item.billboard.scale = SATELLITE_SELECTED_SCALE;
-      } else if (isHovered) {
-        item.billboard.scale = SATELLITE_HOVER_SCALE;
-      } else {
-        item.billboard.scale = SATELLITE_DEFAULT_SCALE;
-      }
+      bb.scale = (isA || isB || isSelected)
+        ? SATELLITE_SELECTED_SCALE
+        : (isHovered ? SATELLITE_HOVER_SCALE : SATELLITE_DEFAULT_SCALE);
     }
 
     const hoverItem = hoveredSatelliteId != null ? map.get(hoveredSatelliteId) : null;
+    prims.focusedItem = hoverItem || null;
     if (hoverItem) {
-      focusLabel.show = true;
-      focusLabel.text = hoverItem.name;
+      focusLabel.text = hoverItem.name || `#${hoveredSatelliteId}`;
       focusLabel.position = hoverItem.billboard.position;
+      focusLabel.show = true;
     } else {
       focusLabel.show = false;
     }
+    viewer.scene.requestRender();
+  }, [viewerReady, visibleSats, hoveredSatelliteId, selectedSatelliteId, selectedAId, selectedBId, threatLevels]);
 
+  // ── Selected orbit ──────────────────────────────────────────────────────
+  useEffect(() => {
+    const viewer = viewerRef.current;
+    if (!viewerReady || !viewer || viewer.isDestroyed()) return;
+    const prims = primitivesRef.current;
+    const { orbitLines, orbitPolyline, orbitMaterial } = prims;
+    if (!orbitLines || !orbitPolyline) return;
+
+    for (const polyline of prims.orbitSegmentPolylines) orbitLines.remove(polyline);
+    prims.orbitSegmentPolylines = [];
+
+    // Split where consecutive samples jump (propagation gaps).
     const segments = [];
-    let currentSegment = [];
+    let current = [];
     let previous = null;
-
-    for (const sample of selectedOrbit) {
+    for (const sample of selectedOrbit || EMPTY) {
       if (!sample?.position || !sample?.epoch_utc) continue;
       const pos = sample.position;
-
       if (previous) {
         const dx = pos.x - previous.x;
         const dy = pos.y - previous.y;
         const dz = pos.z - previous.z;
-        const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
-        if (dist > ORBIT_BREAK_DISTANCE_KM) {
-          if (currentSegment.length > 1) {
-            segments.push(currentSegment);
-          }
-          currentSegment = [];
+        if (Math.sqrt((dx * dx) + (dy * dy) + (dz * dz)) > ORBIT_BREAK_DISTANCE_KM) {
+          if (current.length > 1) segments.push(current);
+          current = [];
         }
       }
-
-      currentSegment.push(sample);
+      current.push(sample);
       previous = pos;
     }
+    if (current.length > 1) segments.push(current);
 
-    if (currentSegment.length > 1) {
-      segments.push(currentSegment);
-    }
+    const toPositions = (segment) => segment.map((s) => toCartesian3(s.position, new Date(s.epoch_utc)));
 
     if (segments.length > 0) {
-      const orbitPositions = segments[0]
-        .map((sample) => {
-          const sampleDate = new Date(sample.epoch_utc);
-          const cartesian = eciToCesiumCartesian(sample.position, sampleDate);
-          return new Cesium.Cartesian3(cartesian.x, cartesian.y, cartesian.z);
-        });
-
-      if (orbitPositions.length > 1) {
-        orbitPolyline.show = true;
-        orbitPolyline.positions = orbitPositions;
-        orbitMaterial.uniforms.color = selectedColor.withAlpha(0.8);
-      } else {
-        orbitPolyline.show = false;
-      }
+      orbitPolyline.positions = toPositions(segments[0]);
+      orbitPolyline.show = true;
     } else {
       orbitPolyline.show = false;
     }
-
-    const nextSegmentPolylines = [];
-    for (const segment of segments.slice(1)) {
-      const segmentPositions = segment.map((sample) => {
-        const sampleDate = new Date(sample.epoch_utc);
-        const cartesian = eciToCesiumCartesian(sample.position, sampleDate);
-        return new Cesium.Cartesian3(cartesian.x, cartesian.y, cartesian.z);
-      });
-
-      if (segmentPositions.length > 1) {
-        const polyline = orbitLines.add({
-          show: true,
-          positions: segmentPositions,
-          width: 2,
-          material: orbitMaterial,
-          arcType: Cesium.ArcType.NONE,
-          id: `selected-orbit-${nextSegmentPolylines.length + 1}`,
-        });
-        nextSegmentPolylines.push(polyline);
-      }
+    for (let i = 1; i < segments.length; i += 1) {
+      prims.orbitSegmentPolylines.push(orbitLines.add({
+        show: true,
+        positions: toPositions(segments[i]),
+        width: 1,
+        material: orbitMaterial,
+        arcType: Cesium.ArcType.NONE,
+        id: `selected-orbit-${i}`,
+      }));
     }
-
-    primitivesRef.current.orbitSegmentPolylines = nextSegmentPolylines;
-
     viewer.scene.requestRender();
-  }, [hoveredSatelliteId, selectedSatelliteId, selectedOrbit, selectedAId, selectedBId, debrisClouds]);
+  }, [viewerReady, selectedOrbit]);
 
+  // ── Conjunction hotspots (rebuilt only when their content changes) ──────
   useEffect(() => {
     const viewer = viewerRef.current;
-    if (!viewer || viewer.isDestroyed()) return;
+    if (!viewerReady || !viewer || viewer.isDestroyed()) return;
+    const prims = primitivesRef.current;
+    if (!prims.hotspotPoints) return;
 
-    const { hotspotPoints } = primitivesRef.current;
-    const currentHotspotZones = primitivesRef.current.hotspotZones || [];
-    if (!hotspotPoints) return;
+    const list = (hotspots || EMPTY)
+      .filter((h) => h?.position && h?.tca_utc)
+      .slice(0, MAX_HOTSPOTS);
+    const key = list.map((h) => `${h.sat1?.id}:${h.sat2?.id}:${h.tca_utc}:${h.zone_radius_km}:${h.hotspot_score}`).join('|');
+    if (key === prims.hotspotKey) return;
+    prims.hotspotKey = key;
 
-    for (const entity of currentHotspotZones) {
-      viewer.entities.remove(entity);
-    }
-    primitivesRef.current.hotspotZones = [];
+    for (const entity of prims.hotspotEntities) viewer.entities.remove(entity);
+    prims.hotspotEntities = [];
+    prims.hotspotPoints.removeAll();
 
-    hotspotPoints.removeAll();
-
-    const visibleHotspots = (hotspots || []).slice(0, 40);
-    for (const hotspot of visibleHotspots) {
-      if (!hotspot?.position || !hotspot?.tca_utc) continue;
-
-      const tcaDate = new Date(hotspot.tca_utc);
-      const cartesian = eciToCesiumCartesian(hotspot.position, tcaDate);
+    viewer.entities.suspendEvents();
+    for (const hotspot of list) {
+      const position = toCartesian3(hotspot.position, new Date(hotspot.tca_utc));
       const score = Number(hotspot.hotspot_score || 0);
-      const zoneRadiusKm = Number(hotspot.zone_radius_km || 100.0);
-      const waveColor = Cesium.Color.fromCssColorString('#ef4444');
-      const coreColor = Cesium.Color.fromCssColorString('#ef4444');
+      const radiusM = Number(hotspot.zone_radius_km || 100) * 1000;
 
-      hotspotPoints.add({
-        position: new Cesium.Cartesian3(cartesian.x, cartesian.y, cartesian.z),
-        color: coreColor.withAlpha(0.95),
-        pixelSize: 8 + (score * 8),
-        outlineColor: Cesium.Color.BLACK,
+      prims.hotspotPoints.add({
+        position,
+        color: COLORS.hotspotCore,
+        pixelSize: 5 + (Math.min(score, 1) * 3),
+        outlineColor: COLORS.void,
         outlineWidth: 1,
         disableDepthTestDistance: Number.POSITIVE_INFINITY,
       });
-
-      const shellFractions = [0.28, 0.56, 0.82, 1.0];
-      const shellAlphas = [0.16, 0.12, 0.08, 0.05];
-      const outlineAlphas = [0.35, 0.3, 0.24, 0.18];
-
-      shellFractions.forEach((fraction, index) => {
-        const shellEntity = viewer.entities.add({
-          position: new Cesium.Cartesian3(cartesian.x, cartesian.y, cartesian.z),
-          name: `hotspot-wave-${hotspot.sat1?.id || 'a'}-${hotspot.sat2?.id || 'b'}-${index}`,
-          ellipsoid: {
-            radii: new Cesium.Cartesian3(
-              zoneRadiusKm * fraction * 1000.0,
-              zoneRadiusKm * fraction * 1000.0,
-              zoneRadiusKm * fraction * 1000.0,
-            ),
-            material: waveColor.withAlpha(shellAlphas[index]),
-            outline: true,
-            outlineColor: waveColor.withAlpha(outlineAlphas[index]),
-            outlineWidth: 1,
-          },
-        });
-        primitivesRef.current.hotspotZones.push(shellEntity);
-      });
+      prims.hotspotEntities.push(viewer.entities.add({
+        position,
+        ellipsoid: {
+          radii: new Cesium.Cartesian3(radiusM, radiusM, radiusM),
+          material: COLORS.hotspotZone,
+          outline: false,
+          slicePartitions: 24,
+          stackPartitions: 12,
+        },
+      }));
     }
-
+    viewer.entities.resumeEvents();
     viewer.scene.requestRender();
-  }, [hotspots]);
+  }, [viewerReady, hotspots]);
 
+  // ── Debris clouds (rebuilt only when their geometry changes) ────────────
   useEffect(() => {
     const viewer = viewerRef.current;
-    if (!viewer || viewer.isDestroyed()) return;
+    if (!viewerReady || !viewer || viewer.isDestroyed()) return;
+    const prims = primitivesRef.current;
 
-    const currentEntities = primitivesRef.current.debrisEntities || [];
-    for (const entity of currentEntities) {
-      viewer.entities.remove(entity);
-    }
-
-    const nextEntities = [];
-    for (const cloud of debrisClouds || []) {
+    const clouds = [];
+    for (const cloud of debrisClouds || EMPTY) {
       const center = cloud.center_eci_km || {};
-      if (![center.x, center.y, center.z].every((value) => Number.isFinite(Number(value)))) {
-        continue;
-      }
-      const tcaDate = cloud.tca_utc
-        ? new Date(cloud.tca_utc)
-        : (snapshotTimestamp ? new Date(snapshotTimestamp) : new Date());
-      const cartesian = eciToCesiumCartesian(center, tcaDate);
-      const shells = Array.isArray(cloud.shells) && cloud.shells.length > 0
+      if (![center.x, center.y, center.z].every((v) => Number.isFinite(Number(v)))) continue;
+      const rawShells = Array.isArray(cloud.shells) && cloud.shells.length > 0
         ? cloud.shells
         : [{ label: 'now', radius_km: Number(cloud.radius_km_now ?? cloud.radius_km_at_tca ?? 0) }];
+      const radii = rawShells
+        .map((s) => Number(s.radius_km))
+        .filter((r) => Number.isFinite(r) && r > 0)
+        .sort((a, b) => a - b);
+      if (radii.length === 0) continue;
+      clouds.push({ cloud, center, radii });
+    }
+    const key = clouds.map(({ cloud, center, radii }) => (
+      `${cloud.id}:${cloud.tca_utc}:${Math.round(center.x)},${Math.round(center.y)},${Math.round(center.z)}:${radii.map((r) => r.toFixed(0)).join(',')}:${cloud.fragment_count}`
+    )).join('|');
+    if (key === prims.debrisKey) return;
+    prims.debrisKey = key;
 
-      const debrisColor = Cesium.Color.fromCssColorString('#a855f7');
+    for (const entity of prims.debrisEntities) viewer.entities.remove(entity);
+    prims.debrisEntities = [];
 
-      // One ellipsoid per temporal shell, so the cloud keeps its layered
-      // structure instead of collapsing into a single envelope sphere.
-      const orderedShells = [...shells]
-        .filter((shell) => Number.isFinite(Number(shell.radius_km)) && Number(shell.radius_km) > 0)
-        .sort((a, b) => Number(a.radius_km) - Number(b.radius_km));
+    viewer.entities.suspendEvents();
+    for (const { cloud, center, radii } of clouds) {
+      const date = cloud.tca_utc ? new Date(cloud.tca_utc) : new Date();
+      const position = toCartesian3(center, date);
+      const outerKm = radii[radii.length - 1];
 
-      if (orderedShells.length === 0) {
-        continue;
-      }
-
-      const debrisRadiusKm = Math.max(...orderedShells.map((s) => Number(s.radius_km)));
-
-      orderedShells.forEach((shell, index) => {
-        const radiusKm = Number(shell.radius_km);
-        // Shells are ordered inner -> outer, so invert the ramp: the outermost
-        // shell is the faintest envelope and the innermost is most opaque.
-        const t = orderedShells.length > 1 ? 1 - index / (orderedShells.length - 1) : 1;
-        const fillAlpha = 0.10 + 0.24 * t;
-        const outlineAlpha = 0.35 + 0.55 * t;
-
-        nextEntities.push(viewer.entities.add({
-          position: new Cesium.Cartesian3(cartesian.x, cartesian.y, cartesian.z),
-          name: `${cloud.id}-shell-${shell.label ?? index}`,
-          description: `${shell.label ?? 'shell'} — r=${radiusKm.toFixed(1)} km`,
+      // Faint nested shells; innermost slightly denser.
+      radii.forEach((radiusKm, index) => {
+        const t = radii.length > 1 ? 1 - (index / (radii.length - 1)) : 1;
+        const r = radiusKm * 1000;
+        prims.debrisEntities.push(viewer.entities.add({
+          position,
           ellipsoid: {
-            radii: new Cesium.Cartesian3(radiusKm * 1000.0, radiusKm * 1000.0, radiusKm * 1000.0),
-            material: debrisColor.withAlpha(fillAlpha),
-            outline: true,
-            outlineColor: debrisColor.withAlpha(outlineAlpha),
-            outlineWidth: index === orderedShells.length - 1 ? 2 : 1,
+            radii: new Cesium.Cartesian3(r, r, r),
+            material: css(PALETTE.caution, 0.04 + (0.06 * t)),
+            outline: false,
+            slicePartitions: 24,
+            stackPartitions: 12,
           },
         }));
       });
 
-      // Bright inner hazard core point
-      const debrisCore = viewer.entities.add({
-        position: new Cesium.Cartesian3(cartesian.x, cartesian.y, cartesian.z),
-        name: `${cloud.id}-core`,
+      prims.debrisEntities.push(viewer.entities.add({
+        position,
         point: {
-          pixelSize: 14,
-          color: Cesium.Color.fromCssColorString('#f0abfc').withAlpha(0.98),
-          outlineColor: Cesium.Color.fromCssColorString('#a855f7').withAlpha(0.9),
-          outlineWidth: 2,
+          pixelSize: 6,
+          color: COLORS.debrisCore,
+          outlineColor: COLORS.void,
+          outlineWidth: 1,
           disableDepthTestDistance: Number.POSITIVE_INFINITY,
-          scaleByDistance: new Cesium.NearFarScalar(1e5, 2.0, 3e7, 0.6),
         },
-      });
-      nextEntities.push(debrisCore);
-
-      // Floating label — always visible
-      const fragCount = cloud.fragment_count ?? 0;
-      const labelText = `⚠ DEBRIS FIELD\n${fragCount} FRAGMENTS · r=${debrisRadiusKm.toFixed(0)}km`;
-      const debrisLabel = viewer.entities.add({
-        position: new Cesium.Cartesian3(cartesian.x, cartesian.y, cartesian.z),
-        name: `${cloud.id}-label`,
         label: {
-          text: labelText,
-          font: 'bold 11px JetBrains Mono, monospace',
-          fillColor: Cesium.Color.fromCssColorString('#e879f9'),
-          outlineColor: Cesium.Color.BLACK,
-          outlineWidth: 3,
-          style: Cesium.LabelStyle.FILL_AND_OUTLINE,
-          pixelOffset: new Cesium.Cartesian2(0, -(debrisRadiusKm > 500 ? 60 : 40)),
-          disableDepthTestDistance: Number.POSITIVE_INFINITY,
-          scaleByDistance: new Cesium.NearFarScalar(1e5, 1.4, 3e7, 0.5),
-          translucencyByDistance: new Cesium.NearFarScalar(1e6, 1.0, 3e7, 0.7),
+          text: `DEBRIS  ${cloud.fragment_count ?? 0} FRAG  R ${outerKm.toFixed(0)} KM`,
+          font: SMALL_LABEL_FONT,
+          fillColor: COLORS.debrisText,
+          style: Cesium.LabelStyle.FILL,
+          showBackground: true,
+          backgroundColor: COLORS.labelBg,
+          backgroundPadding: new Cesium.Cartesian2(6, 3),
+          pixelOffset: new Cesium.Cartesian2(0, -12),
           horizontalOrigin: Cesium.HorizontalOrigin.CENTER,
           verticalOrigin: Cesium.VerticalOrigin.BOTTOM,
-          showBackground: true,
-          backgroundColor: Cesium.Color.fromCssColorString('#1a0030').withAlpha(0.82),
-          backgroundPadding: new Cesium.Cartesian2(8, 5),
+          disableDepthTestDistance: Number.POSITIVE_INFINITY,
         },
-      });
-      nextEntities.push(debrisLabel);
+      }));
     }
-
-    primitivesRef.current.debrisEntities = nextEntities;
+    viewer.entities.resumeEvents();
     viewer.scene.requestRender();
-  }, [debrisClouds, snapshotTimestamp]);
+  }, [viewerReady, debrisClouds]);
 
+  // ── Test-mode approach line ─────────────────────────────────────────────
   useEffect(() => {
     const viewer = viewerRef.current;
-    if (!viewer || viewer.isDestroyed()) return;
-
+    if (!viewerReady || !viewer || viewer.isDestroyed()) return;
     const { approachLine, approachMaterial } = primitivesRef.current;
     if (!approachLine || !approachMaterial) return;
 
     const satA = testSatellites.a;
     const satB = testSatellites.b;
-
-    if (!testActive || !satA || !satB || !computed || overrideAMode !== 'override' || overrideBMode !== 'override') {
-      approachLine.show = false;
-      viewer.scene.requestRender();
+    if (!testActive || !satA?.position || !satB?.position || !computed
+      || overrideAMode !== 'override' || overrideBMode !== 'override') {
+      if (approachLine.show) {
+        approachLine.show = false;
+        viewer.scene.requestRender();
+      }
       return;
     }
 
-    const epoch = testSim.currentEpochUtc || satA.epochUtc || satB.epochUtc || new Date().toISOString();
-    const epochDate = new Date(epoch);
-
+    const epochDate = new Date(testSim.currentEpochUtc || satA.epochUtc || satB.epochUtc || Date.now());
     const separationKm = Math.sqrt(
-      (satA.position.x - satB.position.x) ** 2 +
-      (satA.position.y - satB.position.y) ** 2 +
-      (satA.position.z - satB.position.z) ** 2
+      ((satA.position.x - satB.position.x) ** 2)
+      + ((satA.position.y - satB.position.y) ** 2)
+      + ((satA.position.z - satB.position.z) ** 2),
     );
-
-    let color = '#22c55e';
-    if (separationKm < 1) {
-      color = '#ef4444';
-    } else if (separationKm < 10) {
-      color = '#f97316';
-    } else if (separationKm < 100) {
-      color = '#eab308';
-    }
-
-    const cartA = eciToCesiumCartesian(satA.position, epochDate);
-    const cartB = eciToCesiumCartesian(satB.position, epochDate);
-    approachLine.positions = [
-      new Cesium.Cartesian3(cartA.x, cartA.y, cartA.z),
-      new Cesium.Cartesian3(cartB.x, cartB.y, cartB.z),
-    ];
-    approachMaterial.uniforms.color = Cesium.Color.fromCssColorString(color).withAlpha(0.9);
+    approachMaterial.uniforms.color = separationKm < 1
+      ? COLORS.approach.warning
+      : separationKm < 100 ? COLORS.approach.caution : COLORS.approach.nominal;
+    approachLine.positions = [toCartesian3(satA.position, epochDate), toCartesian3(satB.position, epochDate)];
     approachLine.show = true;
-
     viewer.scene.requestRender();
-  }, [testActive, testSatellites, testSim, overrideAMode, overrideBMode, computed]);
-
-  useEffect(() => {
-    const viewer = viewerRef.current;
-    if (!viewer || viewer.isDestroyed()) return;
-
-    const updateMotion = () => {
-      // Re-queue immediately to ensure the loop never dies
-      motionRef.current.animationFrameId = requestAnimationFrame(updateMotion);
-
-      const currentPerfMs = performance.now();
-
-      const { map, focusLabel } = primitivesRef.current;
-      const snapshotTimestampMs = motionRef.current.lastSnapshotTimestampMs;
-      const snapshotReceivedPerfMs = motionRef.current.lastSnapshotReceivedPerfMs;
-
-      if (snapshotTimestampMs == null || map.size === 0) return;
-
-      const snapshotIntervalMs = motionRef.current.snapshotIntervalMs || 1000;
-      const renderLagMs = Math.min(snapshotIntervalMs * 0.5, 500);
-      const phase = ((currentPerfMs - snapshotReceivedPerfMs) + renderLagMs) / snapshotIntervalMs;
-
-      const previousSnapshotTimestampMs = motionRef.current.previousSnapshotTimestampMs != null
-        ? motionRef.current.previousSnapshotTimestampMs
-        : snapshotTimestampMs - snapshotIntervalMs;
-      const lerpT = Math.min(Math.max(phase, 0), 1);
-      const easedT = lerpT * lerpT * (3 - (2 * lerpT));
-      const extraSeconds = Math.max(phase - 1, 0) * (snapshotIntervalMs / 1000);
-
-      const frameDate = phase <= 1
-        ? new Date(previousSnapshotTimestampMs + (easedT * snapshotIntervalMs))
-        : new Date(snapshotTimestampMs + (extraSeconds * 1000));
-      const gmst = computeGmst(frameDate);
-      const cosG = Math.cos(gmst);
-      const sinG = Math.sin(gmst);
-      
-      const hoveredSatelliteId = useStore.getState().hoveredSatelliteId;
-      const focusedItem = hoveredSatelliteId != null ? map.get(hoveredSatelliteId) : null;
-
-      for (const item of map.values()) {
-        if (!item.eciPosition) continue;
-
-        const velocity = item.eciVelocity || ZERO_VELOCITY;
-
-        const previousPosition = motionRef.current.previousSnapshotPositions.get(item.billboard.id) || item.eciPosition;
-        const currentPosition = item.eciPosition;
-
-        const targetEci = phase <= 1
-          ? {
-              x: previousPosition.x + ((currentPosition.x - previousPosition.x) * easedT),
-              y: previousPosition.y + ((currentPosition.y - previousPosition.y) * easedT),
-              z: previousPosition.z + ((currentPosition.z - previousPosition.z) * easedT),
-            }
-          : {
-              x: currentPosition.x + (velocity.vx * extraSeconds),
-              y: currentPosition.y + (velocity.vy * extraSeconds),
-              z: currentPosition.z + (velocity.vz * extraSeconds),
-            };
-
-        const cartesian = eciToCesiumCartesianFast(targetEci, cosG, sinG);
-        setBillboardPosition(item.billboard, cartesian);
-      }
-
-      if (focusedItem && focusLabel.show) {
-        focusLabel.position = focusedItem.billboard.position;
-      }
-      
-      viewer.scene.requestRender();
-    };
-
-    motionRef.current.animationFrameId = requestAnimationFrame(updateMotion);
-
-    return () => {
-      if (motionRef.current.animationFrameId) {
-        cancelAnimationFrame(motionRef.current.animationFrameId);
-      }
-    };
-  }, []);
+  }, [viewerReady, testActive, testSatellites, testSim, overrideAMode, overrideBMode, computed]);
 
   return (
     <div
       ref={containerRef}
-      style={{ width: '100%', height: '100%', background: mode === 'threat' ? '#0a0005' : '#000' }}
+      style={{ width: '100%', height: '100%', background: PALETTE.void }}
     />
   );
 };

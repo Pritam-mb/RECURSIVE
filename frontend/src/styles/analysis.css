@@ -1,0 +1,352 @@
+/* =====================================================================
+   Analysis panels — Cascade risk graph + Model status
+   Prefix: an-
+   ===================================================================== */
+
+/* ── Shared panel shell (fills its grid cell) ─────────────────────────── */
+.an-panel {
+  height: 100%;
+  overflow: hidden;
+}
+
+.an-panel .ui-panel-header {
+  min-width: 0;
+}
+
+.an-title {
+  color: var(--c-text);
+  white-space: nowrap;
+}
+
+.an-header-meta {
+  display: flex;
+  align-items: center;
+  gap: var(--s-3);
+  min-width: 0;
+  overflow: hidden;
+}
+
+.an-count {
+  font-family: var(--font-data);
+  font-size: var(--fs-micro);
+  font-variant-numeric: tabular-nums;
+  color: var(--c-text-dim);
+  white-space: nowrap;
+}
+
+/* ── Cascade risk graph ──────────────────────────────────────────────── */
+.an-legend {
+  display: flex;
+  align-items: center;
+  gap: var(--s-3);
+  min-width: 0;
+  overflow: hidden;
+}
+
+.an-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-family: var(--font-label);
+  font-size: var(--fs-micro);
+  font-weight: 600;
+  letter-spacing: var(--track-caps);
+  text-transform: uppercase;
+  color: var(--c-text-dim);
+  white-space: nowrap;
+}
+
+.an-legend-swatch {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  background: currentColor;
+}
+
+.an-graph-body {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: hidden;
+  background: var(--c-panel);
+}
+
+.an-graph-svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.an-edge {
+  fill: none;
+  stroke-width: 1;
+  vector-effect: non-scaling-stroke;
+}
+.an-edge--active   { stroke: var(--c-text-faint); }
+.an-edge--cascade  { stroke: var(--c-caution); stroke-dasharray: 3 3; opacity: 0.8; }
+.an-edge--resolved { stroke: var(--c-nominal); opacity: 0.5; }
+.an-edge.is-selected { stroke: var(--c-text-bright); opacity: 1; }
+
+.an-edge-hit {
+  fill: none;
+  stroke: transparent;
+  stroke-width: 9;
+  cursor: pointer;
+}
+.an-edge-group:hover .an-edge--active { stroke: var(--c-text-dim); }
+
+.an-edge-label {
+  font-family: var(--font-data);
+  font-size: 9px;
+  font-variant-numeric: tabular-nums;
+  fill: var(--c-text-dim);
+  paint-order: stroke;
+  stroke: var(--c-panel);
+  stroke-width: 3px;
+  stroke-linejoin: round;
+  pointer-events: none;
+}
+
+.an-node {
+  cursor: pointer;
+}
+
+.an-node-dot {
+  stroke-width: 1;
+  fill-opacity: 0.85;
+}
+
+.an-node-ring {
+  fill: none;
+  stroke: var(--c-text-bright);
+  stroke-width: 1;
+}
+
+.an-node-label {
+  font-family: var(--font-data);
+  font-size: var(--fs-micro);
+  fill: var(--c-text);
+  paint-order: stroke;
+  stroke: var(--c-panel);
+  stroke-width: 3px;
+  stroke-linejoin: round;
+  pointer-events: none;
+}
+.an-node:hover .an-node-label { fill: var(--c-text-bright); }
+
+.an-sev-critical { color: var(--c-warning); }
+.an-sev-warning  { color: var(--c-caution); }
+.an-sev-watch    { color: var(--c-info); }
+.an-sev-nominal  { color: var(--c-nominal); }
+.an-sev-cascade  { color: var(--c-caution); }
+.an-sev-unknown  { color: var(--c-text-dim); }
+
+.an-empty {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--s-1);
+  text-align: center;
+  pointer-events: none;
+}
+.an-empty-sub {
+  font-size: var(--fs-small);
+  color: var(--c-text-faint);
+}
+
+.an-tooltip {
+  position: absolute;
+  z-index: 5;
+  pointer-events: none;
+  display: grid;
+  grid-template-columns: auto auto;
+  column-gap: var(--s-3);
+  row-gap: 2px;
+  padding: 6px var(--s-2);
+  background: var(--c-overlay);
+  border: 1px solid var(--c-line-strong);
+  border-radius: var(--radius);
+  white-space: nowrap;
+}
+.an-tooltip-name {
+  grid-column: 1 / -1;
+  font-family: var(--font-data);
+  font-size: var(--fs-small);
+  color: var(--c-text-bright);
+  margin-bottom: 2px;
+}
+.an-tooltip-k {
+  font-family: var(--font-label);
+  font-size: var(--fs-micro);
+  font-weight: 600;
+  letter-spacing: var(--track-caps);
+  text-transform: uppercase;
+  color: var(--c-text-dim);
+}
+.an-tooltip-v {
+  font-family: var(--font-data);
+  font-size: var(--fs-small);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+/* ── Model status ────────────────────────────────────────────────────── */
+.an-ms-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.an-ms-banner {
+  padding: 6px var(--s-3);
+  border-bottom: 1px solid var(--c-line);
+  background: var(--c-caution-soft);
+  font-family: var(--font-data);
+  font-size: var(--fs-micro);
+  color: var(--c-caution);
+}
+
+.an-ms-group {
+  padding: var(--s-2) var(--s-3) var(--s-3);
+  border-bottom: 1px solid var(--c-line);
+}
+.an-ms-group:last-child { border-bottom: none; }
+
+.an-ms-group-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--s-2);
+  margin-bottom: 6px;
+}
+
+.an-ms-name {
+  display: inline-flex;
+  align-items: baseline;
+  gap: var(--s-2);
+  min-width: 0;
+  font-family: var(--font-ui);
+  font-size: var(--fs-body);
+  font-weight: 500;
+  color: var(--c-text-bright);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.an-ms-kind {
+  font-family: var(--font-data);
+  font-size: var(--fs-micro);
+  color: var(--c-text-faint);
+}
+
+.an-ms-state { flex-shrink: 0; }
+
+.an-ms-rows {
+  display: flex;
+  flex-direction: column;
+}
+
+.an-ms-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: var(--s-2);
+  min-height: 18px;
+}
+
+.an-ms-row--meter {
+  grid-template-columns: minmax(0, 1fr) 56px 52px;
+}
+
+.an-ms-key {
+  font-size: var(--fs-small);
+  color: var(--c-text-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.an-ms-key--mono {
+  font-family: var(--font-data);
+  font-size: var(--fs-micro);
+}
+
+.an-ms-val {
+  font-family: var(--font-data);
+  font-size: var(--fs-small);
+  font-variant-numeric: tabular-nums;
+  color: var(--c-text);
+  text-align: right;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.an-ms-gap { height: 6px; }
+
+.an-meter {
+  height: 4px;
+  background: var(--c-line);
+  overflow: hidden;
+}
+.an-meter--full { margin: 3px 0 2px; }
+
+.an-meter-fill {
+  height: 100%;
+  background: var(--c-text-dim);
+}
+.an-meter-fill.is-nominal { background: var(--c-nominal); }
+
+.an-ms-subhead {
+  margin: var(--s-2) 0 2px;
+}
+
+.an-ms-history {
+  display: flex;
+  align-items: flex-end;
+  gap: 2px;
+  height: 24px;
+  margin-top: var(--s-1);
+}
+.an-ms-history-bar {
+  flex: 0 0 6px;
+  min-height: 2px;
+  background: var(--c-text-faint);
+}
+
+.an-ms-spark {
+  display: block;
+  width: 100%;
+  height: 24px;
+  margin-top: var(--s-2);
+}
+.an-ms-spark polyline {
+  fill: none;
+  stroke: var(--c-text-dim);
+  stroke-width: 1;
+  vector-effect: non-scaling-stroke;
+}
+
+.an-ms-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  margin-top: var(--s-2);
+}
+
+.an-ms-msg {
+  min-width: 0;
+  font-family: var(--font-data);
+  font-size: var(--fs-micro);
+  word-break: break-word;
+}
+
+/* State colours on values (compound selectors beat the base value colour) */
+.an-ms-val.is-nominal { color: var(--c-nominal); }
+.an-ms-val.is-caution { color: var(--c-caution); }
+.an-ms-val.is-warning { color: var(--c-warning); }
+.an-ms-val.is-dim     { color: var(--c-text-dim); }

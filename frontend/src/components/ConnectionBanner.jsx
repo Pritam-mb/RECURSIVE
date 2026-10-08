@@ -6,9 +6,9 @@ export default function ConnectionBanner() {
   if (wsConnected) return null;
 
   return (
-    <div className="connection-banner" role="alert">
-      <div className="connection-banner-dot" />
-      <span>BACKEND OFFLINE — Attempting to reconnect. Data may be stale.</span>
+    <div className="sh-banner" role="alert">
+      <span className="ui-status is-warning">Backend offline</span>
+      <span className="sh-banner-text">Attempting to reconnect. Data may be stale.</span>
     </div>
   );
 }

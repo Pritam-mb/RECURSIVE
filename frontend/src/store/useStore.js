@@ -15,8 +15,8 @@ const useStore = create((set, get) => ({
   debrisClouds: [],
   debrisBySource: {},
   modelMetrics: null,
-  simulationDrawerOpen: true,
-  metricsDrawerOpen: true,
+  simulationDrawerOpen: false,
+  metricsDrawerOpen: false,
 
   // ── Maneuver controls ───────────────────────────────────────────────────────
   maneuver: { dvx: 0, dvy: 0, dvz: 0 },

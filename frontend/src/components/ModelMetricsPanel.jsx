@@ -1,4 +1,5 @@
 import useStore from '../store/useStore';
+import '../styles/drawers.css';
 
 const formatMetric = (value) => {
   if (value == null || Number.isNaN(Number(value))) return '---';
@@ -6,57 +7,59 @@ const formatMetric = (value) => {
 };
 
 const MetricRow = ({ label, value }) => (
-  <div className="monitor-row">
-    <span>{label}</span>
-    <span className="mono">{value}</span>
+  <div className="dr-kv">
+    <span className="dr-kv-key">{label}</span>
+    <span className="dr-kv-val">{value}</span>
   </div>
 );
 
+const ModelBlock = ({ item, rows }) => (
+  <div className="dr-model">
+    <div className="dr-model-head">
+      <span className="dr-model-name">{item.name}</span>
+      <span className="dr-model-type">{item.type}</span>
+    </div>
+    <div className="dr-kv-grid">
+      {rows.map(([label, key]) => (
+        <MetricRow key={key} label={label} value={formatMetric(item.metrics?.[key])} />
+      ))}
+    </div>
+  </div>
+);
+
+const CLASSIFICATION_ROWS = [['Accuracy', 'accuracy'], ['Precision', 'precision'], ['Recall', 'recall'], ['F1', 'f1']];
+const REGRESSION_ROWS = [['MAE', 'mae'], ['RMSE', 'rmse']];
+
 export default function ModelMetricsPanel() {
   const modelMetrics = useStore((s) => s.modelMetrics);
+  const ready = Boolean(modelMetrics?.generated_at);
 
   return (
-    <div className="panel metrics-panel">
-      <div className="panel-header">
-        <span className="panel-title">Model Scorecard</span>
-        <span className="mono" style={{ fontSize: 11 }}>
-          {modelMetrics?.generated_at ? 'READY' : 'LOADING'}
+    <div className="dr-metrics">
+      <div className="dr-row-status">
+        <span className="ui-label">Status</span>
+        <span className={`ui-status ${ready ? 'is-nominal' : 'is-dim'}`}>
+          {ready ? 'Ready' : 'Loading'}
         </span>
       </div>
 
       {!modelMetrics ? (
-        <div className="no-data">LOADING MODEL METRICS</div>
+        <div className="dr-empty">Loading model metrics</div>
       ) : (
         <>
-          <div className="monitor-card">
-            <div className="monitor-title">Classification Models</div>
+          <section className="dr-section">
+            <div className="dr-section-title ui-label">Classification Models</div>
             {(modelMetrics.classification_models || []).map((item) => (
-              <div key={item.name} style={{ marginBottom: 8 }}>
-                <div className="monitor-row">
-                  <span>{item.name}</span>
-                  <span className="mono">{item.type}</span>
-                </div>
-                <MetricRow label="Accuracy" value={formatMetric(item.metrics?.accuracy)} />
-                <MetricRow label="Precision" value={formatMetric(item.metrics?.precision)} />
-                <MetricRow label="Recall" value={formatMetric(item.metrics?.recall)} />
-                <MetricRow label="F1" value={formatMetric(item.metrics?.f1)} />
-              </div>
+              <ModelBlock key={item.name} item={item} rows={CLASSIFICATION_ROWS} />
             ))}
-          </div>
+          </section>
 
-          <div className="monitor-card" style={{ marginTop: 12 }}>
-            <div className="monitor-title">Regression Models</div>
+          <section className="dr-section">
+            <div className="dr-section-title ui-label">Regression Models</div>
             {(modelMetrics.regression_models || []).map((item) => (
-              <div key={item.name} style={{ marginBottom: 8 }}>
-                <div className="monitor-row">
-                  <span>{item.name}</span>
-                  <span className="mono">{item.type}</span>
-                </div>
-                <MetricRow label="MAE" value={formatMetric(item.metrics?.mae)} />
-                <MetricRow label="RMSE" value={formatMetric(item.metrics?.rmse)} />
-              </div>
+              <ModelBlock key={item.name} item={item} rows={REGRESSION_ROWS} />
             ))}
-          </div>
+          </section>
         </>
       )}
     </div>

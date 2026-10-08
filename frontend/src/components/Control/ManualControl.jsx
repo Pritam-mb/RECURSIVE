@@ -2,6 +2,7 @@ import { useState } from 'react';
 import useStore from '../../store/useStore';
 import useTestMode from '../../hooks/useTestMode';
 import PreflightModal from './PreflightModal';
+import '../../styles/uplink.css';
 
 const apiBaseUrl = '';
 
@@ -116,81 +117,103 @@ const ManualControl = () => {
   ];
 
   return (
-    <div className="panel control-panel">
-      <div className="panel-header">
-        <span className="panel-title">Manual Control</span>
+    <div className="ui-panel ul-mc">
+      <div className="ui-panel-header">
+        <span className="ui-label">Manual Control</span>
+        <span className="ul-header-meta">RSW frame</span>
       </div>
 
-      {!selectedSatelliteId ? (
-        <div className="no-data">SELECT A SATELLITE TO COMMAND</div>
-      ) : (
-        <div style={{ marginBottom: 12, fontFamily: 'var(--mono)', fontSize: 11, color: 'var(--text-dim)' }}>
-          Commanding: <span style={{ color: 'var(--text-bright)' }}>{selectedSatellite?.name || `#${selectedSatelliteId}`}</span>
-        </div>
-      )}
-
-      {sliders.map(({ axis, label, hint }) => (
-        <div className="slider-group" key={axis}>
-          <div className="slider-label">
-            <span>
-              {label} <span style={{ color: 'var(--text-dim)', textTransform: 'none', letterSpacing: 0 }}>({hint})</span>
-            </span>
-            <span>
-              {maneuver[axis]?.toFixed(1)} m/s
-            </span>
+      <div className="ul-mc-body">
+        {!selectedSatelliteId ? (
+          <div className="ul-empty">SELECT A SATELLITE TO COMMAND</div>
+        ) : (
+          <div className="ul-mc-target">
+            Commanding: <strong>{selectedSatellite?.name || `#${selectedSatelliteId}`}</strong>
           </div>
-          <input
-            type="range"
-            min="-5"
-            max="5"
-            step="0.05"
-            value={maneuver[axis] || 0}
-            onChange={(e) => handleSliderChange(axis, e.target.value)}
-          />
-        </div>
-      ))}
+        )}
 
-      <div className="threshold-note mono">
-        Total delta-V: {totalDeltaV.toFixed(3)} m/s
-      </div>
-
-      <div className="btn-row" style={{ marginTop: 12 }}>
-        <button className="btn" type="button" onClick={resetManeuver}>
-          Reset
-        </button>
-        <button
-          className="btn btn-execute"
-          type="button"
-          onClick={handleExecute}
-          disabled={!selectedSatelliteId || loading || !burnReady}
-        >
-          {loading ? 'Applying...' : (burnReady ? 'Run Preflight + Burn' : 'Set a non-zero burn')}
-        </button>
-      </div>
-
-      <button className="btn btn-scenario" type="button" onClick={handleTriggerScenario}>
-        Trigger Scenario
-      </button>
-
-      {result && (
-        <div
-          className={`status-banner mono ${result.error || result.status === 'ERROR' ? 'error' : ''}`}
-          style={{ marginTop: 12, textAlign: 'left' }}
-        >
-          {result.error || result.status === 'ERROR' ? (
-            <div>Rejected: {result.error || result.message || 'Unable to apply maneuver'}</div>
-          ) : (
-            <div>
-              <div>Burn applied successfully</div>
-              <div>Frame: {result.frame_used || 'RSW'}</div>
-              <div>New perigee: {result.new_perigee_km} km</div>
-              <div>New apogee: {result.new_apogee_km} km</div>
-              <div>New period: {result.new_period_min} min</div>
-              <div>Delta-V used: {Number(result.delta_v_ms || 0).toFixed(3)} m/s</div>
+        {sliders.map(({ axis, label, hint }) => (
+          <div className="ul-slider" key={axis}>
+            <div className="ul-slider-head">
+              <span className="ul-row-label">
+                {label}<span className="ul-hint">{hint}</span>
+              </span>
+              <span className="ul-row-value">
+                {maneuver[axis]?.toFixed(1)}<span className="ul-unit">m/s</span>
+              </span>
             </div>
-          )}
+            <input
+              className="ul-range"
+              type="range"
+              min="-5"
+              max="5"
+              step="0.05"
+              value={maneuver[axis] || 0}
+              onChange={(e) => handleSliderChange(axis, e.target.value)}
+            />
+          </div>
+        ))}
+
+        <div className="ul-total">
+          <span className="ul-row-label">Total delta-V</span>
+          <span className="ul-row-value">
+            {totalDeltaV.toFixed(3)}<span className="ul-unit">m/s</span>
+          </span>
         </div>
-      )}
+
+        <div className="ul-mc-actions">
+          <button className="ui-btn" type="button" onClick={resetManeuver}>
+            Reset
+          </button>
+          <button
+            className="ui-btn ui-btn--primary"
+            type="button"
+            onClick={handleExecute}
+            disabled={!selectedSatelliteId || loading || !burnReady}
+          >
+            {loading ? 'Applying...' : (burnReady ? 'Run Preflight + Burn' : 'Set a non-zero burn')}
+          </button>
+        </div>
+
+        <button className="ui-btn ul-btn-full" type="button" onClick={handleTriggerScenario}>
+          Trigger Scenario
+        </button>
+
+        {result && (
+          result.error || result.status === 'ERROR' ? (
+            <div className="ul-banner is-warning">
+              Rejected: {result.error || result.message || 'Unable to apply maneuver'}
+            </div>
+          ) : (
+            <div className="ul-kv">
+              <div className="ul-kv-row">
+                <span className="ul-kv-key">Burn applied successfully</span>
+                <span className="ul-kv-val is-nominal">OK</span>
+              </div>
+              <div className="ul-kv-row">
+                <span className="ul-kv-key">Frame</span>
+                <span className="ul-kv-val">{result.frame_used || 'RSW'}</span>
+              </div>
+              <div className="ul-kv-row">
+                <span className="ul-kv-key">New perigee</span>
+                <span className="ul-kv-val">{result.new_perigee_km}<span className="ul-unit">km</span></span>
+              </div>
+              <div className="ul-kv-row">
+                <span className="ul-kv-key">New apogee</span>
+                <span className="ul-kv-val">{result.new_apogee_km}<span className="ul-unit">km</span></span>
+              </div>
+              <div className="ul-kv-row">
+                <span className="ul-kv-key">New period</span>
+                <span className="ul-kv-val">{result.new_period_min}<span className="ul-unit">min</span></span>
+              </div>
+              <div className="ul-kv-row">
+                <span className="ul-kv-key">Delta-V used</span>
+                <span className="ul-kv-val">{Number(result.delta_v_ms || 0).toFixed(3)}<span className="ul-unit">m/s</span></span>
+              </div>
+            </div>
+          )
+        )}
+      </div>
 
       {showPreflight && (
         <PreflightModal

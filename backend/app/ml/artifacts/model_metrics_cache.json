@@ -1,7 +1,7 @@
 {
-  "generated_at": "2026-10-08T05:58:49.332963+00:00",
-  "risk_model_path": "foster-xgboost",
-  "artifact_signature": "foster-xgboost|graph_model.json:1791438434472195800:8030|gat_model.json:1791438434472195800:29612|trajectory_model.json:1791438434489475700:8292",
+  "generated_at": "2026-10-08T06:40:02.928908+00:00",
+  "risk_model_path": "boosted-stump",
+  "artifact_signature": "boosted-stump|graph_model.json:1791438434472195800:8030|gat_model.json:1791438434472195800:29612|trajectory_model.json:1791438434489475700:8292",
   "graph_attention": {
     "degenerate": false,
     "torch_available": false,
@@ -15,12 +15,12 @@
     {
       "name": "Risk Scorer",
       "type": "classification",
-      "model_path": "foster-xgboost",
+      "model_path": "boosted-stump",
       "metrics": {
-        "accuracy": 0.6013,
-        "precision": 0.0,
-        "recall": 0.0,
-        "f1": 0.0,
+        "accuracy": 0.7546,
+        "precision": 0.8783,
+        "recall": 0.4464,
+        "f1": 0.592,
         "samples": 4096
       }
     },

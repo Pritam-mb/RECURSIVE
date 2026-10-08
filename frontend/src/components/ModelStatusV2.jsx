@@ -1,5 +1,6 @@
 import { useEffect, useState, useRef } from 'react';
 import { apiGet, apiPost } from '../utils/api';
+import '../styles/analysis.css';
 
 const POLL_MS = 30_000;
 
@@ -9,6 +10,39 @@ const PIPELINE_OFF_NOTE = 'Extended pipeline off — set ENABLE_EXTENDED_PIPELIN
 
 // '—' when the value is unknown (status endpoint unreachable), never a fake 0.
 const fmt = (v) => (v == null ? '—' : Number(v).toLocaleString());
+
+// 0-1 value → clamped percentage for a flat meter; null when unknown.
+const pct01 = (v) => (v != null && Number.isFinite(Number(v)) ? Math.max(0, Math.min(1, Number(v))) * 100 : null);
+const fixed = (v, d) => (v != null && Number.isFinite(Number(v)) ? Number(v).toFixed(d) : '—');
+
+const Row = ({ k, children, valueClass = '' }) => (
+  <div className="an-ms-row">
+    <span className="an-ms-key">{k}</span>
+    <span className={`an-ms-val ${valueClass}`}>{children}</span>
+  </div>
+);
+
+const MeterRow = ({ k, pct, children, mono = false, valueClass = '' }) => (
+  <div className="an-ms-row an-ms-row--meter">
+    <span className={`an-ms-key${mono ? ' an-ms-key--mono' : ''}`}>{k}</span>
+    <div className="an-meter">
+      <div className={`an-meter-fill ${valueClass}`} style={{ width: `${pct ?? 0}%` }} />
+    </div>
+    <span className={`an-ms-val ${valueClass}`}>{children}</span>
+  </div>
+);
+
+const ModelHead = ({ name, kind, ok, okText, offText }) => (
+  <div className="an-ms-group-head">
+    <span className="an-ms-name">
+      {name}
+      {kind && <span className="an-ms-kind">{kind}</span>}
+    </span>
+    <span className={`ui-status an-ms-state ${ok ? 'is-nominal' : 'is-caution'}`}>
+      {ok ? okText : offText}
+    </span>
+  </div>
+);
 
 export default function ModelStatusV2() {
   const [metrics, setMetrics] = useState(null);
@@ -124,6 +158,14 @@ export default function ModelStatusV2() {
   const readyToRetrain = bufferFill != null ? bufferFill >= bufferThreshold : null;
   const bufferPct = bufferFill != null ? Math.min((bufferFill / bufferThreshold) * 100, 100) : 0;
 
+  const pipelineState = mlStatusReachable === false
+    ? { cls: 'is-warning', text: 'Unreachable' }
+    : pipelineEnabled === true
+      ? { cls: 'is-nominal', text: 'Pipeline on' }
+      : pipelineOff
+        ? { cls: 'is-caution', text: 'Pipeline off' }
+        : { cls: 'is-dim', text: 'Pending' };
+
   // Sparkline for sample history (simple inline SVG)
   const maxCount = Math.max(...sampleHistory.map((s) => s.count), 1);
   const sparkW = 260;
@@ -140,203 +182,173 @@ export default function ModelStatusV2() {
     .join(' ');
 
   return (
-    <div className="model-status-v2">
-      {/* Section 1: XGBoost */}
-      <div className="msv2-section">
-        <div className="msv2-section-title">XGBoost Risk Classifier</div>
-        <div className={`msv2-model-badge ${usingTrained ? 'trained' : 'heuristic'}`}>
-          {usingTrained ? '● TRAINED' : '◌ HEURISTIC'}
-        </div>
-        <div className="msv2-row"><span>Training samples</span><span>{trainSamples.toLocaleString()}</span></div>
-        {usingTrained && precision != null && (
-          <div className="msv2-row">
-            <span>Precision / Recall / F1</span>
-            <span>{precision.toFixed(2)} / {recall.toFixed(2)} / {f1.toFixed(2)}</span>
+    <section className="ui-panel an-panel an-models">
+      <header className="ui-panel-header">
+        <span className="ui-label an-title">Model Status</span>
+        <span className={`ui-status ${pipelineState.cls}`}>{pipelineState.text}</span>
+      </header>
+
+      <div className="an-ms-body">
+        {pipelineOff && <div className="an-ms-banner">{PIPELINE_OFF_NOTE}</div>}
+        {mlStatusReachable === false && (
+          <div className="an-ms-banner">ML status endpoint unreachable</div>
+        )}
+
+        {/* XGBoost */}
+        <div className="an-ms-group">
+          <ModelHead name="Risk Classifier" kind="XGBOOST" ok={usingTrained} okText="Trained" offText="Heuristic" />
+          <div className="an-ms-rows">
+            <Row k="Training samples">{trainSamples.toLocaleString()}</Row>
+            {usingTrained && precision != null && (
+              <>
+                <MeterRow k="Precision" pct={pct01(precision)}>{fixed(precision, 2)}</MeterRow>
+                <MeterRow k="Recall" pct={pct01(recall)}>{fixed(recall, 2)}</MeterRow>
+                <MeterRow k="F1" pct={pct01(f1)}>{fixed(f1, 2)}</MeterRow>
+              </>
+            )}
+            <Row k="Predictions today">{fmt(predictions)}</Row>
+            <Row k="High-risk detections" valueClass={highRisk > 0 ? 'is-caution' : ''}>{fmt(highRisk)}</Row>
           </div>
-        )}
-        <div className="msv2-row"><span>Predictions today</span><span>{fmt(predictions)}</span></div>
-        <div className="msv2-row"><span>High-risk detections</span><span>{fmt(highRisk)}</span></div>
-        {pipelineOff && <div className="msv2-note">{PIPELINE_OFF_NOTE}</div>}
 
-        {/* Feature importance bars */}
-        <div className="msv2-feature-bars">
-          {TOP_FEATURES.map((feat) => {
-            // No fabricated fallback: unknown importance renders as an empty bar + '—'.
-            const raw = riskModel?.feature_importance?.[feat];
-            const imp = raw != null && Number.isFinite(Number(raw)) ? Number(raw) : null;
-            return (
-              <div className="msv2-feature-bar-row" key={feat}>
-                <span className="msv2-feature-name">{feat}</span>
-                <div className="msv2-bar-container">
-                  <div className="msv2-bar-fill" style={{ width: `${imp != null ? Math.min(imp * 100, 100) : 0}%` }} />
-                </div>
-                <span className="msv2-feature-val">{imp != null ? `${(imp * 100).toFixed(0)}%` : '—'}</span>
-              </div>
-            );
-          })}
-        </div>
-      </div>
-
-      {/* Section 2: LSTM */}
-      <div className="msv2-section">
-        <div className="msv2-section-title">LSTM Trajectory Predictor</div>
-        <div className={`msv2-model-badge ${lstmTrained ? 'trained' : 'heuristic'}`}>
-          {lstmTrained ? '● TRAINED' : '◌ LINEAR EXTRAPOLATION'}
-        </div>
-        <div className="msv2-row">
-          <span>Training sequences</span>
-          <span>{lstmSeqs} from {fmt(lstmSats)} satellites</span>
-        </div>
-        {lstmErr != null && (
-          <div className="msv2-row"><span>Mean prediction error</span><span>{lstmErr.toFixed(2)} km</span></div>
-        )}
-        <div className="msv2-row">
-          <span>Buffer fill</span>
-          <span>{fmt(bufferFill)} / {bufferThreshold.toLocaleString()}</span>
-        </div>
-        <div className="msv2-bar-container">
-          <div className="msv2-bar-fill" style={{ width: `${bufferPct}%` }} />
-        </div>
-        {pipelineOff && <div className="msv2-note">{PIPELINE_OFF_NOTE}</div>}
-      </div>
-
-      {/* Section 3: GNN */}
-      <div className="msv2-section">
-        <div className="msv2-section-title">Graph Cascade Models</div>
-        <div className={`msv2-model-badge ${gatDegenerate ? 'heuristic' : 'trained'}`}>
-          {gatDegenerate ? '◌ GAT DEGENERATE' : '● GAT ATTENTION'}
-        </div>
-        {gatDegenerate && (
-          <div className="msv2-row">
-            <span>GAT is not an independent model</span>
-            <span style={{ color: 'var(--alert-red)' }}>ALIASES GNN</span>
-          </div>
-        )}
-        <div className="msv2-row">
-          <span>Attention trainer</span>
-          <span>{gatStatus?.trainer ?? 'unavailable'}</span>
-        </div>
-        <div className="msv2-row">
-          <span>Heads / hidden dim</span>
-          <span>
-            {gatStatus?.heads != null && gatStatus?.hidden_dim != null
-              ? `${gatStatus.heads} / ${gatStatus.hidden_dim}`
-              : 'n/a'}
-          </span>
-        </div>
-        {gatModel?.metrics?.accuracy != null && (
-          <div className="msv2-row">
-            <span>GAT accuracy</span>
-            <span>
-              {gatModel.metrics.accuracy.toFixed(4)}
-              {gatModel.independent === false ? ' (aliased)' : ''}
-            </span>
-          </div>
-        )}
-        {graphModel?.metrics?.accuracy != null && (
-          <div className="msv2-row">
-            <span>GNN accuracy</span>
-            <span>{graphModel.metrics.accuracy.toFixed(4)}</span>
-          </div>
-        )}
-        <div className="msv2-row"><span>Cascade predictions</span><span>{cascadePred}</span></div>
-        <div className="msv2-row"><span>Mean cascade depth</span><span>{Number(meanDepth).toFixed(1)}</span></div>
-      </div>
-
-      {/* Section 4: Meta-Propagator + RLHF */}
-      <div className="msv2-section">
-        <div className="msv2-section-title">Meta-Propagator + RLHF</div>
-
-        {pipelineOff && <div className="msv2-note">{PIPELINE_OFF_NOTE}</div>}
-        <div className="msv2-row"><span>Sats with corrections</span><span>{fmt(metaSats)}</span></div>
-        <div className="msv2-row">
-          <span>Mean improvement vs SGP4</span>
-          <span>{metaImprovement != null ? `${Number(metaImprovement).toFixed(1)}%` : '—'}</span>
-        </div>
-        <div className="msv2-row"><span>Total corrections</span><span>{fmt(metaCorrections)}</span></div>
-
-        <div style={{ height: 6 }} />
-
-        <div className="msv2-row"><span>RLHF decisions</span><span>{fmt(rlhfDecisions)}</span></div>
-        <div className="msv2-row">
-          <span>Approval rate</span>
-          <span>
-            {approvalRate != null ? `${(approvalRate * 100).toFixed(0)}%` : '—'}
-          </span>
-        </div>
-        <div className="msv2-row"><span>RLHF rounds</span><span>{fmt(rlhfRounds)}</span></div>
-
-        {/* Approval rate sparkline dots */}
-        {rlhfRoundRates.length > 0 && (
-          <div className="msv2-rlhf-dots">
-            {rlhfRoundRates.slice(-10).map((r, i, shown) => {
-              const round = rlhfRoundRates.length - shown.length + i + 1;
+          <div className="ui-label an-ms-subhead">Feature importance</div>
+          <div className="an-ms-rows">
+            {TOP_FEATURES.map((feat) => {
+              // No fabricated fallback: unknown importance renders as an empty bar + '—'.
+              const raw = riskModel?.feature_importance?.[feat];
+              const imp = raw != null && Number.isFinite(Number(raw)) ? Number(raw) : null;
               return (
-                <div
-                  key={round}
-                  className="msv2-rlhf-dot"
-                  style={{ height: `${Math.max(2, r * 28)}px` }}
-                  title={`Round ${round}: ${(r * 100).toFixed(0)}%`}
-                />
+                <MeterRow key={feat} k={feat} mono pct={imp != null ? Math.min(imp * 100, 100) : 0}>
+                  {imp != null ? `${(imp * 100).toFixed(0)}%` : '—'}
+                </MeterRow>
               );
             })}
           </div>
-        )}
+        </div>
+
+        {/* LSTM */}
+        <div className="an-ms-group">
+          <ModelHead name="Trajectory Predictor" kind="LSTM" ok={lstmTrained} okText="Trained" offText="Linear extrap." />
+          <div className="an-ms-rows">
+            <Row k="Training sequences">{lstmSeqs} / {fmt(lstmSats)} sats</Row>
+            {lstmErr != null && <Row k="Mean prediction error">{lstmErr.toFixed(2)} km</Row>}
+            <MeterRow k="Buffer fill" pct={bufferPct} valueClass={readyToRetrain ? 'is-nominal' : ''}>
+              {fmt(bufferFill)}/{bufferThreshold.toLocaleString()}
+            </MeterRow>
+          </div>
+        </div>
+
+        {/* GNN / GAT */}
+        <div className="an-ms-group">
+          <ModelHead name="Graph Cascade" kind="GNN / GAT" ok={!gatDegenerate} okText="GAT attention" offText="GAT degenerate" />
+          <div className="an-ms-rows">
+            {gatDegenerate && (
+              <Row k="GAT is not an independent model" valueClass="is-warning">ALIASES GNN</Row>
+            )}
+            <Row k="Attention trainer">{gatStatus?.trainer ?? 'unavailable'}</Row>
+            <Row k="Heads / hidden dim">
+              {gatStatus?.heads != null && gatStatus?.hidden_dim != null
+                ? `${gatStatus.heads} / ${gatStatus.hidden_dim}`
+                : 'n/a'}
+            </Row>
+            {gatModel?.metrics?.accuracy != null && (
+              <MeterRow
+                k={`GAT accuracy${gatModel.independent === false ? ' (aliased)' : ''}`}
+                pct={pct01(gatModel.metrics.accuracy)}
+              >
+                {gatModel.metrics.accuracy.toFixed(4)}
+              </MeterRow>
+            )}
+            {graphModel?.metrics?.accuracy != null && (
+              <MeterRow k="GNN accuracy" pct={pct01(graphModel.metrics.accuracy)}>
+                {graphModel.metrics.accuracy.toFixed(4)}
+              </MeterRow>
+            )}
+            <Row k="Cascade predictions">{cascadePred}</Row>
+            <Row k="Mean cascade depth">{Number(meanDepth).toFixed(1)}</Row>
+          </div>
+        </div>
+
+        {/* Meta-Propagator + RLHF */}
+        <div className="an-ms-group">
+          <div className="an-ms-group-head">
+            <span className="an-ms-name">
+              Meta-Propagator
+              <span className="an-ms-kind">+ RLHF</span>
+            </span>
+          </div>
+          <div className="an-ms-rows">
+            <Row k="Sats with corrections">{fmt(metaSats)}</Row>
+            <Row k="Mean improvement vs SGP4">
+              {metaImprovement != null ? `${Number(metaImprovement).toFixed(1)}%` : '—'}
+            </Row>
+            <Row k="Total corrections">{fmt(metaCorrections)}</Row>
+            <div className="an-ms-gap" />
+            <Row k="RLHF decisions">{fmt(rlhfDecisions)}</Row>
+            <MeterRow k="Approval rate" pct={pct01(approvalRate)}>
+              {approvalRate != null ? `${(approvalRate * 100).toFixed(0)}%` : '—'}
+            </MeterRow>
+            <Row k="RLHF rounds">{fmt(rlhfRounds)}</Row>
+          </div>
+
+          {/* Per-round approval history */}
+          {rlhfRoundRates.length > 0 && (
+            <div className="an-ms-history">
+              {rlhfRoundRates.slice(-10).map((r, i, shown) => {
+                const round = rlhfRoundRates.length - shown.length + i + 1;
+                return (
+                  <div
+                    key={round}
+                    className="an-ms-history-bar"
+                    style={{ height: `${Math.max(2, r * 24)}px` }}
+                    title={`Round ${round}: ${(r * 100).toFixed(0)}%`}
+                  />
+                );
+              })}
+            </div>
+          )}
+        </div>
+
+        {/* Training data accumulation */}
+        <div className="an-ms-group">
+          <div className="an-ms-group-head">
+            <span className="an-ms-name">Training Data</span>
+          </div>
+          <div className="an-ms-rows">
+            <Row k="Conjunction samples">{conjSamples.toLocaleString()}</Row>
+            <Row k="Ready to retrain (LSTM buffer)" valueClass={readyToRetrain ? 'is-nominal' : 'is-dim'}>
+              {readyToRetrain == null
+                ? '—'
+                : readyToRetrain
+                  ? 'YES'
+                  : `NO (${bufferFill.toLocaleString()}/${bufferThreshold.toLocaleString()})`}
+            </Row>
+            <Row k="Shadow retrain">{shadow == null ? '—' : shadow.enabled ? 'ENABLED' : 'DISABLED'}</Row>
+            <Row k="Last retrain">{shadow == null ? '—' : (shadow.last_retrain ?? 'never')}</Row>
+          </div>
+
+          <div className="an-ms-actions">
+            <button
+              type="button"
+              className="ui-btn"
+              onClick={triggerRetrain}
+              disabled={retrainBusy || pipelineEnabled !== true}
+              title={pipelineOff ? PIPELINE_OFF_NOTE : undefined}
+            >
+              {retrainBusy ? 'Retraining…' : 'Retrain now'}
+            </button>
+            {retrainMsg && (
+              <span className={`an-ms-msg ${retrainMsg.ok ? 'is-nominal' : 'is-warning'}`}>{retrainMsg.text}</span>
+            )}
+          </div>
+
+          {/* Sample count sparkline */}
+          {sampleHistory.length > 1 && (
+            <svg className="an-ms-spark" viewBox={`0 0 ${sparkW} ${sparkH}`} preserveAspectRatio="none">
+              <polyline points={sparkPoints} />
+            </svg>
+          )}
+        </div>
       </div>
-
-      {/* Bottom: data accumulation */}
-      <div className="msv2-section">
-        <div className="msv2-section-title">Training Data Accumulation</div>
-        <div className="msv2-row"><span>Conjunction samples</span><span>{conjSamples.toLocaleString()}</span></div>
-        <div className="msv2-row">
-          <span>Ready to retrain (LSTM buffer)</span>
-          <span style={{ color: readyToRetrain ? 'var(--alert-green)' : 'var(--text-dim)' }}>
-            {readyToRetrain == null
-              ? '—'
-              : readyToRetrain
-                ? 'YES'
-                : `NO (${bufferFill.toLocaleString()}/${bufferThreshold.toLocaleString()})`}
-          </span>
-        </div>
-        <div className="msv2-row">
-          <span>Shadow retrain</span>
-          <span>{shadow == null ? '—' : shadow.enabled ? 'ENABLED' : 'DISABLED'}</span>
-        </div>
-        <div className="msv2-row">
-          <span>Last retrain</span>
-          <span>{shadow == null ? '—' : (shadow.last_retrain ?? 'never')}</span>
-        </div>
-        {pipelineOff && <div className="msv2-note">{PIPELINE_OFF_NOTE}</div>}
-        {mlStatusReachable === false && (
-          <div className="msv2-note">ML status endpoint unreachable</div>
-        )}
-
-        <button
-          type="button"
-          className="msv2-btn"
-          onClick={triggerRetrain}
-          disabled={retrainBusy || pipelineEnabled !== true}
-          title={pipelineOff ? PIPELINE_OFF_NOTE : undefined}
-        >
-          {retrainBusy ? 'RETRAINING…' : 'RETRAIN NOW'}
-        </button>
-        {retrainMsg && (
-          <div className={`msv2-retrain-msg ${retrainMsg.ok ? 'ok' : 'err'}`}>{retrainMsg.text}</div>
-        )}
-
-        {/* Sample count sparkline */}
-        {sampleHistory.length > 1 && (
-          <svg className="msv2-sparkline" width={sparkW} height={sparkH} viewBox={`0 0 ${sparkW} ${sparkH}`}>
-            <polyline
-              points={sparkPoints}
-              fill="none"
-              stroke="var(--alert-green)"
-              strokeWidth={1.5}
-              opacity={0.7}
-            />
-          </svg>
-        )}
-      </div>
-    </div>
+    </section>
   );
 }

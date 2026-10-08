@@ -1,5 +1,6 @@
 import { useMemo, useState, useEffect } from 'react';
 import useTestMode from '../hooks/useTestMode';
+import '../styles/sim.css';
 
 const formatDuration = (totalSeconds) => {
   if (totalSeconds == null || Number.isNaN(totalSeconds)) return '---';
@@ -103,150 +104,156 @@ const ConjunctionMonitor = () => {
     };
   }, [computed, prediction, thresholds]);
 
+  const verdictClass = comparison
+    ? { PASS: 'is-nominal', PARTIAL: 'is-caution', FAIL: 'is-warning' }[comparison.verdict]
+    : '';
+
   return (
-    <div className="panel monitor-panel">
-      <div className="panel-header">
-        <span className="panel-title">Conjunction Monitor</span>
-        <button className="mini-btn" type="button" onClick={() => setShowThresholds((prev) => !prev)}>
-          {showThresholds ? 'Hide' : 'Thresholds'}
-        </button>
+    <section className="sim-section">
+      <div className="sim-section-head">
+        <span className="ui-label sim-section-title">Conjunction Monitor</span>
+        <div className="sim-section-head-aside">
+          {testActive && <span className="ui-status is-nominal">Live</span>}
+          <button
+            className="ui-btn sim-mini"
+            type="button"
+            aria-expanded={showThresholds}
+            onClick={() => setShowThresholds((prev) => !prev)}
+          >
+            {showThresholds ? 'Hide' : 'Thresholds'}
+          </button>
+        </div>
       </div>
 
-      {showThresholds && (
-        <div className="thresholds">
-          <div className="field-row">
-            <label>TCA Threshold (s)</label>
-            <input
-              className="field-input"
-              value={thresholds.tcaSeconds}
-              onChange={(e) => setThresholds({ tcaSeconds: Number(e.target.value) })}
-            />
+      <div className="sim-body">
+        {showThresholds && (
+          <div className="sim-fields">
+            <label className="sim-field">
+              <span className="sim-field-label">TCA threshold (s)</span>
+              <input
+                className="ui-input sim-input"
+                value={thresholds.tcaSeconds}
+                onChange={(e) => setThresholds({ tcaSeconds: Number(e.target.value) })}
+              />
+            </label>
+            <label className="sim-field">
+              <span className="sim-field-label">Miss distance threshold (%)</span>
+              <input
+                className="ui-input sim-input"
+                value={thresholds.missDistancePct}
+                onChange={(e) => setThresholds({ missDistancePct: Number(e.target.value) })}
+              />
+            </label>
+            <label className="sim-field">
+              <span className="sim-field-label">Velocity threshold (%)</span>
+              <input
+                className="ui-input sim-input"
+                value={thresholds.velocityPct}
+                onChange={(e) => setThresholds({ velocityPct: Number(e.target.value) })}
+              />
+            </label>
           </div>
-          <div className="field-row">
-            <label>Miss Distance Threshold (%)</label>
-            <input
-              className="field-input"
-              value={thresholds.missDistancePct}
-              onChange={(e) => setThresholds({ missDistancePct: Number(e.target.value) })}
-            />
-          </div>
-          <div className="field-row">
-            <label>Velocity Threshold (%)</label>
-            <input
-              className="field-input"
-              value={thresholds.velocityPct}
-              onChange={(e) => setThresholds({ velocityPct: Number(e.target.value) })}
-            />
-          </div>
-        </div>
-      )}
+        )}
 
-      <div className="monitor-card">
-        <div className="monitor-title">Closest Approach Monitor</div>
-        <div className="monitor-row">
-          <span>Current Separation</span>
-          <span className="mono">{separationKm != null ? separationKm.toFixed(2) : '---'} km</span>
+        <div className="sim-subhead">
+          <span className="ui-label">Closest approach</span>
         </div>
-        <div className="monitor-row">
-          <span>Closing Rate</span>
-          <span className={`mono ${closingRateKms != null && closingRateKms < 0 ? 'danger' : ''}`}>
+        <dl className="sim-dl">
+          <dt>Current separation</dt>
+          <dd>{separationKm != null ? separationKm.toFixed(2) : '---'} km</dd>
+          <dt>Closing rate</dt>
+          <dd className={closingRateKms != null && closingRateKms < 0 ? 'is-caution' : ''}>
             {closingRateKms != null ? closingRateKms.toFixed(3) : '---'} km/s
-          </span>
-        </div>
-        <div className="monitor-row">
-          <span>Time to Predicted TCA</span>
-          <span className="mono">{formatDuration(formattedTcaSeconds)}</span>
-        </div>
-        <div className="monitor-divider" />
-        <div className="monitor-row">
-          <span>Minimum Separation So Far</span>
-          <span className="mono">
-            {computed ? `${computed.missDistanceM.toFixed(2)} m` : '---'}
-          </span>
-        </div>
-        <div className="monitor-row">
-          <span>Computed TCA Time</span>
-          <span className="mono">{computed ? computed.tcaUtc : '---'}</span>
-        </div>
+          </dd>
+          <dt>Time to predicted TCA</dt>
+          <dd>{formatDuration(formattedTcaSeconds)}</dd>
+          <dt>Minimum separation so far</dt>
+          <dd>{computed ? `${computed.missDistanceM.toFixed(2)} m` : '---'}</dd>
+          <dt>Computed TCA time</dt>
+          <dd>{computed ? computed.tcaUtc : '---'}</dd>
+        </dl>
+
+        {computed && (
+          <>
+            <div className="sim-subhead">
+              <span className="ui-label">Simulation result</span>
+            </div>
+            <dl className="sim-dl">
+              <dt>Computed miss distance</dt>
+              <dd>{computed.missDistanceM.toFixed(2)} m</dd>
+              <dt>Computed TCA time</dt>
+              <dd>{computed.tcaUtc}</dd>
+              <dt>Computed rel. velocity</dt>
+              <dd>{computed.relVelocityKms.toFixed(3)} km/s</dd>
+              <dt>Collision detected</dt>
+              <dd className={computed.collisionDetected ? 'is-warning' : 'is-nominal'}>
+                {computed.collisionDetected ? 'YES' : 'NO'}
+              </dd>
+            </dl>
+          </>
+        )}
+
+        {comparison && (
+          <>
+            <div className="sim-subhead">
+              <span className="ui-label">Prediction comparison</span>
+            </div>
+            <table className="sim-table">
+              <thead>
+                <tr>
+                  <th className="ui-label">Metric</th>
+                  <th className="ui-label">Model</th>
+                  <th className="ui-label">Sim</th>
+                  <th className="ui-label">Δ</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td>Miss distance</td>
+                  <td>{prediction.missDistanceM || '---'} m</td>
+                  <td>{computed.missDistanceM.toFixed(2)} m</td>
+                  <td className={comparison.passMiss ? 'is-nominal' : 'is-caution'}>
+                    {comparison.missPct != null ? `${comparison.missPct.toFixed(1)}%` : '---'}
+                  </td>
+                </tr>
+                <tr>
+                  <td>TCA timestamp</td>
+                  <td title={prediction.tcaUtc || undefined}>{prediction.tcaUtc || '---'}</td>
+                  <td title={computed.tcaUtc}>{computed.tcaUtc}</td>
+                  <td className={comparison.passTca ? 'is-nominal' : 'is-caution'}>
+                    {comparison.tcaDiff != null ? `${comparison.tcaDiff.toFixed(0)}s` : '---'}
+                  </td>
+                </tr>
+                <tr>
+                  <td>Rel. velocity</td>
+                  <td>{prediction.relVelocityKms || '---'} km/s</td>
+                  <td>{computed.relVelocityKms.toFixed(3)} km/s</td>
+                  <td className={comparison.passVel ? 'is-nominal' : 'is-caution'}>
+                    {comparison.velPct != null ? `${comparison.velPct.toFixed(1)}%` : '---'}
+                  </td>
+                </tr>
+                <tr>
+                  <td>Collision</td>
+                  <td>{prediction.predictedCollision === 'yes' ? 'YES' : 'NO'}</td>
+                  <td>{computed.collisionDetected ? 'YES' : 'NO'}</td>
+                  <td className={comparison.passCollision ? 'is-nominal' : 'is-caution'}>
+                    {comparison.passCollision ? 'PASS' : 'FAIL'}
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+
+            <div className="sim-verdict">
+              <span className="ui-label">Overall verdict</span>
+              <span className={`ui-status ${verdictClass}`}>{comparison.verdict}</span>
+            </div>
+            <div className="sim-note">
+              Thresholds: TCA +/-{thresholds.tcaSeconds}s, Miss +/-{thresholds.missDistancePct}%, Vel +/-{thresholds.velocityPct}%
+            </div>
+          </>
+        )}
       </div>
-
-      {computed && (
-        <div className="result-card">
-          <div className="monitor-title">Simulation Result</div>
-          <div className="monitor-row">
-            <span>Computed Miss Distance</span>
-            <span className="mono">{computed.missDistanceM.toFixed(2)} m</span>
-          </div>
-          <div className="monitor-row">
-            <span>Computed TCA Time</span>
-            <span className="mono">{computed.tcaUtc}</span>
-          </div>
-          <div className="monitor-row">
-            <span>Computed Rel. Velocity</span>
-            <span className="mono">{computed.relVelocityKms.toFixed(3)} km/s</span>
-          </div>
-          <div className="monitor-row">
-            <span>Collision Detected</span>
-            <span className={`mono ${computed.collisionDetected ? 'danger' : 'success'}`}>
-              {computed.collisionDetected ? 'YES' : 'NO'}
-            </span>
-          </div>
-        </div>
-      )}
-
-      {comparison && (
-        <div className="comparison">
-          <div className="monitor-title">Prediction Comparison</div>
-          <div className="comparison-table">
-            <div className="comparison-row header">
-              <span>Metric</span>
-              <span>Model</span>
-              <span>Sim</span>
-              <span>Status</span>
-            </div>
-            <div className="comparison-row">
-              <span>Miss Distance</span>
-              <span>{prediction.missDistanceM || '---'} m</span>
-              <span>{computed.missDistanceM.toFixed(2)} m</span>
-              <span className={comparison.passMiss ? 'success' : 'warning'}>
-                {comparison.missPct != null ? `${comparison.missPct.toFixed(1)}%` : '---'}
-              </span>
-            </div>
-            <div className="comparison-row">
-              <span>TCA Timestamp</span>
-              <span>{prediction.tcaUtc || '---'}</span>
-              <span>{computed.tcaUtc}</span>
-              <span className={comparison.passTca ? 'success' : 'warning'}>
-                {comparison.tcaDiff != null ? `${comparison.tcaDiff.toFixed(0)}s` : '---'}
-              </span>
-            </div>
-            <div className="comparison-row">
-              <span>Rel. Velocity</span>
-              <span>{prediction.relVelocityKms || '---'} km/s</span>
-              <span>{computed.relVelocityKms.toFixed(3)} km/s</span>
-              <span className={comparison.passVel ? 'success' : 'warning'}>
-                {comparison.velPct != null ? `${comparison.velPct.toFixed(1)}%` : '---'}
-              </span>
-            </div>
-            <div className="comparison-row">
-              <span>Collision</span>
-              <span>{prediction.predictedCollision === 'yes' ? 'YES' : 'NO'}</span>
-              <span>{computed.collisionDetected ? 'YES' : 'NO'}</span>
-              <span className={comparison.passCollision ? 'success' : 'warning'}>
-                {comparison.passCollision ? 'PASS' : 'FAIL'}
-              </span>
-            </div>
-          </div>
-
-          <div className={`verdict ${comparison.verdict.toLowerCase()}`}>
-            Overall Verdict: {comparison.verdict}
-          </div>
-          <div className="threshold-note mono">
-            Thresholds: TCA +/-{thresholds.tcaSeconds}s, Miss +/-{thresholds.missDistancePct}%, Vel +/-{thresholds.velocityPct}%
-          </div>
-        </div>
-      )}
-    </div>
+    </section>
   );
 };
 

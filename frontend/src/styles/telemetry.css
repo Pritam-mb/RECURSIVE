@@ -1,0 +1,227 @@
+/* =====================================================================
+   Telemetry strip + telemetry overlay card  (prefix: tm-)
+   ===================================================================== */
+
+/* ── Strip: single row of readout cells ─────────────────────────────── */
+.tm-strip {
+  display: flex;
+  align-items: stretch;
+  height: 72px;
+  min-width: 0;
+  overflow: hidden;
+  background: var(--c-panel);
+  border-top: 1px solid var(--c-line);
+  border-bottom: 1px solid var(--c-line);
+  font-family: var(--font-ui);
+}
+
+.tm-strip--empty {
+  align-items: center;
+  padding: 0 var(--s-4);
+  gap: var(--s-3);
+}
+
+.tm-empty-label {
+  font-family: var(--font-label);
+  font-size: var(--fs-micro);
+  font-weight: 600;
+  letter-spacing: var(--track-caps);
+  text-transform: uppercase;
+  color: var(--c-text-dim);
+}
+
+.tm-empty-hint {
+  font-size: var(--fs-small);
+  color: var(--c-text-faint);
+}
+
+/* Identity cell (left) */
+.tm-ident {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 3px;
+  min-width: 168px;
+  max-width: 240px;
+  padding: 0 var(--s-4);
+  border-right: 1px solid var(--c-line);
+}
+
+.tm-ident-name {
+  font-family: var(--font-ui);
+  font-size: var(--fs-title);
+  font-weight: 600;
+  color: var(--c-text-bright);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tm-ident-meta {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  font-family: var(--font-data);
+  font-size: var(--fs-small);
+  font-variant-numeric: tabular-nums;
+  color: var(--c-text-dim);
+}
+
+/* Readout cells */
+.tm-cells {
+  flex: 1 1 auto;
+  display: flex;
+  align-items: stretch;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.tm-cell {
+  flex: 1 1 0;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 4px;
+  min-width: 0;
+  padding: 0 var(--s-3);
+  border-right: 1px solid var(--c-line);
+}
+.tm-cell:last-child { border-right: 0; }
+.tm-cell--wide { flex-grow: 2; }
+
+.tm-cell-label {
+  font-family: var(--font-label);
+  font-size: var(--fs-micro);
+  font-weight: 600;
+  letter-spacing: var(--track-caps);
+  text-transform: uppercase;
+  color: var(--c-text-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tm-cell-value {
+  display: flex;
+  align-items: baseline;
+  gap: var(--s-2);
+  font-family: var(--font-data);
+  font-size: var(--fs-data);
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  color: var(--c-text-bright);
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.tm-unit {
+  margin-left: 3px;
+  font-size: var(--fs-micro);
+  font-weight: 400;
+  color: var(--c-text-dim);
+}
+
+.tm-axis {
+  margin-right: 3px;
+  font-size: var(--fs-micro);
+  color: var(--c-text-faint);
+}
+
+/* Value-change cue: brief colour shift only, no glow/animation loop */
+.tm-num { transition: color 400ms var(--ease); }
+.tm-num.is-changed { color: var(--c-info); transition: none; }
+
+/* Fuel bar */
+.tm-bar {
+  flex: 0 0 48px;
+  height: 4px;
+  align-self: center;
+  background: var(--c-raised);
+  border: 1px solid var(--c-line-strong);
+}
+.tm-bar-fill {
+  display: block;
+  height: 100%;
+  background: var(--c-nominal);
+}
+.tm-bar-fill.is-caution { background: var(--c-caution); }
+.tm-bar-fill.is-warning { background: var(--c-warning); }
+
+.tm-sub {
+  font-size: var(--fs-small);
+  color: var(--c-text);
+}
+
+/* Status chip */
+.tm-chip {
+  display: inline-flex;
+  align-items: center;
+  height: 16px;
+  padding: 0 6px;
+  font-family: var(--font-label);
+  font-size: var(--fs-micro);
+  font-weight: 600;
+  letter-spacing: var(--track-caps);
+  text-transform: uppercase;
+  border: 1px solid currentColor;
+  border-radius: var(--radius);
+}
+
+/* ── Overlay card (TelemetryPanel) ──────────────────────────────────── */
+.tm-card {
+  position: absolute;
+  left: var(--s-3);
+  bottom: var(--s-3);
+  z-index: 10;
+  width: 260px;
+  pointer-events: none;
+  background: var(--c-panel);
+  border: 1px solid var(--c-line-strong);
+}
+
+.tm-card-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--s-2);
+  padding: var(--s-2) var(--s-3);
+  border-bottom: 1px solid var(--c-line);
+  background: var(--c-raised);
+}
+
+.tm-card-title {
+  font-size: var(--fs-title);
+  font-weight: 600;
+  color: var(--c-text-bright);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tm-card-id {
+  flex: 0 0 auto;
+  font-family: var(--font-data);
+  font-size: var(--fs-small);
+  font-variant-numeric: tabular-nums;
+  color: var(--c-text-dim);
+}
+
+.tm-card-rows {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+}
+
+.tm-card-row {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: var(--s-2) var(--s-3);
+  border-bottom: 1px solid var(--c-line);
+}
+.tm-card-row:nth-child(odd) { border-right: 1px solid var(--c-line); }
+.tm-card-row:nth-last-child(-n + 2) { border-bottom: 0; }
+
+.tm-card-empty {
+  padding: var(--s-3);
+}

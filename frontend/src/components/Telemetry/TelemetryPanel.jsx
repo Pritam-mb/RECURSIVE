@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import useStore from '../../store/useStore';
 import { eciToLla, generateKeplerianOrbit } from '../../utils/coords';
+import '../../styles/telemetry.css';
 
 const apiBaseUrl = '';
 const detailPollMs = 5000;
@@ -108,8 +109,8 @@ const TelemetryPanel = () => {
 
   if (!sat) {
     return (
-      <div className="telemetry-overlay satellite-card">
-        <div className="no-data">NO SATELLITE SELECTED</div>
+      <div className="tm-card">
+        <div className="tm-card-empty ui-label">No satellite selected</div>
       </div>
     );
   }
@@ -122,28 +123,27 @@ const TelemetryPanel = () => {
   const longitudeText = lla.lon != null ? lla.lon.toFixed(2) : '---';
 
   return (
-    <div className="telemetry-overlay satellite-card">
-      <div className="satellite-card__header">
-        <div className="satellite-card__title">{sat.name}</div>
-        <div className="satellite-card__id">#{sat.norad_id}</div>
+    <div className="tm-card">
+      <div className="tm-card-header">
+        <div className="tm-card-title">{sat.name}</div>
+        <div className="tm-card-id">#{sat.norad_id}</div>
       </div>
-      <div className="satellite-card__divider" />
-      <div className="satellite-card__rows">
-        <div className="satellite-card__row">
-          <span>Speed:</span>
-          <strong>{speedText} km/h</strong>
+      <div className="tm-card-rows">
+        <div className="tm-card-row">
+          <span className="ui-label">Speed</span>
+          <span className="tm-cell-value">{speedText}<span className="tm-unit">km/h</span></span>
         </div>
-        <div className="satellite-card__row">
-          <span>Height:</span>
-          <strong>{heightText} km</strong>
+        <div className="tm-card-row">
+          <span className="ui-label">Height</span>
+          <span className="tm-cell-value">{heightText}<span className="tm-unit">km</span></span>
         </div>
-        <div className="satellite-card__row">
-          <span>Latitude:</span>
-          <strong>{latitudeText}°</strong>
+        <div className="tm-card-row">
+          <span className="ui-label">Latitude</span>
+          <span className="tm-cell-value">{latitudeText}<span className="tm-unit">°</span></span>
         </div>
-        <div className="satellite-card__row">
-          <span>Longitude:</span>
-          <strong>{longitudeText}°</strong>
+        <div className="tm-card-row">
+          <span className="ui-label">Longitude</span>
+          <span className="tm-cell-value">{longitudeText}<span className="tm-unit">°</span></span>
         </div>
       </div>
     </div>

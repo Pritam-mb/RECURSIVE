@@ -1,6 +1,7 @@
-import { useEffect, useState, useRef } from 'react';
+import { useEffect, useState, useRef, useMemo } from 'react';
 import useStore from '../store/useStore';
 import { apiGet } from '../utils/api';
+import '../styles/telemetry.css';
 
 function useFlash(value) {
   const [flashing, setFlashing] = useState(false);
@@ -19,21 +20,36 @@ function useFlash(value) {
 function TelemetryValue({ value, unit = '' }) {
   const flash = useFlash(value);
   return (
-    <span className={flash ? 'ts-changed' : ''}>
-      {value ?? '—'}{unit}
+    <span className={`tm-num${flash ? ' is-changed' : ''}`}>
+      {value ?? '—'}
+      {unit && <span className="tm-unit">{unit}</span>}
     </span>
   );
 }
 
+function Cell({ label, wide = false, children }) {
+  return (
+    <div className={`tm-cell${wide ? ' tm-cell--wide' : ''}`}>
+      <div className="tm-cell-label">{label}</div>
+      <div className="tm-cell-value">{children}</div>
+    </div>
+  );
+}
+
+const stateClass = (status) =>
+  status === 'CRITICAL' ? 'is-warning'
+    : status === 'WARNING' || status === 'WATCH' ? 'is-caution'
+      : 'is-nominal';
+
 export default function TelemetryStrip({ selectedSatId }) {
-  const satellites = useStore((s) => s.satellites);
+  // Select only the chosen satellite rather than the full list.
+  const sat = useStore((s) => (
+    selectedSatId != null
+      ? s.satellites.find((x) => x.norad_id === selectedSatId) ?? null
+      : null
+  ));
   const alerts = useStore((s) => s.alerts);
   const [telemetry, setTelemetry] = useState(null);
-
-  // Use selectedSatId (prop) which maps to selectedSatelliteId in the store
-  const sat = selectedSatId != null
-    ? satellites.find((s) => s.norad_id === selectedSatId) ?? null
-    : null;
 
   // Poll telemetry every 2 seconds if a satellite is selected
   useEffect(() => {
@@ -52,10 +68,19 @@ export default function TelemetryStrip({ selectedSatId }) {
     return () => { cancelled = true; clearInterval(id); };
   }, [selectedSatId]);
 
+  const satNorad = sat?.norad_id;
+  const satAlerts = useMemo(
+    () => (satNorad == null
+      ? []
+      : alerts.filter((a) => a.sat1?.id === satNorad || a.sat2?.id === satNorad)),
+    [alerts, satNorad]
+  );
+
   if (!sat) {
     return (
-      <div className="telemetry-strip">
-        <div className="ts-empty">Select a satellite on the globe to view telemetry</div>
+      <div className="tm-strip tm-strip--empty">
+        <span className="tm-empty-label">No object selected</span>
+        <span className="tm-empty-hint">— click a satellite on the globe</span>
       </div>
     );
   }
@@ -78,89 +103,68 @@ export default function TelemetryStrip({ selectedSatId }) {
   const sig = telemetry?.signal_strength_dbm ?? -85;
 
   // Risk from alerts
-  const satAlerts = alerts.filter(
-    (a) => a.sat1?.id === sat.norad_id || a.sat2?.id === sat.norad_id
-  );
   const maxCpi = satAlerts.length > 0
     ? Math.max(...satAlerts.map((a) => Number(a.cpi_score ?? 0)))
     : 0;
   const status = maxCpi >= 8 ? 'CRITICAL' : maxCpi >= 5 ? 'WARNING' : maxCpi > 0 ? 'WATCH' : 'NOMINAL';
-  const cpiColor = maxCpi >= 8 ? 'var(--alert-red)' : maxCpi >= 5 ? 'var(--alert-yellow)' : 'var(--alert-green)';
+  const cpiClass = maxCpi >= 8 ? 'is-warning' : maxCpi >= 5 ? 'is-caution' : 'is-nominal';
+  const fuelClass = fuel < 15 ? 'is-warning' : fuel < 35 ? 'is-caution' : '';
 
   return (
-    <div className="telemetry-strip">
-      {/* Sat name */}
-      <div className="ts-sat-name">{sat.name}</div>
-
-      <div className="ts-divider" />
-
-      {/* Position */}
-      <div className="ts-group">
-        <div className="ts-group-label">Position (ECI km)</div>
-        <div className="ts-value-row">
-          X:<TelemetryValue value={Number(pos.x ?? 0).toFixed(1)} />
-          {' '}Y:<TelemetryValue value={Number(pos.y ?? 0).toFixed(1)} />
-          {' '}Z:<TelemetryValue value={Number(pos.z ?? 0).toFixed(1)} />
+    <div className="tm-strip">
+      <div className="tm-ident">
+        <div className="tm-ident-name" title={sat.name}>{sat.name}</div>
+        <div className="tm-ident-meta">
+          <span>NORAD {sat.norad_id}</span>
         </div>
       </div>
 
-      <div className="ts-divider" />
+      <div className="tm-cells">
+        <Cell label="Position ECI" wide>
+          <span><span className="tm-axis">X</span><TelemetryValue value={Number(pos.x ?? 0).toFixed(1)} /></span>
+          <span><span className="tm-axis">Y</span><TelemetryValue value={Number(pos.y ?? 0).toFixed(1)} /></span>
+          <span><span className="tm-axis">Z</span><TelemetryValue value={Number(pos.z ?? 0).toFixed(1)} unit="km" /></span>
+        </Cell>
 
-      {/* Velocity */}
-      <div className="ts-group">
-        <div className="ts-group-label">Velocity (km/s)</div>
-        <div className="ts-value-row">
-          Vx:<TelemetryValue value={Number(vel.vx ?? 0).toFixed(3)} />
-          {' '}Vy:<TelemetryValue value={Number(vel.vy ?? 0).toFixed(3)} />
-          {' '}Vz:<TelemetryValue value={Number(vel.vz ?? 0).toFixed(3)} />
-        </div>
-      </div>
+        <Cell label="Velocity ECI" wide>
+          <span><span className="tm-axis">X</span><TelemetryValue value={Number(vel.vx ?? 0).toFixed(3)} /></span>
+          <span><span className="tm-axis">Y</span><TelemetryValue value={Number(vel.vy ?? 0).toFixed(3)} /></span>
+          <span><span className="tm-axis">Z</span><TelemetryValue value={Number(vel.vz ?? 0).toFixed(3)} unit="km/s" /></span>
+        </Cell>
 
-      <div className="ts-divider" />
+        <Cell label="Altitude">
+          <TelemetryValue value={altKm.toFixed(1)} unit="km" />
+        </Cell>
 
-      {/* Orbital */}
-      <div className="ts-group">
-        <div className="ts-group-label">Orbital</div>
-        <div className="ts-value-row">
-          ALT:<TelemetryValue value={altKm.toFixed(0)} unit="km" />
-          {' '}SPD:<TelemetryValue value={spdKms} unit="km/s" />
-        </div>
-        <div className="ts-value-row">PER:{periodMin}min</div>
-      </div>
+        <Cell label="Speed">
+          <TelemetryValue value={spdKms} unit="km/s" />
+        </Cell>
 
-      <div className="ts-divider" />
+        <Cell label="Period">
+          <span>{periodMin}<span className="tm-unit">min</span></span>
+        </Cell>
 
-      {/* Health */}
-      <div className="ts-group">
-        <div className="ts-group-label">Health</div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-          <span style={{ fontFamily: 'var(--mono)', fontSize: 9, color: 'var(--text-dim)' }}>FUEL</span>
-          <div className="ts-fuel-bar">
-            <div className="ts-fuel-fill" style={{ width: `${fuel}%` }} />
-          </div>
-          <span style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-bright)' }}>{fuel}%</span>
-        </div>
-        <div className="ts-value-row">
-          BAT:{bat}% TMP:{temp}°C SIG:{sig}dBm
-        </div>
-      </div>
-
-      <div className="ts-divider" />
-
-      {/* Risk */}
-      <div className="ts-group">
-        <div className="ts-group-label">Risk</div>
-        <div className="ts-value-row">
-          <span className="ts-risk-cpi" style={{ color: cpiColor }}>
-            CPI {maxCpi.toFixed(1)}
+        <Cell label="Fuel">
+          <span className={fuelClass}>{fuel}<span className="tm-unit">%</span></span>
+          <span className="tm-bar">
+            <span className={`tm-bar-fill ${fuelClass}`} style={{ width: `${fuel}%` }} />
           </span>
-        </div>
-        <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
-          <span style={{ fontFamily: 'var(--mono)', fontSize: 9, color: satAlerts.length > 0 ? 'var(--alert-red)' : 'var(--text-dim)' }}>
-            ALERTS:{satAlerts.length}
+        </Cell>
+
+        <Cell label="Bat / Temp / Sig">
+          <span className="tm-sub">
+            {bat}<span className="tm-unit">%</span>{' '}
+            {temp}<span className="tm-unit">°C</span>{' '}
+            {sig}<span className="tm-unit">dBm</span>
           </span>
-          <span className={`ts-status-badge ${status}`}>{status}</span>
-        </div>
+        </Cell>
+
+        <Cell label={`Risk · ${satAlerts.length} alert${satAlerts.length === 1 ? '' : 's'}`}>
+          <span className={cpiClass}>
+            {maxCpi.toFixed(1)}<span className="tm-unit">CPI</span>
+          </span>
+          <span className={`tm-chip ${stateClass(status)}`}>{status}</span>
+        </Cell>
       </div>
     </div>
   );

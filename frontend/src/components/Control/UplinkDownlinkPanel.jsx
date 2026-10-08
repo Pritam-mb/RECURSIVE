@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from "react"
 import useStore from "../../store/useStore"
+import "../../styles/uplink.css"
 
 const API = "" // relative URLs - works on any host
 
@@ -105,242 +106,240 @@ export default function UplinkDownlinkPanel() {
 
   if (!selectedSatId) {
     return (
-      <div className="panel uplink-panel empty">
-        <div className="panel-header">Uplink / Downlink</div>
-        <div className="empty-msg">
-          Click a satellite on the globe to open telemetry
+      <div className="ui-panel ul-panel">
+        <div className="ui-panel-header">
+          <span className="ui-label">Uplink / Downlink</span>
+        </div>
+        <div className="ui-panel-body">
+          <div className="ul-empty">
+            Click a satellite on the globe to open telemetry
+          </div>
         </div>
       </div>
     )
   }
 
   const risk = telemetry?.risk
-  const riskColor = (
-    risk?.status === "CRITICAL" ? "#E24B4A" :
-    risk?.status === "WARNING" ? "#EF9F27" :
-    risk?.status === "WATCH" ? "#F5C518" :
-    "#1D9E75"
+  const riskClass = (
+    risk?.status === "CRITICAL" ? "is-warning" :
+    risk?.status === "WARNING" ? "is-caution" :
+    risk?.status === "WATCH" ? "is-caution" :
+    "is-nominal"
   )
 
   return (
-    <div className="panel uplink-panel">
+    <div className="ui-panel ul-panel">
 
       {/* Header */}
-      <div className="panel-header">
-        <span>
-          Uplink / Downlink
+      <div className="ui-panel-header">
+        <span className="ul-panel-title">
+          <span className="ui-label">Uplink / Downlink</span>
           {telemetry &&
-            <span
-              style={{ color: telemetry.agency_color || "#888",
-                       marginLeft: 8, fontSize: 12 }}
-            >
-              [{telemetry.agency}]
-            </span>
+            <span className="ul-header-meta">[{telemetry.agency}]</span>
           }
         </span>
-        <span className={`live-dot ${telemetry ? "live" : "dead"}`}>
+        <span className={`ui-status ${telemetry ? "is-nominal" : "is-dim"}`}>
           {loading ? "..." : telemetry ? "LIVE" : "OFFLINE"}
         </span>
       </div>
 
-      {error && <div className="error-banner">{error}</div>}
-
-      {/* Downlink section */}
-      {telemetry && (
-        <div className="telem-section">
-          <div className="section-label">
-            DOWNLINK - {telemetry.name}
+      <div className="ul-body">
+        {error && (
+          <div className="ul-section">
+            <div className="ul-banner is-warning">{error}</div>
           </div>
+        )}
 
-          <div className="telem-grid">
-            <div className="telem-row">
-              <span>Altitude</span>
-              <span>
-                {telemetry.orbital?.altitude_km?.toFixed(1)} km
-              </span>
+        {/* Downlink section */}
+        {telemetry && (
+          <div className="ul-section">
+            <div className="ul-section-head">
+              <span className="ui-label">Downlink</span>
+              <span className="ul-header-meta">{telemetry.name}</span>
             </div>
-            <div className="telem-row">
-              <span>Speed</span>
-              <span>
-                {telemetry.orbital?.speed_kms?.toFixed(3)} km/s
-              </span>
+
+            <div className="ul-telem-grid">
+            <div className="ul-kv-row">
+              <span className="ul-kv-key">Altitude</span>
+              <span className="ul-kv-val">{telemetry.orbital?.altitude_km?.toFixed(1)}<span className="ul-unit">km</span></span>
             </div>
-            <div className="telem-row">
-              <span>Period</span>
-              <span>
-                {telemetry.orbital?.period_min?.toFixed(1)} min
-              </span>
+            <div className="ul-kv-row">
+              <span className="ul-kv-key">Speed</span>
+              <span className="ul-kv-val">{telemetry.orbital?.speed_kms?.toFixed(3)}<span className="ul-unit">km/s</span></span>
             </div>
-            <div className="telem-row">
-              <span>Pos X</span>
-              <span>
-                {telemetry.position_eci_km?.x?.toFixed(0)} km
-              </span>
+            <div className="ul-kv-row">
+              <span className="ul-kv-key">Period</span>
+              <span className="ul-kv-val">{telemetry.orbital?.period_min?.toFixed(1)}<span className="ul-unit">min</span></span>
             </div>
-            <div className="telem-row">
-              <span>Pos Y</span>
-              <span>
-                {telemetry.position_eci_km?.y?.toFixed(0)} km
-              </span>
+            <div className="ul-kv-row">
+              <span className="ul-kv-key">Pos X</span>
+              <span className="ul-kv-val">{telemetry.position_eci_km?.x?.toFixed(0)}<span className="ul-unit">km</span></span>
             </div>
-            <div className="telem-row">
-              <span>Pos Z</span>
-              <span>
-                {telemetry.position_eci_km?.z?.toFixed(0)} km
-              </span>
+            <div className="ul-kv-row">
+              <span className="ul-kv-key">Pos Y</span>
+              <span className="ul-kv-val">{telemetry.position_eci_km?.y?.toFixed(0)}<span className="ul-unit">km</span></span>
             </div>
-            <div className="telem-row">
-              <span>Vel X</span>
-              <span>
-                {telemetry.velocity_kms?.vx?.toFixed(4)} km/s
-              </span>
+            <div className="ul-kv-row">
+              <span className="ul-kv-key">Pos Z</span>
+              <span className="ul-kv-val">{telemetry.position_eci_km?.z?.toFixed(0)}<span className="ul-unit">km</span></span>
             </div>
-            <div className="telem-row">
-              <span>Vel Y</span>
-              <span>
-                {telemetry.velocity_kms?.vy?.toFixed(4)} km/s
-              </span>
+            <div className="ul-kv-row">
+              <span className="ul-kv-key">Vel X</span>
+              <span className="ul-kv-val">{telemetry.velocity_kms?.vx?.toFixed(4)}<span className="ul-unit">km/s</span></span>
             </div>
-            <div className="telem-row">
-              <span>Vel Z</span>
-              <span>
-                {telemetry.velocity_kms?.vz?.toFixed(4)} km/s
-              </span>
+            <div className="ul-kv-row">
+              <span className="ul-kv-key">Vel Y</span>
+              <span className="ul-kv-val">{telemetry.velocity_kms?.vy?.toFixed(4)}<span className="ul-unit">km/s</span></span>
             </div>
-            <div className="telem-row">
-              <span>Fuel</span>
-              <span>
-                {telemetry.health?.fuel_remaining_pct?.toFixed(1)}%
-              </span>
+            <div className="ul-kv-row">
+              <span className="ul-kv-key">Vel Z</span>
+              <span className="ul-kv-val">{telemetry.velocity_kms?.vz?.toFixed(4)}<span className="ul-unit">km/s</span></span>
             </div>
-            <div className="telem-row">
-              <span>Battery</span>
-              <span>
-                {telemetry.health?.battery_pct?.toFixed(1)}%
-              </span>
+            <div className="ul-kv-row">
+              <span className="ul-kv-key">Fuel</span>
+              <span className="ul-kv-val">{telemetry.health?.fuel_remaining_pct?.toFixed(1)}<span className="ul-unit">%</span></span>
             </div>
-            <div className="telem-row">
-              <span>Temp</span>
-              <span>
-                {telemetry.health?.temperature_c?.toFixed(1)} C
-              </span>
+            <div className="ul-kv-row">
+              <span className="ul-kv-key">Battery</span>
+              <span className="ul-kv-val">{telemetry.health?.battery_pct?.toFixed(1)}<span className="ul-unit">%</span></span>
             </div>
-            <div className="telem-row">
-              <span>Signal</span>
-              <span>
-                {telemetry.health?.signal_strength_dbm?.toFixed(1)} dBm
-              </span>
+            <div className="ul-kv-row">
+              <span className="ul-kv-key">Temp</span>
+              <span className="ul-kv-val">{telemetry.health?.temperature_c?.toFixed(1)}<span className="ul-unit">C</span></span>
             </div>
-            <div className="telem-row">
-              <span>Alerts</span>
-              <span>{telemetry.risk?.active_alerts ?? 0}</span>
+            <div className="ul-kv-row">
+              <span className="ul-kv-key">Signal</span>
+              <span className="ul-kv-val">{telemetry.health?.signal_strength_dbm?.toFixed(1)}<span className="ul-unit">dBm</span></span>
             </div>
-            <div className="telem-row">
-              <span>CPI</span>
-              <span style={{ color: riskColor, fontWeight: 600 }}>
-                {telemetry.risk?.cpi_score?.toFixed(1)} - {" "}
-                {telemetry.risk?.status}
-              </span>
-            </div>
-            <div className="telem-row">
-              <span>Data Age</span>
-              <span>{telemetry.data_age_seconds}s ago</span>
+              <div className="ul-kv-row">
+                <span className="ul-kv-key">Alerts</span>
+                <span className="ul-kv-val">{telemetry.risk?.active_alerts ?? 0}</span>
+              </div>
+              <div className="ul-kv-row">
+                <span className="ul-kv-key">CPI</span>
+                <span className={`ul-kv-val ${riskClass}`}>
+                  {telemetry.risk?.cpi_score?.toFixed(1)} - {" "}
+                  {telemetry.risk?.status}
+                </span>
+              </div>
+              <div className="ul-kv-row">
+                <span className="ul-kv-key">Data Age</span>
+                <span className="ul-kv-val">{telemetry.data_age_seconds}<span className="ul-unit">s ago</span></span>
+              </div>
             </div>
           </div>
-        </div>
-      )}
+        )}
 
-      {/* Uplink section */}
-      <div className="uplink-section">
-        <div className="section-label">UPLINK - Send Command</div>
+        {/* Uplink section */}
+        <div className="ul-section">
+          <div className="ul-section-head">
+            <span className="ui-label">Uplink</span>
+          </div>
 
-        <div className="control-row">
-          <label>Command Type</label>
-          <select
-            value={cmdType}
-            onChange={e => setCmdType(e.target.value)}
-          >
-            {COMMAND_TYPES.map(c => (
-              <option key={c.value} value={c.value}>
-                {c.label}
-              </option>
-            ))}
-          </select>
-        </div>
-
-        {cmdType === "MANEUVER" && (
-          <>
-            <div className="control-row">
-              <label>
-                Delta-V: <strong>{deltaV.toFixed(2)} m/s</strong>
-              </label>
-              <input
-                type="range"
-                min="0.01" max="2.0" step="0.01"
-                value={deltaV}
-                onChange={e => setDeltaV(parseFloat(e.target.value))}
-              />
-            </div>
-            <div className="control-row">
-              <label>Direction</label>
+          <div className="ul-form">
+            <div className="ul-row ul-row--span">
+              <label className="ul-row-label" htmlFor="ul-cmd-type">Command</label>
               <select
-                value={direction}
-                onChange={e => setDirection(e.target.value)}
+                id="ul-cmd-type"
+                className="ui-select ul-select"
+                value={cmdType}
+                onChange={e => setCmdType(e.target.value)}
               >
-                {DIRECTIONS.map(d => (
-                  <option key={d.value} value={d.value}>
-                    {d.label}
+                {COMMAND_TYPES.map(c => (
+                  <option key={c.value} value={c.value}>
+                    {c.label}
                   </option>
                 ))}
               </select>
             </div>
-          </>
-        )}
 
-        {cmdType === "SET_ORBIT" && (
-          <div className="control-row">
-            <label>
-              Target Altitude: <strong>{altitudeKm} km</strong>
-            </label>
-            <input
-              type="range"
-              min="200" max="35786" step="10"
-              value={altitudeKm}
-              onChange={e => setAltitudeKm(parseInt(e.target.value))}
-            />
-          </div>
-        )}
+            {cmdType === "MANEUVER" && (
+              <>
+                <div className="ul-row">
+                  <span className="ul-row-label">Delta-V</span>
+                  <input
+                    className="ul-range"
+                    type="range"
+                    min="0.01" max="2.0" step="0.01"
+                    value={deltaV}
+                    onChange={e => setDeltaV(parseFloat(e.target.value))}
+                  />
+                  <span className="ul-row-value">
+                    {deltaV.toFixed(2)}<span className="ul-unit">m/s</span>
+                  </span>
+                </div>
+                <div className="ul-row ul-row--span">
+                  <label className="ul-row-label" htmlFor="ul-cmd-dir">Direction</label>
+                  <select
+                    id="ul-cmd-dir"
+                    className="ui-select ul-select"
+                    value={direction}
+                    onChange={e => setDirection(e.target.value)}
+                  >
+                    {DIRECTIONS.map(d => (
+                      <option key={d.value} value={d.value}>
+                        {d.label}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              </>
+            )}
 
-        <button
-          className="uplink-btn"
-          onClick={sendUplink}
-          disabled={sending || !selectedSatId}
-        >
-          {sending ? "SENDING UPLINK..." : "SEND UPLINK COMMAND"}
-        </button>
-      </div>
-
-      {/* Command log */}
-      {cmdLog.length > 0 && (
-        <div className="cmd-log-section">
-          <div className="section-label">COMMAND LOG</div>
-          <div className="cmd-log">
-            {cmdLog.map(entry => (
-              <div
-                key={entry.id}
-                className={`log-row ${entry.success ? "ok" : "fail"}`}
-              >
-                <span className="log-time">{entry.time}</span>
-                <span className="log-type">{entry.type}</span>
-                <span className="log-status">
-                  {entry.success ? "OK" : "FAIL"}
+            {cmdType === "SET_ORBIT" && (
+              <div className="ul-row">
+                <span className="ul-row-label">Target Alt</span>
+                <input
+                  className="ul-range"
+                  type="range"
+                  min="200" max="35786" step="10"
+                  value={altitudeKm}
+                  onChange={e => setAltitudeKm(parseInt(e.target.value))}
+                />
+                <span className="ul-row-value">
+                  {altitudeKm}<span className="ul-unit">km</span>
                 </span>
-                <span className="log-msg">{entry.message}</span>
               </div>
-            ))}
+            )}
+
+            <div className="ul-actions">
+              <button
+                type="button"
+                className="ui-btn ui-btn--primary"
+                onClick={sendUplink}
+                disabled={sending || !selectedSatId}
+              >
+                {sending ? "SENDING UPLINK..." : "SEND UPLINK COMMAND"}
+              </button>
+            </div>
           </div>
         </div>
-      )}
+
+        {/* Command log */}
+        {cmdLog.length > 0 && (
+          <div className="ul-section">
+            <div className="ul-section-head">
+              <span className="ui-label">Command Log</span>
+            </div>
+            <div className="ul-log">
+              <div className="ul-log-row ul-log-row--head">
+                <span>Time</span><span>Dir</span><span>Cmd</span><span>Message</span><span className="ul-log-status">Stat</span>
+              </div>
+              {cmdLog.map(entry => (
+                <div key={entry.id} className="ul-log-row" title={entry.message}>
+                  <span className="ul-log-time">{entry.time}</span>
+                  <span className="ul-log-dir">UL</span>
+                  <span className="ul-log-type">{entry.type}</span>
+                  <span className="ul-log-msg">{entry.message}</span>
+                  <span className={`ul-log-status ${entry.success ? "is-nominal" : "is-warning"}`}>
+                    {entry.success ? "OK" : "FAIL"}
+                  </span>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+      </div>
     </div>
   )
 }

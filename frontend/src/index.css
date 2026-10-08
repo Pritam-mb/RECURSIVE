@@ -1,21 +1,84 @@
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Barlow:wght@400;500;600&family=Barlow+Semi+Condensed:wght@500;600&family=IBM+Plex+Mono:wght@400;500&display=swap');
 
+/* =====================================================================
+   ORBITAL SENTINEL — Flight Console design system
+   Restrained, operational, high-legibility. Think crew-display / MCC:
+   near-black surfaces, hairline dividers, small tracked caps labels,
+   tabular mono numerics, colour reserved for state.
+   ===================================================================== */
 :root {
   color-scheme: dark;
-  --bg: #000000;
-  --panel-bg: #0a0a0a;
-  --border: #1f2937;
-  --text: #d1d5db;
-  --text-dim: #6b7280;
-  --text-bright: #f3f4f6;
-  --text-mono: #9ca3af;
-  --alert-red: #ef4444;
-  --alert-yellow: #eab308;
-  --alert-green: #22c55e;
-  --white: #ffffff;
 
-  --sans: 'Inter', system-ui, -apple-system, sans-serif;
-  --mono: 'JetBrains Mono', ui-monospace, Consolas, monospace;
+  /* Surfaces (darkest → lightest) */
+  --c-void: #030508;        /* behind globes */
+  --c-base: #070a0e;        /* app background */
+  --c-panel: #0b0f14;       /* panel body */
+  --c-raised: #11161d;      /* headers, inputs, hover rows */
+  --c-overlay: #161c25;     /* menus, modals, active rows */
+
+  /* Lines */
+  --c-line: #1a212b;        /* hairline divider */
+  --c-line-strong: #27303c; /* control borders */
+  --c-line-focus: #4c8dff;
+
+  /* Text */
+  --c-text: #c3cbd5;
+  --c-text-dim: #6b7685;
+  --c-text-faint: #454e5b;
+  --c-text-bright: #eef2f6;
+
+  /* Accent (single, cool) */
+  --c-accent: #4c8dff;
+  --c-accent-soft: rgba(76, 141, 255, 0.12);
+
+  /* State — only for status, never decoration */
+  --c-nominal: #3ccf7a;
+  --c-caution: #f0b429;
+  --c-warning: #ff5a4f;
+  --c-info: #7cc4ff;
+  --c-nominal-soft: rgba(60, 207, 122, 0.12);
+  --c-caution-soft: rgba(240, 180, 41, 0.12);
+  --c-warning-soft: rgba(255, 90, 79, 0.12);
+
+  /* Type */
+  --font-ui: 'Barlow', 'Segoe UI', system-ui, sans-serif;
+  --font-label: 'Barlow Semi Condensed', 'Barlow', 'Segoe UI', sans-serif;
+  --font-data: 'IBM Plex Mono', ui-monospace, Consolas, monospace;
+
+  --fs-micro: 10px;   /* tracked caps labels */
+  --fs-small: 11px;
+  --fs-body: 12px;
+  --fs-data: 13px;
+  --fs-title: 14px;
+  --fs-readout: 20px; /* primary numeric readouts */
+
+  --track-caps: 0.14em;
+
+  /* Spacing (4px grid) */
+  --s-1: 4px;
+  --s-2: 8px;
+  --s-3: 12px;
+  --s-4: 16px;
+  --s-5: 24px;
+
+  --radius: 2px;
+  --panel-header-h: 28px;
+  --ease: cubic-bezier(0.2, 0, 0, 1);
+
+  /* Legacy aliases — older rules keep working on the new palette */
+  --bg: var(--c-base);
+  --panel-bg: var(--c-panel);
+  --border: var(--c-line);
+  --text: var(--c-text);
+  --text-dim: var(--c-text-dim);
+  --text-bright: var(--c-text-bright);
+  --text-mono: var(--c-text);
+  --alert-red: var(--c-warning);
+  --alert-yellow: var(--c-caution);
+  --alert-green: var(--c-nominal);
+  --white: var(--c-text-bright);
+  --sans: var(--font-ui);
+  --mono: var(--font-data);
 }
 
 *,
@@ -29,13 +92,14 @@
 html, body {
   height: 100%;
   width: 100%;
-  background: var(--bg);
-  color: var(--text);
-  font-family: var(--sans);
-  font-size: 14px;
-  line-height: 1.5;
+  background: var(--c-base);
+  color: var(--c-text);
+  font-family: var(--font-ui);
+  font-size: var(--fs-body);
+  line-height: 1.45;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
   overflow: hidden;
 }
 
@@ -44,25 +108,147 @@ html, body {
   width: 100%;
 }
 
+button, input, select, textarea {
+  font: inherit;
+  color: inherit;
+}
+
+:focus-visible {
+  outline: 1px solid var(--c-line-focus);
+  outline-offset: 1px;
+}
+
+::selection { background: var(--c-accent-soft); }
+
 /* Scrollbar */
-::-webkit-scrollbar {
-  width: 4px;
-}
-::-webkit-scrollbar-track {
-  background: var(--bg);
-}
-::-webkit-scrollbar-thumb {
-  background: var(--border);
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--c-line-strong); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: var(--c-text-faint); }
+
+/* ── Shared primitives (use these in components) ─────────────────────── */
+
+/* Tracked caps label: "TRACKED", "MISS DIST", panel titles */
+.ui-label {
+  font-family: var(--font-label);
+  font-size: var(--fs-micro);
+  font-weight: 600;
+  letter-spacing: var(--track-caps);
+  text-transform: uppercase;
+  color: var(--c-text-dim);
 }
 
-/* Monospace data class */
+/* Numeric readouts — always tabular */
+.ui-data,
 .mono {
-  font-family: var(--mono);
-  color: var(--text-mono);
-  font-size: 13px;
+  font-family: var(--font-data);
+  font-size: var(--fs-data);
+  font-variant-numeric: tabular-nums;
+  color: var(--c-text);
 }
 
-/* Severity colors */
-.severity-red { color: var(--alert-red); }
-.severity-yellow { color: var(--alert-yellow); }
-.severity-green { color: var(--alert-green); }
+.ui-readout {
+  font-family: var(--font-data);
+  font-size: var(--fs-readout);
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  color: var(--c-text-bright);
+  line-height: 1.1;
+}
+
+/* Panel shell: header bar + scrolling body */
+.ui-panel {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  background: var(--c-panel);
+  border: 1px solid var(--c-line);
+}
+.ui-panel-header {
+  flex: 0 0 var(--panel-header-h);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--s-2);
+  padding: 0 var(--s-3);
+  border-bottom: 1px solid var(--c-line);
+  background: var(--c-raised);
+}
+.ui-panel-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  padding: var(--s-3);
+}
+
+/* Status dot + text */
+.ui-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--font-label);
+  font-size: var(--fs-micro);
+  font-weight: 600;
+  letter-spacing: var(--track-caps);
+  text-transform: uppercase;
+}
+.ui-status::before {
+  content: '';
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+/* Buttons */
+.ui-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  height: 26px;
+  padding: 0 var(--s-3);
+  font-family: var(--font-label);
+  font-size: var(--fs-small);
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--c-text);
+  background: var(--c-raised);
+  border: 1px solid var(--c-line-strong);
+  border-radius: var(--radius);
+  cursor: pointer;
+  transition: background 120ms var(--ease), border-color 120ms var(--ease), color 120ms var(--ease);
+}
+.ui-btn:hover:not(:disabled) { background: var(--c-overlay); border-color: var(--c-text-faint); color: var(--c-text-bright); }
+.ui-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+.ui-btn--primary { background: var(--c-accent); border-color: var(--c-accent); color: #fff; }
+.ui-btn--primary:hover:not(:disabled) { background: #5d99ff; border-color: #5d99ff; color: #fff; }
+.ui-btn--danger { color: var(--c-warning); border-color: rgba(255, 90, 79, 0.4); }
+.ui-btn--ghost { background: transparent; border-color: transparent; }
+
+/* Inputs */
+.ui-input,
+.ui-select {
+  height: 26px;
+  padding: 0 var(--s-2);
+  font-family: var(--font-data);
+  font-size: var(--fs-small);
+  background: var(--c-base);
+  border: 1px solid var(--c-line-strong);
+  border-radius: var(--radius);
+  color: var(--c-text-bright);
+}
+.ui-input:focus,
+.ui-select:focus { outline: none; border-color: var(--c-line-focus); }
+
+/* State colour helpers */
+.is-nominal, .severity-green { color: var(--c-nominal); }
+.is-caution, .severity-yellow { color: var(--c-caution); }
+.is-warning, .severity-red { color: var(--c-warning); }
+.is-dim { color: var(--c-text-dim); }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { transition: none !important; animation: none !important; }
+}

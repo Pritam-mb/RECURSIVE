@@ -1,0 +1,542 @@
+/* =====================================================================
+   Simulation drawer contents — predictor, test mode, monitor, alerts
+   Prefix: sim-
+   ===================================================================== */
+
+/* ── Section shell ───────────────────────────────────────────────────── */
+.sim-section {
+  flex-shrink: 0;
+  background: var(--c-panel);
+  border: 1px solid var(--c-line);
+  min-width: 0;
+}
+
+.sim-section .sim-section {
+  margin-top: var(--s-1);
+  background: transparent;
+}
+
+.sim-section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--s-2);
+  width: 100%;
+  height: var(--panel-header-h);
+  padding: 0 var(--s-3);
+  background: var(--c-raised);
+  border: none;
+  border-bottom: 1px solid var(--c-line);
+  color: var(--c-text-dim);
+  text-align: left;
+  cursor: pointer;
+}
+button.sim-section-head:hover .sim-section-title { color: var(--c-text-bright); }
+.sim-section.is-collapsed > .sim-section-head { border-bottom-color: transparent; }
+
+.sim-section-title { color: var(--c-text); }
+
+.sim-section-head-aside {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+}
+
+/* Chevron: thin, points down when open, right when collapsed */
+.sim-chevron {
+  width: 6px;
+  height: 6px;
+  border-right: 1px solid currentColor;
+  border-bottom: 1px solid currentColor;
+  transform: translateY(-2px) rotate(45deg);
+  transition: transform 120ms var(--ease);
+}
+.sim-section.is-collapsed .sim-chevron { transform: rotate(-45deg); }
+
+.sim-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-2);
+  padding: var(--s-3);
+  min-width: 0;
+}
+
+/* Sub-heading inside a section, with trailing hairline */
+.sim-subhead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--s-2);
+  margin-top: var(--s-1);
+  padding-bottom: var(--s-1);
+  border-bottom: 1px solid var(--c-line);
+}
+.sim-body > .sim-subhead:first-child { margin-top: 0; }
+
+.sim-divider {
+  height: 1px;
+  background: var(--c-line);
+  margin: var(--s-1) 0;
+}
+
+/* ── Form grid ───────────────────────────────────────────────────────── */
+.sim-fields {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.sim-field {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 176px);
+  align-items: center;
+  gap: var(--s-2);
+}
+
+.sim-field-label {
+  font-size: var(--fs-small);
+  color: var(--c-text-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.sim-input {
+  width: 100%;
+  min-width: 0;
+}
+
+.sim-textarea {
+  width: 100%;
+  height: auto;
+  min-height: 180px;
+  padding: var(--s-2);
+  font-family: var(--font-data);
+  font-size: var(--fs-small);
+  line-height: 1.5;
+  resize: vertical;
+}
+
+/* 3-up grid for vector components */
+.sim-vec {
+  display: grid;
+  grid-template-columns: 72px repeat(3, minmax(0, 1fr));
+  align-items: center;
+  gap: 6px;
+}
+.sim-vec-head {
+  font-family: var(--font-label);
+  font-size: var(--fs-micro);
+  font-weight: 600;
+  letter-spacing: var(--track-caps);
+  text-transform: uppercase;
+  color: var(--c-text-faint);
+  text-align: center;
+}
+
+/* ── Segmented control ───────────────────────────────────────────────── */
+.sim-seg {
+  display: inline-flex;
+  flex-shrink: 0;
+  border: 1px solid var(--c-line-strong);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+
+.sim-seg-btn {
+  height: 22px;
+  padding: 0 var(--s-2);
+  background: transparent;
+  border: none;
+  border-left: 1px solid var(--c-line-strong);
+  font-family: var(--font-label);
+  font-size: var(--fs-micro);
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--c-text-dim);
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 120ms var(--ease), color 120ms var(--ease);
+}
+.sim-seg-btn:first-child { border-left: none; }
+.sim-seg-btn:hover:not(.is-active) { color: var(--c-text-bright); background: var(--c-raised); }
+.sim-seg-btn.is-active {
+  background: var(--c-accent-soft);
+  color: var(--c-text-bright);
+  box-shadow: inset 0 -1px 0 var(--c-accent);
+}
+
+/* Header row for an object block: name on the left, segmented on the right */
+.sim-object {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: var(--s-2);
+  border: 1px solid var(--c-line);
+  background: var(--c-base);
+}
+.sim-object-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--s-2);
+}
+.sim-object-name {
+  font-family: var(--font-data);
+  font-size: var(--fs-small);
+  color: var(--c-text-bright);
+}
+
+/* ── Buttons / actions ───────────────────────────────────────────────── */
+.sim-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.sim-actions .ui-btn { flex: 1 1 auto; }
+
+.sim-mini {
+  height: 20px;
+  padding: 0 var(--s-2);
+  font-size: var(--fs-micro);
+}
+
+/* ── Definition lists (results) ──────────────────────────────────────── */
+.sim-dl-group { display: contents; }
+
+.sim-dl {
+  display: grid;
+  grid-template-columns: minmax(0, auto) minmax(0, 1fr);
+  border-top: 1px solid var(--c-line);
+}
+.sim-dl dt,
+.sim-dl dd {
+  min-height: 22px;
+  display: flex;
+  align-items: center;
+  padding: 3px 0;
+  border-bottom: 1px solid var(--c-line);
+}
+.sim-dl dt {
+  padding-right: var(--s-3);
+  font-size: var(--fs-small);
+  color: var(--c-text-dim);
+  white-space: nowrap;
+}
+.sim-dl dd {
+  justify-content: flex-end;
+  text-align: right;
+  font-family: var(--font-data);
+  font-size: var(--fs-small);
+  font-variant-numeric: tabular-nums;
+  color: var(--c-text-bright);
+  word-break: break-word;
+}
+.sim-dl dd.is-nominal { color: var(--c-nominal); }
+.sim-dl dd.is-caution { color: var(--c-caution); }
+.sim-dl dd.is-warning { color: var(--c-warning); }
+.sim-dl dd.is-dim     { color: var(--c-text-dim); }
+
+/* Two-up readouts (start / current epoch) */
+.sim-readouts {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--s-2);
+}
+.sim-readout {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.sim-readout-value {
+  font-family: var(--font-data);
+  font-size: var(--fs-small);
+  font-variant-numeric: tabular-nums;
+  color: var(--c-text-bright);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Status line */
+.sim-status {
+  padding: 6px var(--s-2);
+  border: 1px solid var(--c-line);
+  border-left-width: 2px;
+  border-left-color: var(--c-text-dim);
+  background: var(--c-raised);
+  font-family: var(--font-data);
+  font-size: var(--fs-small);
+  color: var(--c-text-bright);
+  word-break: break-word;
+}
+.sim-status.is-warning { border-left-color: var(--c-warning); color: var(--c-warning); }
+.sim-status.is-caution { border-left-color: var(--c-caution); }
+.sim-status.is-nominal { border-left-color: var(--c-nominal); }
+
+.sim-muted {
+  font-size: var(--fs-small);
+  color: var(--c-text-faint);
+}
+
+/* ── Satellite picker (test mode) ────────────────────────────────────── */
+.sim-pair {
+  display: flex;
+  flex-direction: column;
+  border-top: 1px solid var(--c-line);
+}
+.sim-pair-row {
+  display: grid;
+  grid-template-columns: 20px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: var(--s-2);
+  min-height: 26px;
+  border-bottom: 1px solid var(--c-line);
+}
+.sim-pair-tag {
+  font-family: var(--font-data);
+  font-size: var(--fs-small);
+  color: var(--c-text-dim);
+}
+.sim-pair-value {
+  font-family: var(--font-data);
+  font-size: var(--fs-small);
+  color: var(--c-text-bright);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sim-pair-value.is-unset { color: var(--c-text-faint); }
+
+.sim-list {
+  max-height: 208px;
+  overflow-y: auto;
+  border: 1px solid var(--c-line);
+  background: var(--c-base);
+}
+.sim-list-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: var(--s-2);
+  min-height: 26px;
+  padding: 0 var(--s-1) 0 var(--s-2);
+  border-bottom: 1px solid var(--c-line);
+}
+.sim-list-row:last-child { border-bottom: none; }
+.sim-list-row:hover { background: var(--c-raised); }
+.sim-list-row.is-selected { background: var(--c-accent-soft); }
+.sim-list-name {
+  font-size: var(--fs-small);
+  color: var(--c-text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sim-list-id {
+  font-family: var(--font-data);
+  font-size: var(--fs-micro);
+  font-variant-numeric: tabular-nums;
+  color: var(--c-text-dim);
+}
+
+/* ── Comparison table (monitor) ──────────────────────────────────────── */
+.sim-table {
+  width: 100%;
+  border-collapse: collapse;
+  table-layout: fixed;
+}
+.sim-table th {
+  padding: 4px 0;
+  text-align: right;
+  border-bottom: 1px solid var(--c-line-strong);
+}
+.sim-table th:first-child { text-align: left; width: 30%; }
+.sim-table th:last-child { width: 18%; }
+.sim-table td {
+  padding: 4px 0 4px var(--s-2);
+  border-bottom: 1px solid var(--c-line);
+  font-family: var(--font-data);
+  font-size: var(--fs-micro);
+  font-variant-numeric: tabular-nums;
+  color: var(--c-text);
+  text-align: right;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sim-table td:first-child {
+  padding-left: 0;
+  font-family: var(--font-ui);
+  font-size: var(--fs-small);
+  color: var(--c-text-dim);
+  text-align: left;
+}
+.sim-table td.is-nominal { color: var(--c-nominal); }
+.sim-table td.is-caution { color: var(--c-caution); }
+
+.sim-verdict {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--s-2);
+  padding: 6px var(--s-2);
+  border: 1px solid var(--c-line);
+  background: var(--c-raised);
+}
+
+.sim-note {
+  font-family: var(--font-data);
+  font-size: var(--fs-micro);
+  color: var(--c-text-faint);
+}
+
+/* ── Debris cloud list (predictor) ───────────────────────────────────── */
+.sim-cloud {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding-bottom: var(--s-2);
+  border-bottom: 1px solid var(--c-line);
+}
+.sim-cloud:last-child { border-bottom: none; padding-bottom: 0; }
+.sim-cloud-head {
+  font-family: var(--font-data);
+  font-size: var(--fs-small);
+  color: var(--c-text-bright);
+}
+.sim-cloud-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--s-3);
+  font-family: var(--font-data);
+  font-size: var(--fs-micro);
+  color: var(--c-text-dim);
+}
+.sim-cloud-sat {
+  display: grid;
+  grid-template-columns: 8px minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: var(--s-2);
+  min-height: 20px;
+  font-size: var(--fs-small);
+}
+.sim-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+}
+.sim-cloud-sat-name {
+  color: var(--c-text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sim-cloud-sat-id {
+  font-family: var(--font-data);
+  font-size: var(--fs-micro);
+  color: var(--c-text-dim);
+}
+.sim-band {
+  font-family: var(--font-label);
+  font-size: var(--fs-micro);
+  font-weight: 600;
+  letter-spacing: var(--track-caps);
+  text-transform: uppercase;
+}
+
+/* Risk band → state colour */
+.sim-risk-high   { color: var(--c-warning); }
+.sim-risk-medium { color: var(--c-caution); }
+.sim-risk-low    { color: var(--c-nominal); }
+.sim-risk-none   { color: var(--c-text-dim); }
+
+/* ── Alert cards (AlertPanel) ────────────────────────────────────────── */
+.sim-alert {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: var(--s-2) var(--s-3) var(--s-3);
+  border: 1px solid var(--c-line);
+  border-left: 2px solid var(--c-warning);
+  background: var(--c-base);
+}
+.sim-alert-title {
+  font-family: var(--font-data);
+  font-size: var(--fs-data);
+  color: var(--c-text-bright);
+}
+.sim-alert-verdict {
+  font-size: var(--fs-small);
+  line-height: 1.5;
+  color: var(--c-warning);
+}
+.sim-alert .sim-dl dt {
+  font-family: var(--font-label);
+  font-size: var(--fs-micro);
+  font-weight: 600;
+  letter-spacing: var(--track-caps);
+  text-transform: uppercase;
+  align-items: flex-start;
+}
+.sim-alert .sim-dl dd { justify-content: flex-start; text-align: left; }
+
+.sim-targets {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+}
+.sim-target {
+  display: grid;
+  grid-template-columns: 8px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: var(--s-2);
+  min-height: 20px;
+}
+.sim-target-name {
+  color: var(--c-text-bright);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sim-stack {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-2);
+}
+
+/* ── Modal (paste JSON) ──────────────────────────────────────────────── */
+.sim-modal-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--s-4);
+  background: rgba(3, 5, 8, 0.72);
+}
+.sim-modal {
+  display: flex;
+  flex-direction: column;
+  width: min(520px, 100%);
+  max-height: 100%;
+  background: var(--c-panel);
+  border: 1px solid var(--c-line-strong);
+}
+.sim-modal-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-2);
+  padding: var(--s-3);
+  overflow: auto;
+}
+.sim-modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+}

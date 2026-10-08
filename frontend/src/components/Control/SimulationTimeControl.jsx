@@ -1,4 +1,5 @@
 import { useState, useEffect } from "react"
+import "../../styles/drawers.css"
 
 const API = ""
 
@@ -42,56 +43,67 @@ export default function SimulationTimeControl() {
     : "Loading..."
 
   return (
-    <div className="panel sim-time-panel">
-      <div className="panel-header">
-        Simulation Time Control
-        {offset > 0 && (
-          <span className="sim-badge">SIM +{offset.toFixed(1)}h</span>
+    <div className="ui-panel dr-card">
+      <div className="ui-panel-header">
+        <span className="ui-label">Simulation Time</span>
+        {offset > 0 ? (
+          <span className="ui-status is-caution">SIM +{offset.toFixed(1)}h</span>
+        ) : (
+          <span className="ui-status is-nominal">Realtime</span>
         )}
       </div>
 
-      <div className="sim-time-display">
-        <span className="sim-time-label">Current Time</span>
-        <span className="sim-time-value">{formattedTime} UTC</span>
-        {nAlerts > 0 && (
-          <span className="sim-alerts">
-            {nAlerts} alerts at this time
-          </span>
-        )}
-      </div>
-
-      <div className="control-row">
-        <label>
-          Time Offset: <strong>+{offset.toFixed(1)} hours</strong>
-        </label>
-        <input
-          type="range"
-          min="0" max="24" step="0.5"
-          value={offset}
-          onChange={e => setOffset(parseFloat(e.target.value))}
-          onMouseUp={e => applyTime(parseFloat(e.target.value))}
-          onTouchEnd={e => applyTime(parseFloat(e.target.value))}
-        />
-      </div>
-
-      <div className="preset-buttons">
-        {[0, 2, 4, 6, 12, 24].map(h => (
-          <button
-            key={h}
-            className={`preset-btn ${offset === h ? "active" : ""}`}
-            onClick={() => applyTime(h)}
-            disabled={applying}
-          >
-            {h === 0 ? "NOW" : `+${h}h`}
-          </button>
-        ))}
-      </div>
-
-      {applying && (
-        <div className="applying-msg">
-          Propagating all satellites to T+{offset.toFixed(1)}h...
+      <div className="dr-card-body">
+        <div className="dr-kv-grid">
+          <div className="dr-kv">
+            <span className="dr-kv-key">Current time</span>
+            <span className="dr-kv-val">{formattedTime} UTC</span>
+          </div>
+          {nAlerts > 0 && (
+            <div className="dr-kv">
+              <span className="dr-kv-key">Alerts at time</span>
+              <span className="dr-kv-val is-caution">{nAlerts}</span>
+            </div>
+          )}
         </div>
-      )}
+
+        <label className="dr-range">
+          <span className="dr-range-head">
+            <span className="ui-label">Time offset</span>
+            <span className="dr-kv-val">+{offset.toFixed(1)} h</span>
+          </span>
+          <input
+            type="range"
+            className="dr-range-input"
+            min="0" max="24" step="0.5"
+            value={offset}
+            onChange={e => setOffset(parseFloat(e.target.value))}
+            onMouseUp={e => applyTime(parseFloat(e.target.value))}
+            onTouchEnd={e => applyTime(parseFloat(e.target.value))}
+          />
+        </label>
+
+        <div className="dr-segmented" role="group" aria-label="Time presets">
+          {[0, 2, 4, 6, 12, 24].map(h => (
+            <button
+              key={h}
+              type="button"
+              className="dr-segment"
+              aria-pressed={offset === h}
+              onClick={() => applyTime(h)}
+              disabled={applying}
+            >
+              {h === 0 ? "NOW" : `+${h}h`}
+            </button>
+          ))}
+        </div>
+
+        {applying && (
+          <div className="dr-note" role="status">
+            Propagating all satellites to T+{offset.toFixed(1)}h
+          </div>
+        )}
+      </div>
     </div>
   )
 }

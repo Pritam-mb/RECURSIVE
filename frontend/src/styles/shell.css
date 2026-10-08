@@ -1,0 +1,277 @@
+/* =====================================================================
+   Shell — app grid, header status bar, connection banner, globe frames
+   Prefix: sh-
+   Hairline "bento": the grid background is --c-line and every cell sits
+   on --c-panel with a 1px gap, so dividers are true 1px hairlines.
+   ===================================================================== */
+
+.sh-app {
+  --sh-header-h: 40px;
+  --sh-strip-h: 72px;
+  --sh-bottom-h: clamp(200px, 30vh, 300px);
+
+  display: grid;
+  grid-template-rows: var(--sh-header-h) minmax(0, 1fr) var(--sh-strip-h) var(--sh-bottom-h);
+  gap: 1px;
+  height: 100vh;
+  height: 100dvh;
+  width: 100%;
+  overflow: hidden;
+  background: var(--c-line);
+  color: var(--c-text);
+}
+
+/* ── Grid rows ─────────────────────────────────────────────────────── */
+
+.sh-main {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) clamp(320px, 24vw, 400px) minmax(0, 1fr);
+  gap: 1px;
+  min-height: 0;
+  min-width: 0;
+  background: var(--c-line);
+}
+
+.sh-bottom {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.35fr) minmax(0, 1fr);
+  gap: 1px;
+  min-height: 0;
+  min-width: 0;
+  background: var(--c-line);
+}
+
+/* Generic cell: owns background + clipping; inner component fills it. */
+.sh-cell {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
+  overscroll-behavior: contain;
+  background: var(--c-panel);
+}
+.sh-cell > * {
+  flex: 1 0 auto;
+  min-width: 0;
+}
+.sh-cell--fixed {
+  overflow: hidden;
+}
+
+/* ── Globe frames ──────────────────────────────────────────────────── */
+
+.sh-globe {
+  position: relative;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  background: var(--c-void);
+}
+
+.sh-globe-viewport {
+  position: absolute;
+  inset: 0;
+}
+
+/* Keep Cesium / canvas surfaces inside their grid cell */
+.sh-globe-viewport .cesium-widget,
+.sh-globe-viewport .cesium-container,
+.sh-globe-viewport canvas {
+  position: absolute !important;
+  top: 0 !important;
+  left: 0 !important;
+  width: 100% !important;
+  height: 100% !important;
+}
+.sh-globe-viewport > div {
+  position: absolute;
+  inset: 0;
+}
+
+.sh-globe-label {
+  position: absolute;
+  top: 0;
+  left: 0;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  gap: var(--s-3);
+  height: 24px;
+  padding: 0 var(--s-3);
+  background: rgba(3, 5, 8, 0.82);
+  border-right: 1px solid var(--c-line);
+  border-bottom: 1px solid var(--c-line);
+  pointer-events: none;
+  white-space: nowrap;
+}
+.sh-globe-label .ui-label {
+  color: var(--c-text);
+}
+.sh-globe-label-meta {
+  font-family: var(--font-data);
+  font-size: var(--fs-small);
+  font-variant-numeric: tabular-nums;
+  color: var(--c-text-dim);
+}
+
+.sh-globe-loader {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--c-void);
+}
+
+/* ── Header / status bar ───────────────────────────────────────────── */
+
+.sh-header {
+  display: flex;
+  align-items: stretch;
+  min-width: 0;
+  height: var(--sh-header-h, 40px);
+  background: var(--c-base);
+  overflow: hidden;
+}
+
+.sh-brand {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: var(--s-3);
+  padding: 0 var(--s-4);
+  border-right: 1px solid var(--c-line);
+}
+.sh-brand-mark {
+  font-family: var(--font-label);
+  font-size: var(--fs-title);
+  font-weight: 600;
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+  color: var(--c-text-bright);
+  white-space: nowrap;
+}
+.sh-brand-sub {
+  white-space: nowrap;
+}
+
+.sh-readouts {
+  flex: 1 1 auto;
+  display: flex;
+  align-items: stretch;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.sh-readout {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 1px;
+  padding: 0 var(--s-4);
+  border-right: 1px solid var(--c-line);
+  white-space: nowrap;
+}
+.sh-readout .ui-label {
+  font-size: 9px;
+  line-height: 1;
+}
+.sh-readout-value {
+  font-family: var(--font-data);
+  font-size: var(--fs-data);
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.2;
+  color: var(--c-text-bright);
+}
+.sh-readout-value .sh-unit {
+  margin-left: 2px;
+  font-size: var(--fs-micro);
+  color: var(--c-text-dim);
+}
+.sh-readout-value.is-nominal { color: var(--c-nominal); }
+.sh-readout-value.is-caution { color: var(--c-caution); }
+.sh-readout-value.is-warning { color: var(--c-warning); }
+.sh-readout-value.is-dim { color: var(--c-text-dim); }
+
+.sh-readout .ui-status {
+  line-height: 1.2;
+  height: 16px;
+}
+
+.sh-controls {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  padding: 0 var(--s-3);
+  border-left: 1px solid var(--c-line);
+}
+
+.sh-field {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+}
+.sh-select {
+  height: 24px;
+  max-width: 140px;
+  cursor: pointer;
+}
+
+.sh-toggle {
+  height: 24px;
+  padding: 0 var(--s-2);
+  font-size: var(--fs-micro);
+  letter-spacing: var(--track-caps);
+}
+.sh-toggle[aria-pressed='true'] {
+  background: var(--c-accent-soft);
+  border-color: var(--c-accent);
+  color: var(--c-text-bright);
+}
+
+.sh-clock {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: stretch;
+}
+
+/* Laptop widths: drop secondary text first */
+@media (max-width: 1500px) {
+  .sh-brand-sub { display: none; }
+  .sh-readout { padding: 0 var(--s-3); }
+}
+@media (max-width: 1240px) {
+  .sh-field .ui-label { display: none; }
+}
+
+/* ── Connection banner ─────────────────────────────────────────────── */
+
+.sh-banner {
+  position: fixed;
+  top: 40px;
+  left: 0;
+  right: 0;
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  gap: var(--s-3);
+  height: 24px;
+  padding: 0 var(--s-4);
+  background: #1c0d0d;
+  border-top: 1px solid rgba(255, 90, 79, 0.35);
+  border-bottom: 1px solid rgba(255, 90, 79, 0.35);
+  color: var(--c-text);
+  font-size: var(--fs-small);
+  pointer-events: none;
+}
+.sh-banner-text {
+  color: var(--c-text-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}

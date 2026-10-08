@@ -1,4 +1,5 @@
 import { useMemo } from 'react';
+import '../styles/threats.css';
 
 /**
  * BPlaneDiagram
@@ -12,6 +13,14 @@ import { useMemo } from 'react';
  *   angleRad    — ellipse rotation angle (radians)
  *   hbrKm       — hard body radius (km, default 0.010)
  */
+
+// Muted chrome, state colours reserved for the threat geometry.
+const GRID = 'var(--c-line)';
+const AXIS = 'var(--c-line-strong)';
+const LABEL = 'var(--c-text-dim)';
+const FONT = 'IBM Plex Mono, ui-monospace, Consolas, monospace';
+const GRID_STEPS = [-0.3, -0.15, 0.15, 0.3]; // fractions of SIZE from center
+
 export default function BPlaneDiagram({
   btKm = 0,
   bnKm = 0,
@@ -41,7 +50,7 @@ export default function BPlaneDiagram({
       ellRy: Math.max(semiMinorKm * scale, 1),
       hbrPx: Math.max(hbrKm * scale, 2),
     };
-  }, [btKm, bnKm, semiMajorM, semiMinorM, hbrKm]);
+  }, [btKm, bnKm, semiMajorM, semiMinorM, hbrKm, CENTER]);
 
   const angleDeg = (angleRad * 180) / Math.PI;
   const missDistKm = Math.sqrt(btKm * btKm + bnKm * bnKm);
@@ -49,27 +58,38 @@ export default function BPlaneDiagram({
     ((btKm * Math.cos(angleRad) + bnKm * Math.sin(angleRad)) / (semiMajorM / 1000)) ** 2 +
     ((-btKm * Math.sin(angleRad) + bnKm * Math.cos(angleRad)) / (semiMinorM / 1000)) ** 2 <= 1;
 
-  const missColor = insideEllipse ? '#ef4444' : '#4a90d9';
+  // Miss vector: warning when it falls inside the 1σ ellipse, nominal otherwise.
+  const missColor = insideEllipse ? 'var(--c-warning)' : 'var(--c-nominal)';
+  const ellipseColor = 'var(--c-caution)';
 
   // Scale bar: 1 km
   const scaleBarPx = scale;
-  const scaleBarY = SIZE - 12;
+  const scaleBarY = SIZE - 16;
 
   return (
     <svg
-      className="bplane-svg"
+      className="tq-bplane-svg"
       width={SIZE}
       height={SIZE}
       viewBox={`0 0 ${SIZE} ${SIZE}`}
-      style={{ background: '#040408', border: '0.5px solid #1f2937' }}
+      role="img"
+      aria-label={`B-plane: miss ${missDistKm.toFixed(3)} km, ${insideEllipse ? 'inside' : 'outside'} 1-sigma ellipse`}
     >
+      {/* Grid */}
+      {GRID_STEPS.map((f) => (
+        <g key={f}>
+          <line x1={CENTER + f * SIZE} y1={0} x2={CENTER + f * SIZE} y2={SIZE} stroke={GRID} strokeWidth={0.5} />
+          <line x1={0} y1={CENTER + f * SIZE} x2={SIZE} y2={CENTER + f * SIZE} stroke={GRID} strokeWidth={0.5} />
+        </g>
+      ))}
+
       {/* Axis lines */}
-      <line x1={CENTER} y1={4} x2={CENTER} y2={SIZE - 4} stroke="#1f2937" strokeWidth={0.5} />
-      <line x1={4} y1={CENTER} x2={SIZE - 4} y2={CENTER} stroke="#1f2937" strokeWidth={0.5} />
+      <line x1={CENTER} y1={0} x2={CENTER} y2={SIZE} stroke={AXIS} strokeWidth={0.75} />
+      <line x1={0} y1={CENTER} x2={SIZE} y2={CENTER} stroke={AXIS} strokeWidth={0.75} />
 
       {/* Axis labels */}
-      <text x={CENTER + 3} y={10} fill="#6b7280" fontSize={8} fontFamily="monospace">n</text>
-      <text x={SIZE - 9} y={CENTER - 3} fill="#6b7280" fontSize={8} fontFamily="monospace">t</text>
+      <text x={CENTER + 4} y={10} fill={LABEL} fontSize={8} fontFamily={FONT}>Bn</text>
+      <text x={SIZE - 14} y={CENTER - 4} fill={LABEL} fontSize={8} fontFamily={FONT}>Bt</text>
 
       {/* 1-sigma covariance ellipse */}
       <ellipse
@@ -77,9 +97,9 @@ export default function BPlaneDiagram({
         cy={CENTER}
         rx={ellRx}
         ry={ellRy}
-        fill="rgba(74,144,217,0.08)"
-        stroke="#4a90d9"
-        strokeWidth={0.8}
+        fill="none"
+        stroke={ellipseColor}
+        strokeWidth={1}
         strokeDasharray="3 2"
         transform={`rotate(${-angleDeg}, ${CENTER}, ${CENTER})`}
       />
@@ -89,9 +109,9 @@ export default function BPlaneDiagram({
         cx={CENTER}
         cy={CENTER}
         r={hbrPx}
-        fill="rgba(34,197,94,0.15)"
-        stroke="#22c55e"
-        strokeWidth={0.8}
+        fill="none"
+        stroke="var(--c-text)"
+        strokeWidth={0.75}
       />
 
       {/* Miss vector line */}
@@ -101,38 +121,45 @@ export default function BPlaneDiagram({
         x2={missX}
         y2={missY}
         stroke={missColor}
-        strokeWidth={0.5}
-        strokeDasharray="2 2"
-        opacity={0.6}
+        strokeWidth={1}
       />
 
-      {/* Miss vector dot */}
-      <circle cx={missX} cy={missY} r={3} fill={missColor} />
+      {/* Miss vector point */}
+      <circle cx={missX} cy={missY} r={2.5} fill={missColor} />
 
       {/* Origin cross */}
-      <line x1={CENTER - 3} y1={CENTER} x2={CENTER + 3} y2={CENTER} stroke="#6b7280" strokeWidth={0.8} />
-      <line x1={CENTER} y1={CENTER - 3} x2={CENTER} y2={CENTER + 3} stroke="#6b7280" strokeWidth={0.8} />
+      <line x1={CENTER - 3} y1={CENTER} x2={CENTER + 3} y2={CENTER} stroke="var(--c-text)" strokeWidth={0.75} />
+      <line x1={CENTER} y1={CENTER - 3} x2={CENTER} y2={CENTER + 3} stroke="var(--c-text)" strokeWidth={0.75} />
 
       {/* Scale bar */}
       {scaleBarPx > 4 && (
         <>
           <line
-            x1={10}
+            x1={8}
             y1={scaleBarY}
-            x2={10 + Math.min(scaleBarPx, SIZE - 20)}
+            x2={8 + Math.min(scaleBarPx, SIZE - 20)}
             y2={scaleBarY}
-            stroke="#6b7280"
+            stroke={LABEL}
             strokeWidth={1}
           />
-          <text x={10} y={scaleBarY - 3} fill="#6b7280" fontSize={7} fontFamily="monospace">
-            {scaleBarPx <= SIZE - 20 ? '1km' : `${((SIZE - 20) / scale).toFixed(1)}km`}
+          <line x1={8} y1={scaleBarY - 2} x2={8} y2={scaleBarY + 2} stroke={LABEL} strokeWidth={1} />
+          <line
+            x1={8 + Math.min(scaleBarPx, SIZE - 20)}
+            y1={scaleBarY - 2}
+            x2={8 + Math.min(scaleBarPx, SIZE - 20)}
+            y2={scaleBarY + 2}
+            stroke={LABEL}
+            strokeWidth={1}
+          />
+          <text x={8} y={scaleBarY - 4} fill={LABEL} fontSize={7} fontFamily={FONT}>
+            {scaleBarPx <= SIZE - 20 ? '1 km' : `${((SIZE - 20) / scale).toFixed(1)} km`}
           </text>
         </>
       )}
 
       {/* Miss distance label */}
-      <text x={4} y={SIZE - 3} fill="#6b7280" fontSize={7} fontFamily="monospace">
-        |miss|={missDistKm.toFixed(3)}km
+      <text x={8} y={SIZE - 5} fill={LABEL} fontSize={7} fontFamily={FONT}>
+        |B| {missDistKm.toFixed(3)} km
       </text>
     </svg>
   );

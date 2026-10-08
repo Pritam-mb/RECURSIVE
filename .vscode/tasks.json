@@ -1,53 +1,27 @@
 {
-	"version": "2.0.0",
-	"tasks": [
-		{
-			"label": "backend: dev",
-			"type": "shell",
-			"command": "powershell",
-			"args": [
-				"-NoProfile",
-				"-Command",
-				"Set-Location backend; & \"C:/Users/User/AppData/Local/Microsoft/WindowsApps/python3.13.exe\" main.py"
-			],
-			"isBackground": true,
-			"group": "build"
-		},
-		{
-			"label": "frontend: dev",
-			"type": "shell",
-			"command": "powershell",
-			"args": [
-				"-NoProfile",
-				"-Command",
-				"Set-Location frontend; npm run dev"
-			],
-			"isBackground": true,
-			"group": "build"
-		},
-		{
-			"label": "backend: dev",
-			"type": "shell",
-			"command": "powershell",
-			"args": [
-				"-NoProfile",
-				"-Command",
-				"Set-Location backend; & \"C:/Users/User/AppData/Local/Microsoft/WindowsApps/python3.13.exe\" main.py"
-			],
-			"isBackground": true,
-			"group": "build"
-		},
-		{
-			"label": "backend: dev",
-			"type": "shell",
-			"command": "powershell",
-			"args": [
-				"-NoProfile",
-				"-Command",
-				"Set-Location backend; & \"C:/Users/User/AppData/Local/Microsoft/WindowsApps/python3.13.exe\" main.py"
-			],
-			"isBackground": true,
-			"group": "build"
-		}
-	]
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "backend: dev",
+      "type": "shell",
+      "command": "python main.py",
+      "options": { "cwd": "${workspaceFolder}/backend" },
+      "isBackground": true,
+      "problemMatcher": []
+    },
+    {
+      "label": "frontend: dev",
+      "type": "shell",
+      "command": "npm run dev",
+      "options": { "cwd": "${workspaceFolder}/frontend" },
+      "isBackground": true,
+      "problemMatcher": []
+    },
+    {
+      "label": "dev: all",
+      "dependsOn": ["backend: dev", "frontend: dev"],
+      "dependsOrder": "parallel",
+      "problemMatcher": []
+    }
+  ]
 }

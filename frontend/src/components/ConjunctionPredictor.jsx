@@ -120,21 +120,21 @@ const ConjunctionPredictor = () => {
 
   const setRefField = (setRef, key, value) => setRef((prev) => ({ ...prev, [key]: value }));
 
-  const RefForm = ({ label, ref, setRef, accent }) => (
+  const RefForm = ({ label, refData, setRef, accent }) => (
     <div className="override-block">
       <div className="override-header">
         <span className={`override-label mono ${accent}`}>{label}</span>
         <div className="override-toggle">
           <button
             type="button"
-            className={`toggle-btn ${ref.mode === 'norad' ? 'active' : ''}`}
+            className={`toggle-btn ${refData.mode === 'norad' ? 'active' : ''}`}
             onClick={() => setRefField(setRef, 'mode', 'norad')}
           >
             Catalog
           </button>
           <button
             type="button"
-            className={`toggle-btn ${ref.mode === 'latlon' ? 'active' : ''}`}
+            className={`toggle-btn ${refData.mode === 'latlon' ? 'active' : ''}`}
             onClick={() => setRefField(setRef, 'mode', 'latlon')}
           >
             Lat/Lon
@@ -142,13 +142,13 @@ const ConjunctionPredictor = () => {
         </div>
       </div>
 
-      {ref.mode === 'norad' && (
+      {refData.mode === 'norad' && (
         <div className="override-fields">
           <div className="field-row">
             <label>Satellite</label>
             <select
               className="field-input"
-              value={ref.noradId}
+              value={refData.noradId}
               onChange={(e) => setRefField(setRef, 'noradId', e.target.value)}
             >
               <option value="">Select ...</option>
@@ -163,7 +163,7 @@ const ConjunctionPredictor = () => {
             <label>NORAD ID (override)</label>
             <input
               className="field-input mono"
-              value={ref.noradId}
+              value={refData.noradId}
               onChange={(e) => setRefField(setRef, 'noradId', e.target.value)}
               placeholder="e.g. 25544"
             />
@@ -171,13 +171,13 @@ const ConjunctionPredictor = () => {
         </div>
       )}
 
-      {ref.mode === 'latlon' && (
+      {refData.mode === 'latlon' && (
         <div className="override-fields">
           <div className="field-row">
             <label>Latitude (°)</label>
             <input
               className="field-input mono"
-              value={ref.lat}
+              value={refData.lat}
               onChange={(e) => setRefField(setRef, 'lat', e.target.value)}
             />
           </div>
@@ -185,7 +185,7 @@ const ConjunctionPredictor = () => {
             <label>Longitude (°)</label>
             <input
               className="field-input mono"
-              value={ref.lon}
+              value={refData.lon}
               onChange={(e) => setRefField(setRef, 'lon', e.target.value)}
             />
           </div>
@@ -193,7 +193,7 @@ const ConjunctionPredictor = () => {
             <label>Altitude (km)</label>
             <input
               className="field-input mono"
-              value={ref.alt}
+              value={refData.alt}
               onChange={(e) => setRefField(setRef, 'alt', e.target.value)}
             />
           </div>
@@ -201,7 +201,7 @@ const ConjunctionPredictor = () => {
             <label>Inclination (°)</label>
             <input
               className="field-input mono"
-              value={ref.incl}
+              value={refData.incl}
               onChange={(e) => setRefField(setRef, 'incl', e.target.value)}
             />
           </div>
@@ -217,9 +217,9 @@ const ConjunctionPredictor = () => {
   return (
     <Section title="Conjunction Predictor">
       <div className="section-subtitle mono">Object A</div>
-      <RefForm label="Object A" ref={refA} setRef={setRefA} accent="primary" />
+      <RefForm label="Object A" refData={refA} setRef={setRefA} accent="primary" />
       <div className="section-subtitle mono">Object B</div>
-      <RefForm label="Object B" ref={refB} setRef={setRefB} accent="secondary" />
+      <RefForm label="Object B" refData={refB} setRef={setRefB} accent="secondary" />
 
       <div className="field-row">
         <label>Forecast Window (hours)</label>

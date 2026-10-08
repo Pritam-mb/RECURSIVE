@@ -251,12 +251,11 @@
 
 /* ── Connection banner ─────────────────────────────────────────────── */
 
+.sh-app.is-offline {
+  grid-template-rows: var(--sh-header-h) 24px minmax(0, 1fr) var(--sh-strip-h) var(--sh-bottom-h);
+}
+
 .sh-banner {
-  position: fixed;
-  top: 40px;
-  left: 0;
-  right: 0;
-  z-index: 60;
   display: flex;
   align-items: center;
   gap: var(--s-3);

@@ -165,6 +165,51 @@ function drawTag(ctx, x, y, w, h, text, color) {
   ctx.fillText(text, x + 5, y + (h / 2) + 0.5);
 }
 
+/**
+ * Callout: places a tag just outside the globe limb, radially out from its
+ * anchor, nudging around the limb to avoid other tags, and joins it to the
+ * anchor with a thin leader line. Tags never sit on the sphere itself, so the
+ * disc stays clean. Returns false when no free slot was found.
+ */
+const CALLOUT_GAP = 14;
+const CALLOUT_NUDGES = [0, 0.1, -0.1, 0.2, -0.2, 0.3, -0.3, 0.42, -0.42, 0.56, -0.56];
+function drawCallout(ctx, anchor, text, color, W, H) {
+  const { cx, cy, R } = view;
+  const w = ctx.measureText(text).width + 10;
+  const h = 14;
+  const base = Math.atan2(anchor.sy - cy, anchor.sx - cx);
+  for (const nudge of CALLOUT_NUDGES) {
+    const a = base + nudge;
+    const cos = Math.cos(a);
+    const ex = cx + (cos * (R + CALLOUT_GAP));
+    const ey = cy + (Math.sin(a) * (R + CALLOUT_GAP));
+    const x = Math.min(Math.max(cos >= 0 ? ex : ex - w, 2), W - w - 2);
+    const y = Math.min(Math.max(ey - (h / 2), 2), H - h - 2);
+    // Reject slots where clamping pushed the tag back onto the disc.
+    const nx = Math.min(Math.max(cx, x), x + w);
+    const ny = Math.min(Math.max(cy, y), y + h);
+    if (Math.hypot(nx - cx, ny - cy) < R + 3) continue;
+    if (!reserve(placedBoxes, x, y, w, h)) continue;
+
+    const attachX = cos >= 0 ? x : x + w;
+    const attachY = y + (h / 2);
+    ctx.strokeStyle = PALETTE.lineStrong;
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(anchor.sx, anchor.sy);
+    ctx.lineTo(ex, ey);
+    ctx.lineTo(attachX, attachY);
+    ctx.stroke();
+    ctx.fillStyle = PALETTE.lineStrong;
+    ctx.beginPath();
+    ctx.arc(anchor.sx, anchor.sy, 1.5, 0, TWO_PI);
+    ctx.fill();
+    drawTag(ctx, x, y, w, h, text, color);
+    return true;
+  }
+  return false;
+}
+
 const testPosA = { sx: 0, sy: 0, visible: false };
 const testPosB = { sx: 0, sy: 0, visible: false };
 const scratchProj = { sx: 0, sy: 0, visible: false };
@@ -177,6 +222,7 @@ export default function ThreatGlobe({ alerts = EMPTY, satellites = EMPTY, select
   const computed = useTestMode((s) => s.computed);
   const debrisClouds = useStore((s) => s.debrisClouds);
   const snapshotTimestamp = useStore((s) => s.snapshotTimestamp);
+  const selectedOrbit = useStore((s) => s.selectedOrbit);
 
   // Alert-derived lookups, rebuilt only when alerts change (not per frame).
   const threat = useMemo(() => {
@@ -197,7 +243,7 @@ export default function ThreatGlobe({ alerts = EMPTY, satellites = EMPTY, select
 
   // Latest inputs for the render loop, so new snapshots don't restart it.
   const propsRef = useRef(null);
-  propsRef.current = { threat, alertCount: alerts.length, selectedSatId, testActive, testSatellites, computed, debrisClouds };
+  propsRef.current = { threat, alertCount: alerts.length, selectedSatId, testActive, testSatellites, computed, debrisClouds, selectedOrbit };
 
   // Per-satellite dead-reckoning state (see utils/motion.js).
   const motionRef = useRef({ sats: new Map(), lastSimMs: null, lastWallMs: 0, simRate: 1 });
@@ -283,13 +329,13 @@ export default function ThreatGlobe({ alerts = EMPTY, satellites = EMPTY, select
       const {
         threat: { cpiById, ranked },
         alertCount, selectedSatId: selectedId, testActive: tActive,
-        testSatellites: tSats, computed: comp, debrisClouds: clouds,
+        testSatellites: tSats, computed: comp, debrisClouds: clouds, selectedOrbit: orbit,
       } = propsRef.current;
       const motion = motionRef.current;
 
       view.cx = W / 2;
       view.cy = H / 2;
-      view.R = Math.min(W, H) * 0.44;
+      view.R = Math.min(W, H) * 0.40;
       view.cosV = Math.cos(viewLon * DEG);
       view.sinV = Math.sin(viewLon * DEG);
       const { cx, cy, R } = view;
@@ -392,6 +438,26 @@ export default function ThreatGlobe({ alerts = EMPTY, satellites = EMPTY, select
       };
       const cpiOf = (id) => ((id === testIdA || id === testIdB) ? 10 : (cpiById.get(id) ?? 0));
 
+      // ── Selected satellite's orbit: near side only, hidden behind the globe ─
+      if (orbit && orbit.length > 1 && selectedId != null) {
+        ctx.strokeStyle = PALETTE.accent;
+        ctx.globalAlpha = 0.75;
+        ctx.lineWidth = 1.25;
+        ctx.beginPath();
+        let penDown = false;
+        for (const sample of orbit) {
+          const pos = sample.position;
+          if (!pos) { penDown = false; continue; }
+          const p = projectEci(pos.x, pos.y, pos.z, scratchProj);
+          if (!p.visible) { penDown = false; continue; }
+          if (penDown) ctx.lineTo(p.sx, p.sy);
+          else { ctx.moveTo(p.sx, p.sy); penDown = true; }
+        }
+        ctx.stroke();
+        ctx.globalAlpha = 1;
+        ctx.lineWidth = 1;
+      }
+
       // Nominal satellites: one batched path of tiny dim dots.
       ctx.fillStyle = PALETTE.dim;
       ctx.globalAlpha = 0.7;
@@ -409,7 +475,6 @@ export default function ThreatGlobe({ alerts = EMPTY, satellites = EMPTY, select
       ctx.lineWidth = 1;
       ctx.setLineDash([4, 3]);
       let pillCount = 0;
-      const labelledIds = [];
       const pills = [];
       for (const alert of ranked) {
         const idA = Number(alert.sat1?.id);
@@ -428,7 +493,6 @@ export default function ThreatGlobe({ alerts = EMPTY, satellites = EMPTY, select
         ctx.stroke();
         if (!isTop) continue;
         pillCount += 1;
-        labelledIds.push(idA, idB);
         pills.push(alert, pA, pB);
       }
       ctx.setLineDash([]);
@@ -475,42 +539,6 @@ export default function ThreatGlobe({ alerts = EMPTY, satellites = EMPTY, select
         drawThreatDot(sid, posOf(sid));
       }
 
-      // ── Labels: pills first (they matter most), then names ────────────
-      for (let i = 0; i < pills.length; i += 3) {
-        const alert = pills[i];
-        const pA = pills[i + 1];
-        const pB = pills[i + 2];
-        const miss = formatMiss(Number(alert.miss_distance_km ?? 0));
-        const tca = formatTca(alert);
-        const text = miss && tca ? `${miss}  ${tca}` : (miss || tca);
-        if (!text) continue;
-        const w = ctx.measureText(text).width + 10;
-        const x = ((pA.sx + pB.sx) / 2) - (w / 2);
-        const y = ((pA.sy + pB.sy) / 2) - 7;
-        if (!reserve(placedBoxes, x, y, w, 14)) continue;
-        drawTag(ctx, x, y, w, 14, text, threatColor(Number(alert.cpi_score ?? 0)) || PALETTE.text);
-      }
-
-      const nameLabel = (id) => {
-        const p = posOf(id);
-        if (!p || !p.visible) return;
-        const name = id === testIdA ? testA.name : id === testIdB ? testB.name : motion.sats.get(id)?.name;
-        const text = (name ?? `#${id}`).slice(0, 14).toUpperCase();
-        const w = ctx.measureText(text).width + 10;
-        const h = 14;
-        const y = p.sy - (h / 2);
-        let x = p.sx + 7;
-        if (!reserve(placedBoxes, x, y, w, h)) {
-          x = p.sx - 7 - w;
-          if (!reserve(placedBoxes, x, y, w, h)) return;
-        }
-        drawTag(ctx, x, y, w, h, text, id === Number(selectedId) ? PALETTE.bright : PALETTE.text);
-      };
-      if (selectedId != null) nameLabel(Number(selectedId));
-      for (const id of labelledIds) {
-        if (id !== Number(selectedId)) nameLabel(id);
-      }
-
       ctx.restore();
 
       // ── Limb + readout ─────────────────────────────────────────────────
@@ -519,6 +547,31 @@ export default function ThreatGlobe({ alerts = EMPTY, satellites = EMPTY, select
       ctx.strokeStyle = PALETTE.lineStrong;
       ctx.lineWidth = 1;
       ctx.stroke();
+
+      // ── Callout labels, outside the disc (near-side objects only) ──────
+      ctx.font = MONO_9;
+      ctx.textBaseline = 'middle';
+      const midpoint = { sx: 0, sy: 0 };
+      for (let i = 0; i < pills.length; i += 3) {
+        const alert = pills[i];
+        const pA = pills[i + 1];
+        const pB = pills[i + 2];
+        const miss = formatMiss(Number(alert.miss_distance_km ?? 0));
+        const tca = formatTca(alert);
+        const text = miss && tca ? `${miss}  ${tca}` : (miss || tca);
+        if (!text) continue;
+        midpoint.sx = (pA.sx + pB.sx) / 2;
+        midpoint.sy = (pA.sy + pB.sy) / 2;
+        drawCallout(ctx, midpoint, text, threatColor(Number(alert.cpi_score ?? 0)) || PALETTE.text, W, H);
+      }
+      if (selectedId != null) {
+        const sid = Number(selectedId);
+        const p = posOf(sid);
+        if (p && p.visible) {
+          const name = sid === testIdA ? testA.name : sid === testIdB ? testB.name : motion.sats.get(sid)?.name;
+          drawCallout(ctx, p, (name ?? `#${sid}`).slice(0, 18).toUpperCase(), PALETTE.bright, W, H);
+        }
+      }
 
       ctx.font = CAPS_10;
       if ('letterSpacing' in ctx) ctx.letterSpacing = '1.4px';
@@ -565,9 +618,27 @@ export default function ThreatGlobe({ alerts = EMPTY, satellites = EMPTY, select
     };
   }, []);
 
+  // Click a dot to select it (same selection as the live globe).
+  const setSelectedSatelliteId = useStore((s) => s.setSelectedSatelliteId);
+  const handleClick = (evt) => {
+    const rect = evt.currentTarget.getBoundingClientRect();
+    const x = evt.clientX - rect.left;
+    const y = evt.clientY - rect.top;
+    let bestId = null;
+    let bestD2 = 10 * 10; // px pick radius
+    for (const [id, entry] of motionRef.current.sats) {
+      const p = entry.proj;
+      if (!p.visible) continue;
+      const d2 = ((p.sx - x) ** 2) + ((p.sy - y) ** 2);
+      if (d2 < bestD2) { bestD2 = d2; bestId = id; }
+    }
+    if (bestId != null) setSelectedSatelliteId(bestId);
+  };
+
   return (
     <canvas
       ref={canvasRef}
+      onClick={handleClick}
       style={{ width: '100%', height: '100%', display: 'block', cursor: 'crosshair', background: PALETTE.void }}
     />
   );

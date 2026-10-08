@@ -43,7 +43,7 @@ const COLORS = {
   satSelectedB: css(PALETTE.info, 1),
   satCaution: css(PALETTE.caution, 0.95),
   satWarning: css(PALETTE.warning, 0.95),
-  orbit: css(PALETTE.accent, 0.6),
+  orbit: css(PALETTE.accent, 0.85),
   labelText: css(PALETTE.bright, 1),
   labelBg: css(PALETTE.void, 0.92),
   hotspotCore: css(PALETTE.warning, 0.95),
@@ -239,7 +239,6 @@ const CesiumGlobe = ({ mode = 'live', alerts = EMPTY, onSatelliteSelect }) => {
         horizontalOrigin: Cesium.HorizontalOrigin.LEFT,
         verticalOrigin: Cesium.VerticalOrigin.CENTER,
         pixelOffset: new Cesium.Cartesian2(12, 0),
-        disableDepthTestDistance: Number.POSITIVE_INFINITY,
       });
 
       prims.orbitMaterial = Cesium.Material.fromType('Color');
@@ -250,7 +249,7 @@ const CesiumGlobe = ({ mode = 'live', alerts = EMPTY, onSatelliteSelect }) => {
       prims.orbitPolyline = prims.orbitLines.add({
         show: false,
         positions: [],
-        width: 1,
+        width: 1.5,
         material: prims.orbitMaterial,
         arcType: Cesium.ArcType.NONE,
         id: 'selected-orbit',
@@ -606,7 +605,7 @@ const CesiumGlobe = ({ mode = 'live', alerts = EMPTY, onSatelliteSelect }) => {
       prims.orbitSegmentPolylines.push(orbitLines.add({
         show: true,
         positions: toPositions(segments[i]),
-        width: 1,
+        width: 1.5,
         material: orbitMaterial,
         arcType: Cesium.ArcType.NONE,
         id: `selected-orbit-${i}`,
@@ -645,7 +644,6 @@ const CesiumGlobe = ({ mode = 'live', alerts = EMPTY, onSatelliteSelect }) => {
         pixelSize: 5 + (Math.min(score, 1) * 3),
         outlineColor: COLORS.void,
         outlineWidth: 1,
-        disableDepthTestDistance: Number.POSITIVE_INFINITY,
       });
       prims.hotspotEntities.push(viewer.entities.add({
         position,
@@ -720,7 +718,6 @@ const CesiumGlobe = ({ mode = 'live', alerts = EMPTY, onSatelliteSelect }) => {
           color: COLORS.debrisCore,
           outlineColor: COLORS.void,
           outlineWidth: 1,
-          disableDepthTestDistance: Number.POSITIVE_INFINITY,
         },
         label: {
           text: `DEBRIS  ${cloud.fragment_count ?? 0} FRAG  R ${outerKm.toFixed(0)} KM`,
@@ -733,7 +730,6 @@ const CesiumGlobe = ({ mode = 'live', alerts = EMPTY, onSatelliteSelect }) => {
           pixelOffset: new Cesium.Cartesian2(0, -12),
           horizontalOrigin: Cesium.HorizontalOrigin.CENTER,
           verticalOrigin: Cesium.VerticalOrigin.BOTTOM,
-          disableDepthTestDistance: Number.POSITIVE_INFINITY,
         },
       }));
     }

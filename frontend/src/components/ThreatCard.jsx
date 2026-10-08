@@ -36,7 +36,10 @@ function ThreatCard({ alert, isSelected, onDecision }) {
   const pc = Number(alert.p_collision ?? alert.probability_of_collision ?? 0);
   const tcaHours = Number(alert.tca_hours ?? (Number(alert.tca_minutes ?? NaN) / 60));
   const { formatted, urgent, critical } = useTCACountdown(tcaHours, alert.tca_utc);
-  const tcaState = critical ? 'is-warning' : urgent ? 'is-caution' : '';
+  // Time pressure only colours the timer when the conjunction itself is risky;
+  // a low-risk WATCH pair at closest approach right now is not an emergency.
+  const tcaState = state === 'nominal' ? '' : critical ? 'is-warning' : urgent ? 'is-caution' : '';
+  const tcaText = formatted === '00:00:00' ? 'NOW' : formatted;
 
   const sat1 = alert.sat1 ?? {};
   const sat2 = alert.sat2 ?? {};
@@ -140,7 +143,7 @@ function ThreatCard({ alert, isSelected, onDecision }) {
         </div>
 
         <div className="tq-metrics">
-          <span className={`tq-tca ${tcaState}`}>{formatted}</span>
+          <span className={`tq-tca ${tcaState}`}>{tcaText}</span>
           <span className="tq-num">{missKm.toFixed(1)}</span>
           <span className="tq-num">{formatPc(pc)}</span>
           <span className="tq-num">{cascadeCount}</span>

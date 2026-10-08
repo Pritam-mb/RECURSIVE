@@ -11,6 +11,7 @@ import ModelStatusV2 from './components/ModelStatusV2';
 import SimulationDrawer from './components/SimulationDrawer';
 import MetricsDrawer from './components/MetricsDrawer';
 import useStore from './store/useStore';
+import useSelectedOrbit from './hooks/useSelectedOrbit';
 import { buildCascadeGraph } from './utils/cascadeGraph';
 import './App.css';
 import './styles/shell.css';
@@ -46,6 +47,10 @@ function App() {
   const setSelectedSatelliteId = useStore((s) => s.setSelectedSatelliteId);
   const agencyFilter      = useStore((s) => s.agencyFilter);
   const cascadeGraph      = useStore((s) => s.cascadeGraph);
+  const wsConnected       = useStore((s) => s.wsConnected);
+
+  // Orbit path for the selected satellite (drawn by both globes).
+  useSelectedOrbit();
 
   const wsRef = useRef(null);
   const alertFetchInFlight = useRef(false);
@@ -186,12 +191,12 @@ function App() {
   }, [alerts, setCascadeGraph]);
 
   return (
-    <div className="sh-app">
-      {/* Offline banner (fixed, under the header) */}
-      <ConnectionBanner />
-
+    <div className={`sh-app${wsConnected ? '' : ' is-offline'}`}>
       {/* Row 1: Header / status bar */}
       <Header />
+
+      {/* Offline banner: its own grid row, so it never covers the panels */}
+      <ConnectionBanner />
 
       {/* Row 2: Live globe | mission control center | threat globe */}
       <div className="sh-main">

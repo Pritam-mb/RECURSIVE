@@ -112,6 +112,7 @@ class TestFrontendBackendParity:
                     # Normalise template segments:
                     # /api/satellites/${id}/telemetry -> /api/satellites/telemetry
                     path = re.sub(r"\$\{[^}]*\}", "", raw)
+                    path = path.split("?", 1)[0]  # query strings are not part of the route
                     path = re.sub(r"/{2,}", "/", path)
                     if not path.endswith("/"):
                         path += "/"

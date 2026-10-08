@@ -184,10 +184,26 @@ def run_scenario() -> dict:
         t0 = time.perf_counter()
         res["debris"] = _http("POST", "/debris/simulate", {})
         res["debris_call_s"] = round(time.perf_counter() - t0, 3)
+
+        def _n_debris(payload):
+            return sum(1 for a in (payload or {}).get("alerts", []) if a.get("source") == "debris")
+
+        # Fragment screening may finish in a background worker: poll /api/alerts (<= 60 s).
+        t_poll = time.perf_counter()
+        al = _http("GET", "/alerts")
+        while _n_debris(al) == 0 and time.perf_counter() - t_poll < 60:
+            time.sleep(1.0)
+            al = _http("GET", "/alerts")
+        res["debris_alerts_wait_s"] = round(time.perf_counter() - t0, 3)
         t0 = time.perf_counter()
         res["recompute_debris"] = _http("POST", "/simulation/time", {"offset_hours": 0})
         res["pipeline_refresh_debris_s"] = round(time.perf_counter() - t0, 3)
-        res["alerts_debris"] = _http("GET", "/alerts")
+        al2 = _http("GET", "/alerts")
+        t_poll = time.perf_counter()
+        while _n_debris(al2) == 0 and time.perf_counter() - t_poll < 60:
+            time.sleep(1.0)
+            al2 = _http("GET", "/alerts")
+        res["alerts_debris"] = al2 if _n_debris(al2) else al
         res["satellites_debris"] = _http("GET", "/satellites")
     finally:
         for m, p, b in (("DELETE", "/debris/active", None), ("DELETE", "/simulate", None),
@@ -2162,9 +2178,16 @@ def main():
     S += figure("20_cascade")
     if event:
         ds = (scen.get("debris") or {}).get("debris_screening") or {}
-        S.append(P(f"Debris screening: {ds.get('fragments_screened')} fragments × {ds.get('satellites_screened')} "
-                   f"satellites, {ds.get('window_hours'):g} h at {ds.get('step_s'):g} s steps → {ds.get('alerts_returned')} alerts in "
-                   f"{ds.get('elapsed_s'):.1f} s. Cascade depth is the BFS hop count from the collision event; P(hit) "
+        if ds.get("elapsed_s") is not None:
+            ds_txt = (f"Debris screening: {ds.get('fragments_screened')} fragments × {ds.get('satellites_screened')} "
+                      f"satellites, {ds.get('window_hours'):g} h at {ds.get('step_s'):g} s steps → {ds.get('alerts_returned')} "
+                      f"alerts in {ds['elapsed_s']:.1f} s.")
+        else:
+            ds_txt = (f"Debris screening (6 h window, 30 s steps, 5 km threshold) runs in a background worker: "
+                      f"POST /api/debris/simulate returned in {scen.get('debris_call_s', float('nan')):.2f} s and the "
+                      f"{n_deb} fragment alerts were published to /api/alerts {scen.get('debris_alerts_wait_s', float('nan')):.1f} s "
+                      "after the collision request.")
+        S.append(P(ds_txt + " Cascade depth is the BFS hop count from the collision event; P(hit) "
                    "combines all incident alerts assuming independence. This is a graph over predicted encounters in the "
                    "screening window, not a multi-year population model.", "small"))
     S.append(PageBreak())

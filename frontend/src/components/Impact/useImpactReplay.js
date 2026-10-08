@@ -99,7 +99,8 @@ export default function useImpactReplay() {
     setError(null);
     (async () => {
       try {
-        const res = await fetch(`/api/debris/events/${encodeURIComponent(eventId)}/replay?${REPLAY_QUERY}`);
+        const safeId = encodeURIComponent(eventId);
+        const res = await fetch(`/api/debris/events/${safeId}/replay?${REPLAY_QUERY}`);
         if (!res.ok) throw new Error(res.status === 404 ? 'Replay endpoint not available yet' : `Replay failed (${res.status})`);
         const payload = await res.json();
         replayCache.set(eventId, payload);

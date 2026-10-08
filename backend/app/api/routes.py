@@ -950,7 +950,7 @@ async def trigger_scenario(
         result = _sim_engine.load_scenario(name)
         # Update snapshot immediately so the new satellites show up on the UI
         if _propagator:
-            snapshot = _build_snapshot(_propagator, sim_clock.simulation_now())
+            snapshot = await asyncio.to_thread(_build_snapshot, _propagator, sim_clock.simulation_now())
             set_latest_snapshot(snapshot)
         return {"status": "LOADED", **result}
     except (FileNotFoundError, ValueError) as e:
@@ -964,6 +964,17 @@ async def clear_scenario(session_id: str = Depends(resolve_session_id)):
     if _sim_engine:
         _sim_engine.clear_scenario()
     return {"status": "CLEARED"}
+
+
+def _drop_debris_alerts() -> None:
+    """Remove published fragment alerts/clouds once all debris events are cleared."""
+    current = dict(get_latest_alerts() or {})
+    if not current:
+        return
+    current["alerts"] = [a for a in current.get("alerts", []) or [] if a.get("source") != "debris"]
+    current["count"] = len(current["alerts"])
+    current["debris_alert_count"] = 0
+    set_latest_alerts(current)
 
 
 class DebrisSimulateRequest(BaseModel):
@@ -1019,7 +1030,7 @@ async def simulate_collision_event(
 
     now = sim_clock.simulation_now()
     try:
-        event = await run_in_threadpool(
+        event = await asyncio.to_thread(
             debris_model.simulate_collision_from_pair, sat_a, sat_b, _propagator, now,
             tca_hint_utc=hint, window_hours=req.window_hours,
         )
@@ -1028,12 +1039,28 @@ async def simulate_collision_event(
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
 
-    snapshot = _build_snapshot(_propagator, now)
+    # All heavy work off the event loop. One snapshot (states) feeds the
+    # fragment screening; the clouds are re-read from the debris model's cache
+    # so cloud.affected_satellites and the debris alerts come from the same run.
+    snapshot = await asyncio.to_thread(_build_snapshot, _propagator, now)
+    debris_alerts = await asyncio.to_thread(
+        debris_model.compute_debris_alerts, snapshot.get("states", []), now,
+    )
+    snapshot = {**snapshot, "debris_clouds": debris_model.get_frontend_debris_clouds()}
+    try:
+        payload = json.loads(snapshot["payload"])
+        payload["debris_clouds"] = snapshot["debris_clouds"]
+        snapshot["payload"] = json.dumps(payload, separators=(",", ":"))
+    except Exception:
+        pass
     set_latest_snapshot(snapshot)
-    # Populate fragment-vs-satellite exposure immediately (also refreshed by the alert loop).
-    debris_alerts = await run_in_threadpool(debris_model.compute_debris_alerts, snapshot.get("states", []), now)
-    snapshot = _build_snapshot(_propagator, now)
-    set_latest_snapshot(snapshot)
+    # Publish the debris alerts now instead of waiting for the next 30 s refresh.
+    current = dict(get_latest_alerts() or {})
+    kept = [a for a in current.get("alerts", []) or [] if a.get("source") != "debris"]
+    current["alerts"] = kept + debris_alerts
+    current["count"] = len(current["alerts"])
+    current["debris_alert_count"] = len(debris_alerts)
+    set_latest_alerts(current)
 
     return {
         "status": "SUCCESS",
@@ -1056,8 +1083,9 @@ async def clear_debris(session_id: str = Depends(resolve_session_id)):
 
     from app.core.debris_model import debris_model
     debris_model.clear()
+    _drop_debris_alerts()
     
-    snapshot = _build_snapshot(_propagator, sim_clock.simulation_now())
+    snapshot = await asyncio.to_thread(_build_snapshot, _propagator, sim_clock.simulation_now())
     set_latest_snapshot(snapshot)
     
     return {"status": "CLEARED"}
@@ -1075,8 +1103,9 @@ async def reset_simulation(session_id: str = Depends(resolve_session_id)):
         _sim_engine.clear_scenario()
     from app.core.debris_model import debris_model
     debris_model.clear()
+    _drop_debris_alerts()
     
-    snapshot = _build_snapshot(_propagator, sim_clock.simulation_now())
+    snapshot = await asyncio.to_thread(_build_snapshot, _propagator, sim_clock.simulation_now())
     set_latest_snapshot(snapshot)
     
     return {"status": "RESET"}

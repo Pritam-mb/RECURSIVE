@@ -375,7 +375,7 @@ class CascadePlanner:
             s = state_by_id[n]
             pos = np.array([_get(s, "x"), _get(s, "y"), _get(s, "z")], float)
             vel = np.array([_get(s, "vx"), _get(s, "vy"), _get(s, "vz")], float)
-            peak = max((e["cpi_score"] for e in graph["adjacency"].get(n, [])), default=0.0)
+            peak = max((e.get("cpi_score", 0.0) for e in graph["adjacency"].get(n, [])), default=0.0)
             feats.append([*pos, *vel, np.linalg.norm(vel) * 3600.0, np.linalg.norm(pos) - 6371.0,
                           agency_id[graph["nodes"][n]["agency"]], peak])
         ei, ea = [], []

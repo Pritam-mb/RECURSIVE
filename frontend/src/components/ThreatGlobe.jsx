@@ -2,7 +2,7 @@ import { useRef, useEffect, useMemo } from 'react';
 import useTestMode from '../hooks/useTestMode';
 import useStore from '../store/useStore';
 import { severityLabel } from '../utils/severity';
-import { cloudCentroid, cloudEventId, cloudLabel, cloudRadius } from '../utils/debrisCloud';
+import { cloudCentroid, cloudLabel, cloudRadius } from '../utils/debrisCloud';
 import {
   CORRECTION_DECAY_S,
   MAX_EXTRAPOLATION_S,
@@ -37,6 +37,8 @@ const MAX_DPR = 1.5;
 const ROTATION_DEG_PER_S = 4.8;
 const MAX_CONJUNCTION_LABELS = 3;
 const EMPTY = [];
+// Longest pair link drawn (km). Beyond this the chord leaves the surface.
+const MAX_LINK_KM = 1500;
 
 // Simplified coastline data as lat/lon polylines (very compressed)
 // Each sub-array is a connected polyline [[lat,lon],...]
@@ -489,29 +491,34 @@ export default function ThreatGlobe({ alerts = EMPTY, satellites = EMPTY, select
       ctx.setLineDash([4, 3]);
       let pillCount = 0;
       const pills = [];
-      // Debris alerts: the fragment has no TLE, so anchor the line at the
-      // centroid of its parent event's cloud (when the backend sent one).
-      const cloudAnchor = new Map();
-      for (const cloud of clouds || EMPTY) {
-        const id = cloudEventId(cloud);
-        const c = cloudCentroid(cloud);
-        if (id != null && c && !cloudAnchor.has(id)) {
-          cloudAnchor.set(id, projectEci(c.x, c.y, c.z, { sx: 0, sy: 0, visible: false }));
-        }
-      }
+      // Alerts are future encounters, so the two objects can be on opposite
+      // sides of the Earth right now. This canvas has no depth test: a chord
+      // between distant objects would be drawn straight across the disc. Only
+      // link a pair while it is genuinely close (short chord ≈ on-surface).
+      const eciOf = (id) => {
+        if (id === testIdA) return testA.position;
+        if (id === testIdB) return testB.position;
+        return motion.sats.get(id)?.render ?? null;
+      };
       for (const alert of ranked) {
         const isDebris = alert.source === 'debris';
         const idA = Number(alert.sat1?.id);
         const idB = Number(alert.sat2?.id);
         let pA = posOf(idA);
         let pB = posOf(idB);
+        let rA = eciOf(idA);
+        let rB = eciOf(idB);
         if (isDebris && (!pA || !pB)) {
-          const eventId = alert.parent_event?.event_id;
-          const anchor = eventId != null ? cloudAnchor.get(String(eventId)) : null;
-          if (!pA) pA = anchor ?? null;
-          else pB = anchor ?? null;
+          // The fragment has no TLE: anchor at its own reported state.
+          const fr = alert.fragment_state?.r_km;
+          const anchor = Array.isArray(fr) && fr.length === 3
+            ? { x: Number(fr[0]), y: Number(fr[1]), z: Number(fr[2]) } : null;
+          const proj = anchor ? projectEci(anchor.x, anchor.y, anchor.z, { sx: 0, sy: 0, visible: false }) : null;
+          if (!pA) { pA = proj; rA = anchor; } else { pB = proj; rB = anchor; }
         }
-        if (!pA || !pB || !pA.visible || !pB.visible) continue;
+        if (!pA || !pB || !pA.visible || !pB.visible || !rA || !rB) continue;
+        const sepKm = Math.hypot((rA.x ?? 0) - (rB.x ?? 0), (rA.y ?? 0) - (rB.y ?? 0), (rA.z ?? 0) - (rB.z ?? 0));
+        if (!(sepKm <= MAX_LINK_KM)) continue;
         const isTop = pillCount < MAX_CONJUNCTION_LABELS;
         const color = threatColor(alertLevel(alert));
         ctx.setLineDash(isDebris ? [1, 3] : [4, 3]);

@@ -100,16 +100,13 @@ function measure() {
   return { items: out, numberOf, sections };
 }
 
-function RegionCard({ item, numberOf, children, style }) {
+function RegionCard({ item, children, style }) {
   const { region, n } = item;
   return (
     <div className="gd-callout" style={style} role="note" aria-label={`${n}. ${region.title}`}>
       <div className="gd-callout-head">
         <span className="gd-num">{n}</span>
         <span className="gd-callout-title">{region.title}</span>
-        {region.how && (
-          <InfoTip title="How it is computed" side="bottom">{region.how}</InfoTip>
-        )}
       </div>
       {region.what && <p className="gd-callout-text">{region.what}</p>}
       {region.bullets && (
@@ -125,7 +122,6 @@ function RegionCard({ item, numberOf, children, style }) {
       {region.how && <p className="gd-callout-how"><span className="gd-k">How</span>{region.how}</p>}
       {region.colours && <p className="gd-callout-how"><span className="gd-k">Colours</span>{region.colours}</p>}
       {children}
-      {!children && numberOf && null}
     </div>
   );
 }
@@ -158,7 +154,7 @@ export default function HelpOverlay({ open, onClose, onStartTour }) {
 
   if (!open || !layout) return null;
 
-  const { items, numberOf, sections } = layout;
+  const { items, sections } = layout;
   const children = {};
   for (const it of items) {
     if (it.region.badgeOnly && it.region.parent) (children[it.region.parent] ||= []).push(it);
@@ -205,7 +201,11 @@ export default function HelpOverlay({ open, onClose, onStartTour }) {
 
       <div className="gd-help-bar">
         <span className="gd-help-bar-title">Screen guide</span>
-        <span className="gd-help-bar-meta">{items.length} regions · every value is computed live · Esc closes</span>
+        <span className="gd-help-bar-meta">{items.length} regions · Esc closes</span>
+        <InfoTip title="Where the numbers come from" side="bottom">
+          Every value on screen is computed live by the backend (SGP4, Foster Pc, NASA SBM, re-propagated burns).
+          Assumptions such as masses are tagged with their source. Full write-up: docs/HOW_IT_WORKS.md.
+        </InfoTip>
         {onStartTour && (
           <button type="button" className="ui-btn ui-btn--primary gd-help-bar-btn" onClick={onStartTour}>
             Start demo tour
@@ -215,7 +215,6 @@ export default function HelpOverlay({ open, onClose, onStartTour }) {
           Close
         </button>
       </div>
-      {numberOf.queue && !numberOf['threat-card'] && null}
     </div>,
     document.body,
   );

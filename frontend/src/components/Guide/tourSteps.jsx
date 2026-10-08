@@ -4,7 +4,7 @@
  * `run` returned (no invented values). `ctx` carries results between steps.
  */
 import useStore from '../../store/useStore';
-import InfoTip from './InfoTip';
+import Kv from './Kv';
 import {
   gdFetch, sleep, pairKey, alertPair, fmtPc, fmtNum, fmtMiss, fmtDuration,
 } from './guideApi';
@@ -58,17 +58,6 @@ async function fetchAlerts(signal) {
 function findPairAlert(data, pair) {
   return (data?.alerts || []).find((a) => a.source !== 'debris' && alertPair(a) === pair) || null;
 }
-
-const Kv = ({ rows }) => (
-  <dl className="gd-kv">
-    {rows.filter(Boolean).map(([k, v, tip]) => (
-      <div className="gd-kv-row" key={k}>
-        <dt>{k}{tip && <InfoTip title={k} side="top">{tip}</InfoTip>}</dt>
-        <dd>{v}</dd>
-      </div>
-    ))}
-  </dl>
-);
 
 // ─────────────────────────────────────────────────────────────────────────────
 export const TOUR_STEPS = [
@@ -480,8 +469,8 @@ export const TOUR_STEPS = [
         depth: data?.cascade_depth ?? null,
         maxLinkedDepth: maxDepth,
         linked: linked.length,
-        nodes: data?.graph?.nodes?.length ?? null,
-        edges: data?.graph?.edges?.length ?? null,
+        nodes: data?.graph?.node_count ?? data?.graph?.nodes?.length ?? null,
+        edges: data?.graph?.edge_count ?? data?.graph?.edges?.length ?? null,
         top: probs.slice(0, 4).map(([id, p]) => [names[id] || id, p]),
       };
     },

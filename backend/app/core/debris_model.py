@@ -5,9 +5,10 @@ fragment-vs-satellite screening -> debris clouds for the UI.
 Pipeline (everything computed, nothing scripted):
 
 1. ``simulate_collision_from_pair(a, b, propagator, sim_time)``
-   * finds the pair's TCA with a vectorised SGP4 coarse scan (20 s grid) and
-     refines it with ``conjunction_solver.run_to_tca`` (RK45 + J2 + Hermite
-     interpolation + bounded Brent minimisation);
+   * finds the pair's TCA with a vectorised SGP4 scan (<= 10 s grid, or
+     +/- 30 min around a hint such as the screening alert's TCA) and refines
+     EVERY candidate local minimum with bounded Brent on the SGP4 distance,
+     keeping the global minimum (``find_pair_tca``);
    * parent masses: SATCAT (``app.core.satcat.lookup``) RCS class / object type
      when available, else documented defaults (``mass_source`` says which);
    * breakup via ``app.core.breakup.simulate_breakup`` (NASA SBM, seeded with a
@@ -20,7 +21,11 @@ Pipeline (everything computed, nothing scripted):
 3. ``compute_debris_alerts(states, sim_time)`` screens every live fragment
    against every satellite over a forward window (default 6 h, 30 s grid,
    KD-tree candidate search + linear relative-motion TCA refinement inside the
-   step) and computes Pc for each fragment/satellite pair.
+   step) and computes Pc for each fragment/satellite pair.  Satellites with a
+   TLE use one vectorised SGP4 (SatrecArray) call; only objects without a TLE
+   are integrated (RK4 two-body + J2, 20 s substeps).  The numeric kernel runs
+   in a persistent worker process (see ``_KernelWorker``) so GIL contention
+   with the server's other threads cannot stretch it (3.6 s -> 141 s measured).
 4. ``get_frontend_debris_clouds(states)`` reports the real fragment cloud
    (centroid, 50/90th percentile radius, real SBM fragment count, <=300
    rendered positions, affected satellites from step 3).
@@ -33,7 +38,13 @@ from __future__ import annotations
 import logging
 import math
 import os
+import pickle
+import struct
+import subprocess
+import sys
+import threading
 import zlib
+from pathlib import Path
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from threading import RLock
@@ -67,6 +78,7 @@ DEBRIS_WINDOW_HOURS = float(os.getenv("DEBRIS_WINDOW_HOURS", "6"))
 DEBRIS_STEP_S = float(os.getenv("DEBRIS_STEP_S", "30"))
 DEBRIS_THRESHOLD_KM = float(os.getenv("DEBRIS_THRESHOLD_KM", "5"))
 SAT_TRACK_MAX_STEP_S = 20.0        # RK4 substep for satellites without a TLE (two-body + J2)
+STATE_BACKSTEP_MAX_S = 300.0       # state_at may integrate this far backwards from the live state
 DEBRIS_MAX_ALERTS = int(os.getenv("DEBRIS_MAX_ALERTS", "50"))
 MAX_FRAGMENTS_PROPAGATED = int(os.getenv("DEBRIS_MAX_FRAGMENTS", "1000"))
 MAX_FRAGMENTS_RENDERED = 300
@@ -287,7 +299,11 @@ class DebrisEvent:
         """Copy of the fragment state at t without mutating the event (t >= collision)."""
         if t <= self.collision_utc:
             return self.result.r_km.copy(), self.result.v_kms.copy(), np.ones(len(self.result.r_km), bool)
-        if t >= self.epoch:
+        back_s = (self.epoch - t).total_seconds()
+        if t >= self.epoch or back_s <= STATE_BACKSTEP_MAX_S:
+            # forward from the live state, or a short RK4 step backwards from it
+            # (the snapshot loop usually advanced the epoch a few seconds past
+            # the caller's sim time; re-integrating from the breakup is wasteful)
             r, v, alive = self.r, self.v, self.alive
             dt = (t - self.epoch).total_seconds()
         else:
@@ -358,11 +374,26 @@ def _bound_ok(r: np.ndarray) -> np.ndarray:
     return np.isfinite(rn) & (rn - R_EARTH_KM >= sbm.REENTRY_ALT_KM) & (rn < 1.0e5)
 
 
-def _advance(r, v, bc, alive, dt_s, chunk_s: float | None = None):
-    """Propagate alive rows over dt_s; rows dropping below 100 km are marked decayed."""
-    r = r.copy()
-    v = v.copy()
-    alive = alive.copy()
+# ── Out-of-process numeric kernels ──────────────────────────────────────────
+#
+# Why a worker process: the fragment screening is ~150k small numpy calls (a
+# fixed-step RK4 time loop).  numpy releases the GIL inside each call, so when
+# any other Python thread of the server is CPU-bound (snapshot builder, alert
+# pipeline, ML, JSON) every release costs a ~5 ms GIL switch interval
+# ("convoy effect"): measured 3.6 s alone vs 141 s next to one busy Python
+# thread.  The same maths therefore runs in a persistent child process (one
+# per server, started lazily, ~60 MB) that has its own GIL.  If the worker
+# cannot start or dies, the kernel runs in-process (same code, same result).
+# DEBRIS_WORKER=0 disables the worker.
+
+ADVANCE_WORKER_MIN_STEPS = 8        # _advance spans with >= this many steps go to the worker
+_BACKEND_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _advance_local(r, v, bc, alive, dt_s, chunk_s: float | None = None):
+    r = np.array(r, float)
+    v = np.array(v, float)
+    alive = np.array(alive, bool)
     remaining = float(dt_s)
     sign = 1.0 if remaining >= 0 else -1.0
     chunk_s = DEBRIS_STEP_S if chunk_s is None else chunk_s  # decay checked every step
@@ -374,6 +405,249 @@ def _advance(r, v, bc, alive, dt_s, chunk_s: float | None = None):
         alive[idx[~_bound_ok(r_new)]] = False
         remaining -= step
     return r, v, alive
+
+
+def _series_kernel(r, v, bc, alive, dts, chunk_s=None):
+    """Positions after each successive dt in ``dts`` (cumulative), plus alive masks."""
+    out_r = np.empty((len(dts),) + np.shape(r))
+    out_alive = np.empty((len(dts), len(r)), bool)
+    for k, dt in enumerate(dts):
+        r, v, alive = _advance_local(r, v, bc, alive, dt, chunk_s)
+        out_r[k], out_alive[k] = r, alive
+    return out_r, out_alive, v
+
+
+def _rest_tracks(R, V, rest, r0, v0, offsets):
+    """Fill rows ``rest`` of R/V by RK4 two-body + J2 from (r0, v0) at offsets[0].
+
+    20 s RK4 substeps: ~1.5 m error after 6 h in LEO (60 s gave ~200 m, i.e.
+    ~1 sigma of the 0.2 km satellite sigma used for debris Pc).  Only objects
+    without a TLE come here; TLE objects use SGP4 (SatrecArray) directly."""
+    if len(rest) == 0:
+        return R, V
+    r = np.asarray(r0, float)
+    v = np.asarray(v0, float)
+    R[rest, 0], V[rest, 0] = r, v
+    for k in range(1, len(offsets)):
+        r, v = sbm.propagate(r, v, None, offsets[k] - offsets[k - 1], max_step_s=SAT_TRACK_MAX_STEP_S)
+        R[rest, k], V[rest, k] = r, v
+    return R, V
+
+
+def _screen_kernel(F_r, F_v, F_bc, F_alive, F_rel, F_ev, n_events, S_r_all, S_v_all,
+                   rest, rest_r0, rest_v0, offsets, step_s, threshold_km, excluded):
+    """Fragment x satellite screening over the grid (pure numpy/scipy).
+
+    Returns the closest approach below ``threshold_km`` per (fragment, satellite)
+    pair as arrays, plus per-event cloud-radius timelines."""
+    from scipy.spatial import cKDTree
+    S_r_all, S_v_all = _rest_tracks(S_r_all, S_v_all, rest, rest_r0, rest_v0, offsets)
+    n_steps = len(offsets) - 1
+    cand_radius = threshold_km + MAX_REL_SPEED_KMS * step_s / 2.0
+    timeline: dict[int, list[dict]] = {k: [] for k in range(n_events)}
+    timeline_every = max(1, int(round(1800.0 / step_s)))
+    hits = []
+    r_cur, v_cur, alive = F_r.copy(), F_v.copy(), F_alive.copy()
+    for k in range(n_steps + 1):
+        if k > 0:
+            idx = np.nonzero(alive & (k > F_rel))[0]
+            if idx.size:
+                rn, vn = sbm.propagate(r_cur[idx], v_cur[idx], F_bc[idx], step_s, max_step_s=step_s)
+                r_cur[idx], v_cur[idx] = rn, vn
+                alive[idx[~_bound_ok(rn)]] = False
+        active = alive & (k >= F_rel)
+        if k % timeline_every == 0:
+            for e in range(n_events):
+                sel = active & (F_ev == e)
+                if sel.sum() >= 3:
+                    c = r_cur[sel].mean(axis=0)
+                    d = np.linalg.norm(r_cur[sel] - c, axis=1)
+                    p50, p90 = np.percentile(d, [50, 90])
+                    timeline[e].append({"minutes": round(k * step_s / 60.0, 1),
+                                        "radius_km": round(float(p90), 2),
+                                        "radius_p50_km": round(float(p50), 2)})
+        ai = np.nonzero(active)[0]
+        if ai.size == 0:
+            continue
+        S_r = S_r_all[:, k, :]
+        ok = np.isfinite(S_r[:, 0])
+        tree_s = cKDTree(np.where(ok[:, None], S_r, 1e9))
+        tree_f = cKDTree(r_cur[ai])
+        pairs = tree_f.sparse_distance_matrix(tree_s, cand_radius, output_type="ndarray")
+        if len(pairs) == 0:
+            continue
+        fi = ai[pairs["i"]]
+        sj = pairs["j"].astype(np.int64)
+        dr = r_cur[fi] - S_r[sj]
+        dv = v_cur[fi] - S_v_all[sj, k, :]
+        dv2 = np.einsum("ij,ij->i", dv, dv)
+        tstar = np.clip(-np.einsum("ij,ij->i", dr, dv) / np.maximum(dv2, 1e-12), -step_s / 2, step_s / 2)
+        miss_vec = dr + dv * tstar[:, None]
+        miss = np.linalg.norm(miss_vec, axis=1)
+        keep = (miss < threshold_km) & ~excluded[F_ev[fi], sj]
+        if keep.any():
+            q = np.nonzero(keep)[0]
+            hits.append((fi[q], sj[q], miss[q], k * step_s + tstar[q], dv[q], miss_vec[q], S_r[sj[q]]))
+    if not hits:
+        e3 = np.zeros((0, 3))
+        return {"f": np.zeros(0, int), "s": np.zeros(0, int), "miss": np.zeros(0), "t_off": np.zeros(0),
+                "dv": e3, "miss_vec": e3, "sat_r": e3, "timeline": timeline}
+    f, s, miss, t_off, dv, mv, sr = (np.concatenate(x) for x in zip(*hits))
+    # best (smallest miss) per (fragment, satellite) pair
+    order = np.lexsort((miss, s, f))
+    f, s = f[order], s[order]
+    first = np.ones(len(f), bool)
+    first[1:] = (f[1:] != f[:-1]) | (s[1:] != s[:-1])
+    sel = order[first]
+    return {"f": f[first], "s": s[first], "miss": miss[sel], "t_off": t_off[sel],
+            "dv": dv[sel], "miss_vec": mv[sel], "sat_r": sr[sel], "timeline": timeline}
+
+
+_KERNELS = {"advance": _advance_local, "series": _series_kernel, "screen": _screen_kernel}
+
+
+def _read_exact(stream, n: int) -> bytes:
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = stream.read(n - len(buf))
+        if not chunk:
+            raise EOFError("debris worker pipe closed")
+        buf += chunk
+    return bytes(buf)
+
+
+def _worker_main() -> None:  # pragma: no cover - runs in the child process
+    inp, out = sys.stdin.buffer, sys.stdout.buffer
+    sys.stdout = sys.stderr   # nothing else may write to the result pipe
+    while True:
+        try:
+            hdr = _read_exact(inp, 8)
+        except EOFError:
+            return
+        op, args = pickle.loads(_read_exact(inp, struct.unpack("<Q", hdr)[0]))
+        try:
+            res = ("ok", _KERNELS[op](**args))
+        except Exception as exc:
+            res = ("err", f"{type(exc).__name__}: {exc}")
+        data = pickle.dumps(res, protocol=pickle.HIGHEST_PROTOCOL)
+        out.write(struct.pack("<Q", len(data)))
+        out.write(data)
+        out.flush()
+
+
+class _KernelWorker:
+    """Persistent child process running ``_KERNELS`` (see note above)."""
+
+    def __init__(self):
+        self._proc: subprocess.Popen | None = None
+        self._lock = threading.Lock()
+        self.calls = 0
+        self.fallbacks = 0
+
+    @property
+    def enabled(self) -> bool:
+        return os.getenv("DEBRIS_WORKER", "1") != "0"
+
+    def _start_locked(self) -> None:
+        if self._proc is not None and self._proc.poll() is None:
+            return
+        env = dict(os.environ)
+        env["PYTHONPATH"] = str(_BACKEND_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+        self._proc = subprocess.Popen(
+            [sys.executable, "-c", "from app.core.debris_model import _worker_main; _worker_main()"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=None,
+            cwd=str(_BACKEND_ROOT), env=env, creationflags=flags,
+        )
+
+    def prewarm(self) -> None:
+        """Start the child now (non-blocking) so its imports overlap other work."""
+        if not self.enabled:
+            return
+        if self._lock.acquire(blocking=False):
+            try:
+                self._start_locked()
+            except Exception as exc:  # pragma: no cover
+                logger.warning("debris worker prewarm failed: %s", exc)
+            finally:
+                self._lock.release()
+
+    def call(self, op: str, **args):
+        if self.enabled:
+            with self._lock:
+                for _attempt in range(2):
+                    try:
+                        self._start_locked()
+                        data = pickle.dumps((op, args), protocol=pickle.HIGHEST_PROTOCOL)
+                        self._proc.stdin.write(struct.pack("<Q", len(data)))
+                        self._proc.stdin.write(data)
+                        self._proc.stdin.flush()
+                        hdr = _read_exact(self._proc.stdout, 8)
+                        status, res = pickle.loads(_read_exact(self._proc.stdout, struct.unpack("<Q", hdr)[0]))
+                    except Exception as exc:
+                        logger.warning("debris worker failed (%s); restarting", exc)
+                        self.stop_locked()
+                        continue
+                    if status == "ok":
+                        self.calls += 1
+                        return res
+                    logger.warning("debris worker kernel error: %s", res)
+                    break
+        self.fallbacks += 1
+        return _KERNELS[op](**args)
+
+    def stop_locked(self) -> None:
+        proc, self._proc = self._proc, None
+        if proc is None:
+            return
+        try:
+            proc.stdin.close()
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=2)
+        except Exception:
+            proc.kill()
+
+    def stop(self) -> None:
+        with self._lock:
+            self.stop_locked()
+
+
+_worker = _KernelWorker()
+
+
+def _stop_worker_at_exit() -> None:
+    try:
+        _worker.stop()
+    except Exception:
+        pass
+
+
+import atexit  # noqa: E402
+
+atexit.register(_stop_worker_at_exit)
+
+
+def propagate_series(r, v, bc, alive, dts, chunk_s: float | None = None):
+    """Propagate fragments through successive steps ``dts`` (seconds, cumulative)
+    in the worker process. Returns (positions[len(dts), n, 3], alive[len(dts), n],
+    final velocities). Same integrator as ``_advance`` (RK4 two-body+J2+drag)."""
+    return _worker.call("series", r=np.asarray(r, float), v=np.asarray(v, float),
+                        bc=np.asarray(bc, float), alive=np.asarray(alive, bool),
+                        dts=[float(x) for x in dts], chunk_s=chunk_s)
+
+
+def _advance(r, v, bc, alive, dt_s, chunk_s: float | None = None):
+    """Propagate alive rows over dt_s; rows dropping below 100 km are marked decayed.
+
+    Long spans run in the worker process (GIL-free); short ones in-process."""
+    step = DEBRIS_STEP_S if chunk_s is None else chunk_s
+    if abs(float(dt_s)) / max(step, 1e-9) >= ADVANCE_WORKER_MIN_STEPS and np.any(alive):
+        return _worker.call("advance", r=np.asarray(r, float), v=np.asarray(v, float),
+                            bc=np.asarray(bc, float), alive=np.asarray(alive, bool),
+                            dt_s=float(dt_s), chunk_s=chunk_s)
+    return _advance_local(r, v, bc, alive, dt_s, chunk_s)
 
 
 # ── Model ────────────────────────────────────────────────────────────────────
@@ -388,6 +662,21 @@ class DebrisModel:
         self._last_exposure: dict[str, list[dict]] = {}
         self._last_timeline: dict[str, list[dict]] = {}
         self._last_screen_meta: dict[str, Any] = {}
+        self._screening: dict[str, dict[str, Any]] = {}
+
+    # ── fragment-screening status (POST /debris/simulate runs it in background)
+    def set_screening_status(self, event_id: str, status: str, **info: Any) -> dict:
+        with self._lock:
+            rec = {**self._screening.get(event_id, {}), "status": status, **info}
+            self._screening[event_id] = rec
+            return dict(rec)
+
+    def screening_status(self, event_id: str | None = None) -> dict:
+        """{status: running|done|error, ...} for an event (or {event_id: status} for all)."""
+        with self._lock:
+            if event_id is None:
+                return {k: dict(v) for k, v in self._screening.items()}
+            return dict(self._screening.get(event_id) or {"status": "unknown"})
 
     # ── creation ─────────────────────────────────────────────────────────
     def _register(self, event_id, collision_utc, parent_ids, parent_names, parents, tca, res, provenance):
@@ -447,6 +736,7 @@ class DebrisModel:
         """Breakup of a catalogue pair at their predicted TCA."""
         sim_time = _as_utc(sim_time)
         self._propagator = propagator
+        _worker.prewarm()   # child process imports overlap the TCA search
         tca = find_pair_tca(propagator, int(sat_a_id), int(sat_b_id), sim_time,
                             window_hours=window_hours, tca_hint_utc=tca_hint_utc)
         names = tca["names"]
@@ -510,6 +800,7 @@ class DebrisModel:
             self._last_exposure = {}
             self._last_timeline = {}
             self._last_screen_meta = {}
+            self._screening = {}
 
     def drop_events_with_parents(self, norad_ids) -> list[str]:
         """Drop events whose parent objects were removed from the catalogue."""
@@ -520,6 +811,7 @@ class DebrisModel:
                 self._events.pop(eid, None)
                 self._last_exposure.pop(eid, None)
                 self._last_timeline.pop(eid, None)
+                self._screening.pop(eid, None)
             if gone:
                 self._last_alerts = [a for a in self._last_alerts
                                      if a.get("parent_event", {}).get("event_id") not in gone]
@@ -590,77 +882,57 @@ class DebrisModel:
 
         sat_ids = np.array([s[0] for s in sats])
         sat_names = [s[1] for s in sats]
-        S_r_all, S_v_all = self._satellite_tracks(sats, sim_time, offsets)
+        t_tracks = _time.perf_counter()
+        S_r_all, S_v_all, rest = self._tle_tracks(sats, sim_time, offsets)
+        t_tracks = _time.perf_counter() - t_tracks
 
         # exclude each event's own parents
-        parent_ids = [set(ev.parent_ids) for ev in events]
+        excluded = np.zeros((len(events), len(sats)), bool)
+        for e, ev in enumerate(events):
+            if ev.parent_ids:
+                excluded[e] = np.isin(sat_ids, np.array(ev.parent_ids, dtype=sat_ids.dtype))
 
-        from scipy.spatial import cKDTree
-        cand_radius = threshold_km + MAX_REL_SPEED_KMS * step_s / 2.0
-        best: dict[tuple[int, int], tuple] = {}
-        timeline: dict[int, list[dict]] = {k: [] for k in range(len(events))}
-        timeline_every = max(1, int(round(1800.0 / step_s)))
-        r_cur, v_cur, alive = F_r, F_v, F_alive
-        for k in range(n_steps + 1):
-            if k > 0:
-                idx = np.nonzero(alive & (k > F_rel))[0]
-                rn, vn = sbm.propagate(r_cur[idx], v_cur[idx], F_bc[idx], step_s, max_step_s=step_s)
-                r_cur = r_cur.copy(); v_cur = v_cur.copy(); alive = alive.copy()
-                r_cur[idx], v_cur[idx] = rn, vn
-                alive[idx[~_bound_ok(rn)]] = False
-            active = alive & (k >= F_rel)
-            if k % timeline_every == 0:
-                for e in range(len(events)):
-                    sel = active & (F_ev == e)
-                    if sel.sum() >= 3:
-                        c = r_cur[sel].mean(axis=0)
-                        d = np.linalg.norm(r_cur[sel] - c, axis=1)
-                        timeline[e].append({"minutes": round(k * step_s / 60.0, 1),
-                                            "radius_km": round(float(np.percentile(d, 90)), 2),
-                                            "radius_p50_km": round(float(np.percentile(d, 50)), 2)})
-            ai = np.nonzero(active)[0]
-            if ai.size == 0:
-                continue
-            S_r = S_r_all[:, k, :]
-            S_v = S_v_all[:, k, :]
-            ok = np.isfinite(S_r[:, 0])
-            tree_s = cKDTree(np.where(ok[:, None], S_r, 1e9))
-            tree_f = cKDTree(r_cur[ai])
-            pairs = tree_f.sparse_distance_matrix(tree_s, cand_radius, output_type="ndarray")
-            if len(pairs) == 0:
-                continue
-            fi = ai[pairs["i"]]
-            sj = pairs["j"]
-            dr = r_cur[fi] - S_r[sj]
-            dv = v_cur[fi] - S_v[sj]
-            dv2 = np.einsum("ij,ij->i", dv, dv)
-            tstar = np.clip(-np.einsum("ij,ij->i", dr, dv) / np.maximum(dv2, 1e-12), -step_s / 2, step_s / 2)
-            miss_vec = dr + dv * tstar[:, None]
-            miss = np.linalg.norm(miss_vec, axis=1)
-            keep = miss < threshold_km
-            for q in np.nonzero(keep)[0]:
-                f, s = int(fi[q]), int(sj[q])
-                if int(sat_ids[s]) in parent_ids[F_ev[f]]:
-                    continue
-                key = (f, s)
-                if key not in best or miss[q] < best[key][0]:
-                    best[key] = (float(miss[q]), k * step_s + float(tstar[q]), dv[q].copy(),
-                                 miss_vec[q].copy(), S_r[s].copy())
+        t_kernel = _time.perf_counter()
+        n_fallback0 = _worker.fallbacks
+        out = _worker.call(
+            "screen", F_r=F_r, F_v=F_v, F_bc=F_bc, F_alive=F_alive, F_rel=F_rel, F_ev=F_ev,
+            n_events=len(events), S_r_all=S_r_all, S_v_all=S_v_all, rest=rest,
+            rest_r0=np.array([sats[i][2] for i in rest], float).reshape(-1, 3),
+            rest_v0=np.array([sats[i][3] for i in rest], float).reshape(-1, 3),
+            offsets=offsets, step_s=step_s, threshold_km=threshold_km, excluded=excluded,
+        )
+        t_kernel = _time.perf_counter() - t_kernel
+        in_worker = _worker.fallbacks == n_fallback0 and _worker.enabled
+        timeline = out["timeline"]
+
+        # Pc for every candidate pair at once (one vectorised ncx2 call)
+        n_c = len(out["f"])
+        c_ev = F_ev[out["f"]] if n_c else np.zeros(0, int)
+        c_lc = np.array([events[int(c_ev[q])].result.lc_m[int(F_idx[out["f"][q]])] for q in range(n_c)], float)
+        c_props = [object_physical_properties(int(sat_ids[s]), sat_names[s]) for s in out["s"]]
+        c_hbr = (np.array([p["hbr_m"] for p in c_props], float) + c_lc / 2.0) / 1000.0
+        c_coll = np.array([(sim_time - events[int(c_ev[q])].collision_utc).total_seconds() for q in range(n_c)], float)
+        c_age = np.maximum(0.0, c_coll + out["t_off"])
+        c_sigf = np.hypot(FRAG_SIGMA0_KM, FRAG_SIGMA_RATE_KMS * c_age)
+        c_sigma = np.hypot(SAT_SIGMA_KM, c_sigf)
+        c_pc = _pc_isotropic(out["miss"], c_hbr, c_sigma) if n_c else np.zeros(0)
 
         alerts = []
         exposure: dict[int, dict] = {}
-        for (f, s), (miss, t_off, dv, miss_vec, sat_r) in best.items():
+        for q in range(n_c):
+            f, s = int(out["f"][q]), int(out["s"][q])
+            miss, t_off = float(out["miss"][q]), float(out["t_off"][q])
+            dv, miss_vec, sat_r = out["dv"][q], out["miss_vec"][q], out["sat_r"][q]
             ev = events[F_ev[f]]
             fidx = int(F_idx[f])
-            lc = float(ev.result.lc_m[fidx])
+            lc = float(c_lc[q])
             sid = int(sat_ids[s])
-            props = object_physical_properties(sid, sat_names[s])
-            hbr_km = (props["hbr_m"] + lc / 2.0) / 1000.0
+            props = c_props[q]
+            hbr_km = float(c_hbr[q])
             tca_time = sim_time + timedelta(seconds=t_off)
-            age_s = max(0.0, (tca_time - ev.collision_utc).total_seconds())
-            sig_f = math.hypot(FRAG_SIGMA0_KM, FRAG_SIGMA_RATE_KMS * age_s)
-            sigma = math.hypot(SAT_SIGMA_KM, sig_f)
-            pc = float(_pc_isotropic(np.array([miss]), np.array([hbr_km]), np.array([sigma]))[0])
+            sig_f = float(c_sigf[q])
+            sigma = float(c_sigma[q])
+            pc = float(c_pc[q])
             vrel = float(np.linalg.norm(dv))
             zhat = dv / max(vrel, 1e-12)
             xi = np.cross(zhat, sat_r); xi /= max(np.linalg.norm(xi), 1e-12)
@@ -759,6 +1031,9 @@ class DebrisModel:
                 "satellites_screened": len(sats), "pairs_within_threshold": total,
                 "alerts_returned": len(alerts), "satellites_exposed": len(exposure),
                 "elapsed_s": round(elapsed, 3),
+                "satellite_tracks_s": round(t_tracks, 3), "kernel_s": round(t_kernel, 3),
+                "kernel_process": "worker" if in_worker else "in_process",
+                "satellites_sgp4": len(sats) - len(rest), "satellites_rk4_j2": len(rest),
             }
         logger.info("Debris screening: %d fragments x %d sats over %.1f h -> %d pairs (%.2f s)",
                     len(F_r), len(sats), window_hours, total, elapsed)
@@ -767,11 +1042,23 @@ class DebrisModel:
     def _satellite_tracks(self, sats, sim_time, offsets):
         """Satellite positions/velocities on the grid: SGP4 (SatrecArray) when the
         propagator knows the object, else RK4 two-body + J2 from the given state."""
+        R, V, rest = self._tle_tracks(sats, sim_time, offsets)
+        return _rest_tracks(R, V, rest, [sats[i][2] for i in rest], [sats[i][3] for i in rest], offsets)
+
+    def _tle_tracks(self, sats, sim_time, offsets):
+        """SGP4 rows filled in one vectorised SatrecArray call; returns (R, V,
+        rest) where ``rest`` lists the rows (objects without a TLE) still NaN."""
         m, nt = len(sats), len(offsets)
         R = np.full((m, nt, 3), np.nan)
         V = np.full((m, nt, 3), np.nan)
         sgp_rows, satrecs = [], []
         prop = self._propagator
+        if prop is None:   # e.g. events restored without a pair call: use the server's propagator
+            try:
+                from app.core import screening as _scr
+                prop = getattr(_scr, "_DEFAULT_PROPAGATOR", None)
+            except Exception:
+                prop = None
         if prop is not None:
             try:
                 with prop._lock:
@@ -795,17 +1082,9 @@ class DebrisModel:
             r = np.where((err == 0)[..., None], r, np.nan)
             R[sgp_rows] = r
             V[sgp_rows] = v
-        rest = [i for i in range(m) if i not in set(sgp_rows)]
-        if rest:
-            r = np.array([sats[i][2] for i in rest], float)
-            v = np.array([sats[i][3] for i in rest], float)
-            R[rest, 0], V[rest, 0] = r, v
-            for k in range(1, nt):
-                # 20 s RK4 substeps: ~1.5 m error after 6 h in LEO (60 s gave ~200 m,
-                # i.e. ~1 sigma of the 0.2 km satellite sigma used for debris Pc).
-                r, v = sbm.propagate(r, v, None, offsets[k] - offsets[k - 1], max_step_s=SAT_TRACK_MAX_STEP_S)
-                R[rest, k], V[rest, k] = r, v
-        return R, V
+        in_sgp = set(sgp_rows)
+        rest = [i for i in range(m) if i not in in_sgp]
+        return R, V, rest
 
     # ── UI ───────────────────────────────────────────────────────────────
     def get_frontend_debris_clouds(self, states: list | None = None) -> list[dict]:
@@ -901,52 +1180,114 @@ class DebrisModel:
 
 # ── TCA for a catalogue pair ────────────────────────────────────────────────
 
-def find_pair_tca(propagator, a_id: int, b_id: int, start: datetime, *, window_hours: float = 24.0,
-                  tca_hint_utc=None, coarse_step_s: float = 20.0) -> dict:
-    """Vectorised SGP4 coarse scan then conjunction_solver.run_to_tca refinement."""
+def _pair_sgp4(propagator, ids, satrecs, jd, fr):
     from sgp4.api import SatrecArray
-    from app.services.conjunction_solver import parse_eci_state, run_to_tca
+    err, r, v = SatrecArray(list(satrecs)).sgp4(np.atleast_1d(jd), np.atleast_1d(fr))
+    try:  # executed burns ride on SGP4 as a propagated deviation
+        from app.core.sgp4_propagator import add_burn_offsets
+        add_burn_offsets(propagator, list(ids), np.atleast_1d(jd), np.atleast_1d(fr), r, v)
+    except ImportError:  # pragma: no cover
+        pass
+    return err, r, v
+
+
+def find_pair_tca(propagator, a_id: int, b_id: int, start: datetime, *, window_hours: float = 24.0,
+                  tca_hint_utc=None, coarse_step_s: float = 10.0, hint_half_window_min: float = 30.0,
+                  max_candidates: int = 64) -> dict:
+    """Closest approach of a catalogue pair (global minimum over the window).
+
+    1. Vectorised SGP4 scan (SatrecArray, burns included) on a <= 10 s grid
+       over ``window_hours`` from ``start`` -- or +/- ``hint_half_window_min``
+       around ``tca_hint_utc`` (e.g. the screening alert's TCA).
+    2. EVERY local minimum of the grid distance that could hide the global
+       minimum (grid distance - |v_rel| * step <= best grid distance) is
+       refined with bounded Brent on the SGP4 distance (xatol 1 ms).  A fast
+       crossing (10 km/s) moves 100 km per 10 s step, so the coarse argmin
+       alone can pick the wrong revolution; refining all minima cannot.
+    3. The pass with the smallest refined miss wins; states at TCA from SGP4.
+    """
+    from scipy.optimize import minimize_scalar
 
     with propagator._lock:
         ea = propagator._satellites.get(int(a_id))
         eb = propagator._satellites.get(int(b_id))
     if ea is None or eb is None:
         raise KeyError(f"satellite {a_id if ea is None else b_id} not tracked")
+    ids = (int(a_id), int(b_id))
+    satrecs = (ea[0], eb[0])
+    step = min(float(coarse_step_s), 10.0)
     start = _as_utc(start)
     if tca_hint_utc is not None:
         hint = _as_utc(tca_hint_utc)
-        scan_start = max(start, hint - timedelta(minutes=30))
-        span = (hint + timedelta(minutes=30) - scan_start).total_seconds()
+        scan_start = max(start, hint - timedelta(minutes=hint_half_window_min))
+        span = (hint + timedelta(minutes=hint_half_window_min) - scan_start).total_seconds()
+        basis = "hint_window"
     else:
         scan_start = start
         span = window_hours * 3600.0
-    offsets = np.arange(0.0, max(span, coarse_step_s) + coarse_step_s, coarse_step_s)
+        basis = "full_window"
+    offsets = np.arange(0.0, max(span, step) + step, step)
+    jd0, fr0 = _jd_arrays([scan_start])
     jd, fr = _jd_grid(scan_start, offsets)
-    err, r, v = SatrecArray([ea[0], eb[0]]).sgp4(jd, fr)
-    try:  # executed burns ride on SGP4 as a propagated deviation
-        from app.core.sgp4_propagator import add_burn_offsets
-        add_burn_offsets(propagator, [int(a_id), int(b_id)], jd, fr, r, v)
-    except ImportError:  # pragma: no cover
-        pass
+    err, r, v = _pair_sgp4(propagator, ids, satrecs, jd, fr)
     d = np.linalg.norm(r[0] - r[1], axis=1)
-    d[(err[0] != 0) | (err[1] != 0)] = np.inf
-    k = int(np.argmin(d))
-    if not np.isfinite(d[k]):
+    bad = (err[0] != 0) | (err[1] != 0)
+    d[bad] = np.inf
+    if not np.isfinite(d).any():
         raise ValueError("propagation failed for pair")
-    k0 = max(0, k - 1)
-    t0 = scan_start + timedelta(seconds=float(offsets[k0]))
-    t1 = scan_start + timedelta(seconds=float(offsets[min(k + 1, len(offsets) - 1)]))
-    sa = parse_eci_state(r[0, k0], v[0, k0], t0)
-    sb = parse_eci_state(r[1, k0], v[1, k0], t0)
-    res = run_to_tca(sa, sb, t1, step_seconds=1.0, max_steps=200, use_j2=True)
+    vrel = np.linalg.norm(v[0] - v[1], axis=1)
+    vrel[bad] = 0.0
+    # local minima of the sampled distance (end points included)
+    left = np.r_[np.inf, d[:-1]]
+    right = np.r_[d[1:], np.inf]
+    is_min = np.isfinite(d) & (d <= left) & (d <= right)
+    cand = np.nonzero(is_min)[0]
+    # a pass can only beat the best grid sample if its lower bound is below it
+    lower = d[cand] - vrel[cand] * step
+    cand = cand[lower <= d[cand].min()]
+    cand = cand[np.argsort(d[cand])][:max_candidates]
+
+    def dist(t_s: float) -> float:
+        f = fr0[0] + t_s / 86400.0
+        whole = math.floor(f)
+        e, rr, _ = _pair_sgp4(propagator, ids, satrecs, jd0[0] + whole, f - whole)
+        if e[0, 0] or e[1, 0]:
+            return float("inf")
+        return float(np.linalg.norm(rr[0, 0] - rr[1, 0]))
+
+    passes = []
+    for k in cand:
+        lo = float(offsets[max(k - 1, 0)])
+        hi = float(offsets[min(k + 1, len(offsets) - 1)])
+        if hi <= lo:
+            t_best, d_best = lo, float(d[k])
+        else:
+            res = minimize_scalar(dist, bounds=(lo, hi), method="bounded", options={"xatol": 1e-3})
+            t_best, d_best = float(res.x), float(res.fun)
+            if d[k] < d_best:
+                t_best, d_best = float(offsets[k]), float(d[k])
+        passes.append((d_best, t_best, float(d[k])))
+    passes.sort()
+    miss_km, t_tca, grid_km = passes[0]
+    f = fr0[0] + t_tca / 86400.0
+    whole = math.floor(f)
+    _, rr, vv = _pair_sgp4(propagator, ids, satrecs, jd0[0] + whole, f - whole)
+    ra, rb, va, vb = rr[0, 0], rr[1, 0], vv[0, 0], vv[1, 0]
+    tca_time = scan_start + timedelta(seconds=t_tca)
     return {
-        "tca_utc": res.tca_utc,
-        "miss_distance_m": res.miss_distance_m,
-        "relative_velocity_kms": res.relative_velocity_kms,
-        "position_a_eci": res.position_a_eci, "velocity_a_eci": res.velocity_a_eci,
-        "position_b_eci": res.position_b_eci, "velocity_b_eci": res.velocity_b_eci,
-        "coarse_min_km": round(float(d[k]), 4),
-        "method": "sgp4_scan_20s+run_to_tca(rk45_j2,hermite,brent)",
+        "tca_utc": tca_time.isoformat(),
+        "miss_distance_m": round(miss_km * 1000.0, 3),
+        "relative_velocity_kms": round(float(np.linalg.norm(va - vb)), 6),
+        "position_a_eci": [float(x) for x in ra], "velocity_a_eci": [float(x) for x in va],
+        "position_b_eci": [float(x) for x in rb], "velocity_b_eci": [float(x) for x in vb],
+        "coarse_min_km": round(float(np.min(d)), 4),
+        "grid_distance_at_tca_pass_km": round(grid_km, 4),
+        "passes_refined": len(passes),
+        "other_passes": [{"tca_utc": (scan_start + timedelta(seconds=t)).isoformat(), "miss_km": round(m, 4)}
+                         for m, t, _ in passes[1:6]],
+        "scan": {"basis": basis, "start_utc": scan_start.isoformat(), "span_s": float(offsets[-1]),
+                 "step_s": step, "hint_utc": None if tca_hint_utc is None else _as_utc(tca_hint_utc).isoformat()},
+        "method": f"sgp4_scan_{step:g}s+brent_all_local_minima(sgp4,xatol=1ms)",
         "names": (ea[1], eb[1]),
     }
 

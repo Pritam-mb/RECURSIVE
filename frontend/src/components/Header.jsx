@@ -1,6 +1,8 @@
 import { memo, useEffect, useMemo, useState } from 'react';
 import useStore from '../store/useStore';
 import AnalyticsDrawer from './AnalyticsDrawer';
+import HelpOverlay from './Guide/HelpOverlay';
+import DemoTour from './Guide/DemoTour';
 
 const DEFAULT_AGENCIES = ['SpaceX', 'ISS', 'Roscosmos', 'CNSA', 'NOAA', 'NASA', 'Iridium'];
 
@@ -70,6 +72,8 @@ export default function Header() {
   const setSimOpen = useStore((s) => s.setSimulationDrawerOpen);
   const analyticsOpen = useStore((s) => s.analyticsDrawerOpen);
   const setAnalyticsOpen = useStore((s) => s.setAnalyticsDrawerOpen);
+  const [helpOpen, setHelpOpen] = useState(false);
+  const [tourOpen, setTourOpen] = useState(false);
 
   const maxCpi = useMemo(() => {
     let max = 0;
@@ -168,7 +172,32 @@ export default function Header() {
         >
           Analytics
         </button>
+        <button
+          type="button"
+          className="ui-btn ui-btn--primary sh-toggle gd-hdr-btn"
+          aria-pressed={tourOpen}
+          onClick={() => { setHelpOpen(false); setTourOpen((v) => !v); }}
+          title="Guided demo: scenario → detection → avoidance → collision → debris → cascade"
+        >
+          Demo tour
+        </button>
+        <button
+          type="button"
+          className="ui-btn sh-toggle gd-hdr-btn is-help"
+          aria-pressed={helpOpen}
+          aria-label="Explain this screen"
+          onClick={() => setHelpOpen((v) => !v)}
+          title="Explain every part of the screen (Esc closes)"
+        >
+          ?
+        </button>
       </div>
+      <HelpOverlay
+        open={helpOpen}
+        onClose={() => setHelpOpen(false)}
+        onStartTour={() => { setHelpOpen(false); setTourOpen(true); }}
+      />
+      <DemoTour open={tourOpen} onClose={() => setTourOpen(false)} />
       {/* Fixed-position side sheet; mounted here so it fetches only when open. */}
       <AnalyticsDrawer />
     </header>

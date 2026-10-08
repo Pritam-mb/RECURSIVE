@@ -112,7 +112,11 @@ export default function CascadeExplorer({ initialSelection = null, onClose }) {
   const hotspotsById = useMemo(() => new Map((data?.hotspots ?? []).map((h) => [h.id, h])), [data]);
 
   // Default selection: the highest-score hotspot (the backend sorts by score).
-  const effectiveSel = selection ?? (data?.hotspots?.length ? { type: 'hotspot', id: data.hotspots[0].id } : null);
+  const topHotspotId = data?.hotspots?.[0]?.id ?? null;
+  const effectiveSel = useMemo(
+    () => selection ?? (topHotspotId ? { type: 'hotspot', id: topHotspotId } : null),
+    [selection, topHotspotId],
+  );
 
   // Which hotspot's detail is shown for the current selection.
   const context = useMemo(() => {

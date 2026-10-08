@@ -24,7 +24,8 @@ def _crossing_pair(lead_s: float, miss_m: float, rel_speed_kms: float = 10.0):
     epoch = datetime(2024, 1, 1, 12, tzinfo=timezone.utc)
     start = epoch + timedelta(hours=1)
     t_enc = start + timedelta(seconds=lead_s)
-    jd, fr = jday(t_enc.year, t_enc.month, t_enc.day, t_enc.hour, t_enc.minute, t_enc.second)
+    jd, fr = jday(t_enc.year, t_enc.month, t_enc.day, t_enc.hour, t_enc.minute,
+                   t_enc.second + t_enc.microsecond / 1e6)
     _, r_a, v_a = a.sgp4(jd, fr)
     r_a, v_a = np.array(r_a), np.array(v_a)
     r_hat = r_a / np.linalg.norm(r_a)

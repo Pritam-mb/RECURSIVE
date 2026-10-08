@@ -22,7 +22,9 @@ import {
 const RE_KM = 6378.137;
 const FLASH_MS = 3200;
 const THREAT_WINDOW_S = 15 * 60;
-const TRAIL_SAMPLES = 6;
+// Only link a threatened satellite to its fragment once they are this close.
+const THREAT_LINK_KM = 1500;
+const TRAIL_SAMPLES = 4;
 const TRAIL_MAX_VERTICES = 1400;
 const ENV_MAX_STEP_RAD = (1.5 * Math.PI) / 180;
 const SHOCK_MAX_KM = 420;
@@ -482,7 +484,8 @@ export default class ImpactScene {
       if (inWindow && f >= 0 && this.fragAlive[f]) {
         const fp = [this.fragNow[f * 3], this.fragNow[(f * 3) + 1], this.fragNow[(f * 3) + 2]];
         const sp = [pos[0], pos[1], pos[2]];
-        if (segmentClearsEarth(sp, fp)) {
+        const sepKm = Math.hypot(fp[0] - sp[0], fp[1] - sp[1], fp[2] - sp[2]);
+        if (sepKm <= THREAT_LINK_KM && segmentClearsEarth(sp, fp)) {
           it.line.positions = [c, this.toCart(fp[0], fp[1], fp[2])];
           it.line.show = true;
         } else it.line.show = false;

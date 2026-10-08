@@ -50,16 +50,17 @@ function cardStyle(region, rect, anchorRect) {
     }
     case 'beside-right': {
       const a = anchorRect || rect;
-      const p = clampBox(a.x + a.w + 12, a.y + 12, 420, vw, vh);
-      return { ...p, width: 420 };
+      const p = clampBox(a.x + a.w + 12, a.y + 12, 376, vw, vh);
+      return { ...p, width: 376 };
     }
     case 'inside-bl':
       return { left: rect.x + 12, bottom: Math.max(GAP, vh - (rect.y + rect.h) + 40), width: w };
     case 'inside-tr':
       return { left: rect.x + rect.w - w - 12, top: rect.y + oy, width: w };
     case 'inside-wide': {
+      // May grow a little above a short strip; anchored to its bottom edge.
       const ww = Math.min(1180, rect.w - 280);
-      return { left: rect.x + rect.w - ww - 12, top: rect.y + 6, width: ww, maxHeight: rect.h - 12 };
+      return { left: rect.x + rect.w - ww - 12, bottom: vh - (rect.y + rect.h) + 4, width: ww };
     }
     case 'inside-tl':
     default:
@@ -97,7 +98,10 @@ function measure() {
       });
     }
   }
-  return { items: out, numberOf, sections };
+  // Title bar sits on the (mostly empty) left end of the telemetry strip.
+  const strip = findRect(['.tm-strip']);
+  const bar = strip ? { left: strip.x + 12, top: strip.y + 8 } : { left: 12, bottom: 12 };
+  return { items: out, numberOf, sections, bar };
 }
 
 function RegionCard({ item, children, style }) {
@@ -154,7 +158,7 @@ export default function HelpOverlay({ open, onClose, onStartTour }) {
 
   if (!open || !layout) return null;
 
-  const { items, sections } = layout;
+  const { items, sections, bar } = layout;
   const children = {};
   for (const it of items) {
     if (it.region.badgeOnly && it.region.parent) (children[it.region.parent] ||= []).push(it);
@@ -199,7 +203,7 @@ export default function HelpOverlay({ open, onClose, onStartTour }) {
         </RegionCard>
       ))}
 
-      <div className="gd-help-bar">
+      <div className="gd-help-bar" style={bar}>
         <span className="gd-help-bar-title">Screen guide</span>
         <span className="gd-help-bar-meta">{items.length} regions · Esc closes</span>
         <InfoTip title="Where the numbers come from" side="bottom">

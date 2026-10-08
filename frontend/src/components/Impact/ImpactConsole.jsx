@@ -162,6 +162,7 @@ export default function ImpactConsole() {
           <span className="im-band im-band--spread" style={{ left: pct(Math.min(t1, IMPACT_BAND_S)), right: 0 }} />
           <span className="im-t0" style={{ left: pct(0) }} />
           <span className="im-fill" style={{ width: pct(Math.min(t1, Math.max(t0, tRelS))) }} />
+          <span className="im-head" style={{ left: pct(Math.min(t1, Math.max(t0, tRelS))) }} />
           {threat.total > 0 && (replay?.threatened || []).map((x) => {
             const rel = (Date.parse(x.tca_utc || '') - Date.parse(replay.collision_utc || '')) / 1000;
             if (!Number.isFinite(rel) || rel < t0 || rel > t1) return null;

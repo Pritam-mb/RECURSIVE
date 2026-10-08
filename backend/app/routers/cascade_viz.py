@@ -46,7 +46,9 @@ SEV_RANK = {"CRITICAL": 3, "WARNING": 2, "WATCH": 1}
 SPREAD_OFFSETS_S = (600.0, 2700.0, 5400.0)   # own-event spread shown 10 / 45 / 90 min after breakup
 PC_TARGET = 1e-6                              # maneuver_planner target (reported, not decided here)
 MAX_EVENT_HORIZON_S = 36 * 3600.0            # do not propagate fragments further than this past breakup
-CACHE_SIZE = 8
+CHECKPOINT_S = 1800.0                         # fragment-state checkpoint grid (s after breakup)
+MAX_CHECKPOINTS = 120
+CACHE_SIZE = 8                                # events with cached checkpoints
 
 _cache: "OrderedDict[tuple, dict]" = OrderedDict()
 _cache_lock = threading.Lock()
@@ -274,32 +276,54 @@ def build_graph(alerts: list[dict], node_prob: dict, events: list[dict]) -> dict
 
 # ── Debris census inside a hotspot ─────────────────────────────────────────
 
+def _checkpoints(ev) -> dict[float, tuple]:
+    """Per-event store of propagated states {t_rel_s: (r, v, alive)}; seeded with the breakup state."""
+    res = ev.result
+    key = (ev.event_id, int(getattr(res, "seed", 0)), ev.collision_utc.isoformat())
+    with _cache_lock:
+        cps = _cache.get(key)
+        if cps is None:
+            cps = _cache[key] = {0.0: (np.asarray(res.r_km, float), np.asarray(res.v_kms, float),
+                                       np.ones(len(res.r_km), bool))}
+            while len(_cache) > CACHE_SIZE:
+                _cache.popitem(last=False)
+        else:
+            _cache.move_to_end(key)
+    # the live model already holds the state at ev.epoch: reuse it as a checkpoint
+    epoch, r, v, alive = ev.epoch, ev.r, ev.v, ev.alive
+    if epoch is not None and r is not None and epoch > ev.collision_utc and ev.epoch is epoch:
+        t = round((epoch - ev.collision_utc).total_seconds(), 3)
+        if t not in cps and len(r) == len(res.r_km):
+            cps[t] = (np.array(r, float), np.array(v, float), np.array(alive, bool))
+    return cps
+
+
 def fragment_states(ev, offsets_s: list[float]) -> dict[float, tuple[np.ndarray, np.ndarray]]:
-    """Fragment (r, alive) at each t_rel >= 0 (seconds after breakup), one forward pass, cached."""
+    """Fragment (r, alive) at each t_rel >= 0 (seconds after breakup).
+
+    Propagation (``debris_model._advance``, the live model's RK4 two-body+J2+drag) resumes from the
+    nearest earlier checkpoint, and new checkpoints are kept every CHECKPOINT_S, so repeated requests
+    (alerts refresh every 30 s) only integrate the few seconds that changed."""
     from app.core.debris_model import _advance
 
-    res = ev.result
     wanted = sorted({round(float(t), 0) for t in offsets_s if 0.0 <= t <= MAX_EVENT_HORIZON_S})
-    key = (ev.event_id, int(getattr(res, "seed", 0)), ev.collision_utc.isoformat(), tuple(wanted))
-    with _cache_lock:
-        hit = _cache.get(key)
-        if hit is not None:
-            _cache.move_to_end(key)
-            return hit
-    r = np.asarray(res.r_km, float).copy()
-    v = np.asarray(res.v_kms, float).copy()
-    alive = np.ones(len(r), bool)
+    cps = _checkpoints(ev)
     out: dict[float, tuple[np.ndarray, np.ndarray]] = {}
-    t_prev = 0.0
     for t in wanted:
-        if t > t_prev and alive.any():
-            r, v, alive = _advance(r, v, ev.bc, alive, t - t_prev)
-        t_prev = t
-        out[t] = (r.copy(), alive.copy())
-    with _cache_lock:
-        _cache[key] = out
-        while len(_cache) > CACHE_SIZE:
-            _cache.popitem(last=False)
+        t0 = max(k for k in list(cps) if k <= t)
+        r, v, alive = cps[t0]
+        while t0 < t:
+            step = min(t - t0, CHECKPOINT_S - (t0 % CHECKPOINT_S) if t0 % CHECKPOINT_S else CHECKPOINT_S)
+            if alive.any():
+                r, v, alive = _advance(r, v, ev.bc, alive, step)
+            t0 += step
+            if t0 % CHECKPOINT_S == 0 and t0 not in cps:
+                cps[t0] = (r, v, alive)
+        if len(cps) > MAX_CHECKPOINTS:   # keep the grid checkpoints, drop the oldest ad-hoc ones
+            for k in [k for k in list(cps) if k and k % CHECKPOINT_S][: len(cps) - MAX_CHECKPOINTS]:
+                cps.pop(k, None)
+        cps.setdefault(t, (r, v, alive))
+        out[t] = (r, alive)
     return out
 
 
@@ -319,17 +343,26 @@ def _spread(pts: np.ndarray) -> dict:
             "p90_km": round(float(np.percentile(d, 90)), 2), "along_track_spread_km": along}
 
 
-def census_offsets(ev, when: datetime, own: bool) -> list[float]:
+def _window_s() -> float:
+    """Debris look-ahead = the live fragment-screening window (debris_model.DEBRIS_WINDOW_HOURS)."""
+    try:
+        from app.core.debris_model import DEBRIS_WINDOW_HOURS
+        return float(DEBRIS_WINDOW_HOURS) * 3600.0
+    except Exception:  # pragma: no cover
+        return 6 * 3600.0
+
+
+def census_offsets(ev, when: datetime, own: bool, now: datetime | None = None) -> list[float]:
     """Seconds after breakup at which debris_census needs the fragment state."""
     t_rel = (when - ev.collision_utc).total_seconds()
-    if t_rel < -1.0:
+    if t_rel < -1.0 or (now is not None and (when - now).total_seconds() > _window_s()):
         return []
     t0 = max(t_rel, 0.0)
     return [t0] + ([t0 + s for s in SPREAD_OFFSETS_S] if own else [])
 
 
 def debris_census(ev, center: np.ndarray, radius_km: float, when: datetime, own: bool,
-                  states: dict | None = None) -> dict:
+                  states: dict | None = None, now: datetime | None = None) -> dict:
     res = ev.result
     t_rel = (when - ev.collision_utc).total_seconds()
     weight = float(getattr(res, "weight", 1.0) or 1.0)
@@ -341,8 +374,12 @@ def debris_census(ev, center: np.ndarray, radius_km: float, when: datetime, own:
     if t_rel < -1.0:
         return {**base, "state": "not_yet_released", "sampled_inside": 0, "represented_inside": 0,
                 "nearest_fragment_km": None, "spread": None, "spread_timeline": None}
+    if now is not None and (when - now).total_seconds() > _window_s():
+        return {**base, "state": "outside_debris_window", "window_hours": round(_window_s() / 3600.0, 2),
+                "sampled_inside": None, "represented_inside": None, "nearest_fragment_km": None,
+                "spread": None, "spread_timeline": None}
     if states is None:
-        states = fragment_states(ev, census_offsets(ev, when, own))
+        states = fragment_states(ev, census_offsets(ev, when, own, now))
     t0 = round(max(t_rel, 0.0), 0)
     if t0 not in states:
         return {**base, "state": "beyond_propagation_horizon", "sampled_inside": None,
@@ -444,6 +481,9 @@ def _explain(h: dict) -> dict:
         for e in deb["events"]:
             if e["state"] == "not_yet_released":
                 bits.append(f"event {e['event_id']} has not broken up yet at this time")
+            elif e["state"] == "outside_debris_window":
+                bits.append(f"this TCA is beyond the {e['window_hours']:g} h debris look-ahead, so fragments of "
+                            f"event {e['event_id']} were not propagated that far")
             elif e["state"] == "released":
                 if e["relation"] == "own_breakup" and abs(e["t_rel_s"]) <= 1.0:
                     tl = e.get("spread_timeline") or []
@@ -451,8 +491,11 @@ def _explain(h: dict) -> dict:
                                       for t in tl if t.get("p90_km") is not None)
                     bits.append(f"this is the breakup point of event {e['event_id']}: ~{e['fragment_count_total']} "
                                 f"fragments ≥10 cm are released here" + (f" ({after})" if after else ""))
-                else:
+                elif e["represented_inside"]:
                     bits.append(f"~{e['represented_inside']} fragment(s) of event {e['event_id']} are inside the zone "
+                                f"(nearest {fmt_dist(e['nearest_fragment_km'])})")
+                else:
+                    bits.append(f"no fragment of event {e['event_id']} is inside the zone at TCA "
                                 f"(nearest {fmt_dist(e['nearest_fragment_km'])})")
         e_deb = "Debris layer: " + "; ".join(bits) + "."
     else:
@@ -493,7 +536,9 @@ def _explain(h: dict) -> dict:
         e_av = "No burn was planned: " + "; ".join(f"{a['mover']['name']} ({str(a['maneuver_status']).replace('_', ' ')})" for a in av) + "."
     else:
         e_av = "No operational payload in this zone can manoeuvre (debris / rocket bodies only)."
-    if eff["options_checked"]:
+    if not eff["options_total"]:
+        e_eff = "No burn is proposed here, so nobody else's risk changes. "
+    elif eff["options_checked"]:
         e_eff = (f"Each option was re-screened for 24 h against the catalogue and live fragments: "
                  f"{eff['secondary_total']} new or worsened close approach(es) found, "
                  f"{eff['unsafe_options']} option(s) unsafe. ")
@@ -540,7 +585,7 @@ def build_hotspot(idx: int, h: dict, alerts: list[dict], ev_objs: list, forecast
         for ev in ev_objs:
             try:
                 census.append(debris_census(ev, center, radius, when, ev is own_ev,
-                                            (ev_states or {}).get(ev.event_id)))
+                                            (ev_states or {}).get(ev.event_id), now))
             except Exception as error:  # pragma: no cover - never fail the payload on one event
                 logger.warning("debris census failed for %s: %s", ev.event_id, error)
     a_, b_ = sorted(pair)
@@ -670,7 +715,7 @@ def build_explorer(snapshot: dict, ev_objs: list, now: datetime) -> dict:
         for h in raw_hotspots:
             when = _parse(h.get("tca_utc"))
             if when is not None:
-                offsets += census_offsets(ev, when, _own_event(h, ev_objs) is ev)
+                offsets += census_offsets(ev, when, _own_event(h, ev_objs) is ev, now)
         try:
             ev_states[ev.event_id] = fragment_states(ev, offsets) if offsets else {}
         except Exception as error:  # pragma: no cover

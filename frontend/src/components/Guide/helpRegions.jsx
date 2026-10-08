@@ -33,7 +33,7 @@ export const HELP_REGIONS = [
     key: 'live-globe',
     title: 'Live catalogue globe',
     selectors: ['section[aria-label="Live catalog globe"]'],
-    place: 'inside-bl',
+    place: 'inside-tl',
     what: 'Every tracked object at its current position. Click a dot to select it: its orbit is drawn and the telemetry strip fills in.',
     how: 'SGP4 propagation of each TLE (executed burns added as J2 deviations), refreshed about once per second over the WebSocket.',
     colours: 'Grey = no alert, amber = in a WARNING pair, red = in a CRITICAL pair, blue = selected, amber cloud = debris fragments.',

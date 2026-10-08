@@ -206,3 +206,25 @@ def test_endpoint(scenario, monkeypatch):
     assert body["counts"]["events"] == 1 and body["counts"]["hotspots"] == 1
     assert body["events"][0]["threatened"][0]["id"] == "555"
     assert body["hotspots"][0]["area"]["geodetic"]["altitude_km"] > 400
+
+
+def test_checkpointed_propagation_equals_straight_run(scenario):
+    _, ev = scenario
+    from app.core.debris_model import _advance
+
+    cv._cache.clear()
+    a = cv.fragment_states(ev, [2400.0])[2400.0]
+    b = cv.fragment_states(ev, [5400.0])[5400.0]           # resumes from the 1800 s checkpoint
+    res = ev.result
+    r, _, alive = _advance(res.r_km.copy(), res.v_kms.copy(), ev.bc, np.ones(len(res.r_km), bool), 5400.0)
+    assert np.array_equal(b[1], alive)
+    assert np.nanmax(np.abs(b[0][alive] - r[alive])) < 1e-6
+    assert a[0].shape == r.shape
+
+
+def test_census_outside_debris_window(scenario):
+    _, ev = scenario
+    snap = _snapshot(ev)
+    snap["hotspots"][0]["tca_utc"] = (T0 + timedelta(hours=cv._window_s() / 3600.0 + 1)).isoformat()
+    c = cv.build_explorer(snap, [ev], T0)["hotspots"][0]["debris"]["events"][0]
+    assert c["state"] == "outside_debris_window" and c["represented_inside"] is None

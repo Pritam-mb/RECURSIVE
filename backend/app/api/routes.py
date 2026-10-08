@@ -923,10 +923,9 @@ async def trigger_scenario(
 
     try:
         result = await asyncio.to_thread(_sim_engine.load_scenario, name)
-        # Update snapshot immediately so the new satellites show up on the UI
-        if _propagator:
-            snapshot = await asyncio.to_thread(_build_snapshot, _propagator, sim_clock.simulation_now())
-            set_latest_snapshot(snapshot)
+        # Rebuild the snapshot in the background so the new objects show up on
+        # the next push without holding the response (the 1 s loop also does it).
+        _spawn_debris_task(_rebuild_snapshot_bg())
         return {"status": "LOADED", **result}
     except (FileNotFoundError, ValueError) as e:
         return {"status": "ERROR", "message": str(e)}
@@ -934,21 +933,56 @@ async def trigger_scenario(
 
 @router.delete("/simulate")
 async def clear_scenario(session_id: str = Depends(resolve_session_id)):
-    """Clear the active scenario."""
+    """Clear the active scenario (its objects, their breakups and their alerts).
+
+    Fast (no propagation): the 1 s snapshot loop shows the change on its next tick."""
     _require_valid_session(session_id)
+    removed = _clear_scenario_state()
+    return {"status": "CLEARED", "removed_object_ids": removed}
+
+
+# Bumped whenever debris/scenario state is cleared: a background fragment
+# screening started before the clear must not republish stale alerts.
+_DEBRIS_GENERATION = 0
+_DEBRIS_TASKS: set = set()
+
+
+def _bump_debris_generation() -> None:
+    global _DEBRIS_GENERATION
+    _DEBRIS_GENERATION += 1
+
+
+def _clear_scenario_state() -> list[int]:
+    """Remove scenario objects, breakups of them and alerts that reference them."""
+    removed: list[int] = []
     if _sim_engine:
+        removed = [int(x) for x in getattr(_sim_engine, "_scenario_sats", []) or []]
         _sim_engine.clear_scenario()
-    return {"status": "CLEARED"}
+    if removed:
+        _bump_debris_generation()
+        gone = set(removed)
+        current = dict(get_latest_alerts() or {})
+        if current:
+            def _refs(a):
+                return ((a.get("sat1") or {}).get("id") in gone or (a.get("sat2") or {}).get("id") in gone
+                        or bool(gone & set((a.get("parent_event") or {}).get("parent_ids") or [])))
+            current["alerts"] = [a for a in current.get("alerts", []) or [] if not _refs(a)]
+            current["count"] = len(current["alerts"])
+            current["debris_alert_count"] = sum(1 for a in current["alerts"] if a.get("source") == "debris")
+            set_latest_alerts(current)
+    return removed
 
 
 def _drop_debris_alerts() -> None:
     """Remove published fragment alerts/clouds once all debris events are cleared."""
+    _bump_debris_generation()
     current = dict(get_latest_alerts() or {})
     if not current:
         return
     current["alerts"] = [a for a in current.get("alerts", []) or [] if a.get("source") != "debris"]
     current["count"] = len(current["alerts"])
     current["debris_alert_count"] = 0
+    current["debris_clouds"] = [c for c in current.get("debris_clouds", []) or [] if c.get("kind") != "fragments"]
     set_latest_alerts(current)
 
 
@@ -957,6 +991,28 @@ class DebrisSimulateRequest(BaseModel):
     sat_b: int | None = None
     tca_utc: str | None = None
     window_hours: float = 24.0
+    # Demo helper: shift the simulation clock to (collision - IMPACT_LEAD_S) so
+    # the breakup happens on screen within ~2 min of wall time. Default off.
+    advance_to_impact: bool = False
+
+
+IMPACT_LEAD_S = 120.0
+
+
+def _screened_pair_tca(a: int, b: int) -> str | None:
+    """TCA of the latest screening alert for this pair (smallest miss), if any."""
+    best = None
+    pair = {int(a), int(b)}
+    for alert in (get_latest_alerts() or {}).get("alerts", []) or []:
+        if alert.get("source") == "debris":
+            continue
+        ids = {(alert.get("sat1") or {}).get("id"), (alert.get("sat2") or {}).get("id")}
+        if ids != pair or not alert.get("tca_utc"):
+            continue
+        miss = float(alert.get("miss_distance_km", float("inf")) or float("inf"))
+        if best is None or miss < best[0]:
+            best = (miss, alert["tca_utc"])
+    return None if best is None else best[1]
 
 
 def _default_debris_pair() -> tuple[int, int, str | None, str]:
@@ -981,6 +1037,57 @@ def _default_debris_pair() -> tuple[int, int, str | None, str]:
     return best[1], best[2], best[3], "highest_pc_alert"
 
 
+def _spawn_debris_task(coro) -> None:
+    task = asyncio.create_task(coro)
+    _DEBRIS_TASKS.add(task)
+    task.add_done_callback(_DEBRIS_TASKS.discard)
+
+
+async def _rebuild_snapshot_bg() -> None:
+    try:
+        if _propagator is not None:
+            snapshot = await asyncio.to_thread(_build_snapshot, _propagator, sim_clock.simulation_now())
+            set_latest_snapshot(snapshot)
+    except Exception as error:  # pragma: no cover
+        logger.warning("background snapshot rebuild failed: %s", error)
+
+
+async def _debris_screening_bg(event_id: str, generation: int, rebuild_snapshot: bool) -> None:
+    """Fragment-vs-catalogue screening for a new event, then publish its alerts."""
+    import time as _time
+    from app.core.debris_model import debris_model
+    t0 = _time.perf_counter()
+    try:
+        snapshot = get_latest_snapshot() or {}
+        if rebuild_snapshot or not snapshot.get("states"):
+            snapshot = await asyncio.to_thread(_build_snapshot, _propagator, sim_clock.simulation_now())
+            set_latest_snapshot(snapshot)
+        stamp = snapshot.get("timestamp")
+        now = datetime.fromisoformat(stamp) if stamp else sim_clock.simulation_now()
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        debris_alerts = await asyncio.to_thread(
+            debris_model.compute_debris_alerts, snapshot.get("states", []), now,
+        )
+        if generation != _DEBRIS_GENERATION or debris_model.get_cloud(event_id) is None:
+            debris_model.set_screening_status(event_id, "cancelled")
+            return
+        current = dict(get_latest_alerts() or {})
+        kept = [a for a in current.get("alerts", []) or [] if a.get("source") != "debris"]
+        current["alerts"] = kept + debris_alerts
+        current["count"] = len(current["alerts"])
+        current["debris_alert_count"] = len(debris_alerts)
+        set_latest_alerts(current)
+        debris_model.set_screening_status(
+            event_id, "done", debris_alerts=len(debris_alerts),
+            elapsed_s=round(_time.perf_counter() - t0, 3), meta=debris_model.last_screen_meta,
+        )
+    except Exception as error:
+        logger.exception("background debris screening failed")
+        debris_model.set_screening_status(event_id, "error", error=str(error),
+                                          elapsed_s=round(_time.perf_counter() - t0, 3))
+
+
 @router.post("/debris/simulate")
 async def simulate_collision_event(
     req: DebrisSimulateRequest | None = None,
@@ -988,8 +1095,16 @@ async def simulate_collision_event(
 ):
     """Break up a catalogue pair at its predicted TCA (NASA SBM).
 
-    Body (optional): {sat_a, sat_b, tca_utc?}. Default pair: the loaded
-    computed-crossing scenario pair, else the highest-Pc screened alert.
+    Body (optional): {sat_a, sat_b, tca_utc?, window_hours?, advance_to_impact?}.
+    Default pair: the loaded computed-crossing scenario pair, else the
+    highest-Pc screened alert. TCA hint: request tca_utc, else the latest
+    screening alert for the pair, else the scenario's encounter time; the pair
+    TCA is then refined (all local minima, global minimum kept).
+
+    Returns right after the breakup; the fragment-vs-catalogue screening runs
+    in the background (``debris_screening.status == "running"``) and its
+    alerts are published to /api/alerts + WS when done.
+    ``advance_to_impact: true`` shifts the sim clock to collision - 120 s.
     """
     if _propagator is None:
         raise HTTPException(status_code=503, detail="Propagator not initialized")
@@ -1002,6 +1117,14 @@ async def simulate_collision_event(
         sat_a, sat_b, hint, pair_source = int(req.sat_a), int(req.sat_b), req.tca_utc, "request"
     else:
         sat_a, sat_b, hint, pair_source = _default_debris_pair()
+    hint_source = ("request" if pair_source == "request" else "screening_alert") if hint else None
+    if hint is None:
+        hint = _screened_pair_tca(sat_a, sat_b)
+        hint_source = "screening_alert" if hint else None
+    if hint is None and pair_source == "scenario_pair":
+        construction = ((getattr(_sim_engine, "active_scenario", None) or {}).get("construction") or {})
+        hint = construction.get("encounter_utc")
+        hint_source = "scenario_encounter" if hint else None
 
     now = sim_clock.simulation_now()
     try:
@@ -1014,76 +1137,65 @@ async def simulate_collision_event(
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
 
-    # All heavy work off the event loop. One snapshot (states) feeds the
-    # fragment screening; the clouds are re-read from the debris model's cache
-    # so cloud.affected_satellites and the debris alerts come from the same run.
-    snapshot = await asyncio.to_thread(_build_snapshot, _propagator, now)
-    debris_alerts = await asyncio.to_thread(
-        debris_model.compute_debris_alerts, snapshot.get("states", []), now,
-    )
-    snapshot = {**snapshot, "debris_clouds": debris_model.get_frontend_debris_clouds()}
-    try:
-        payload = json.loads(snapshot["payload"])
-        payload["debris_clouds"] = snapshot["debris_clouds"]
-        snapshot["payload"] = json.dumps(payload, separators=(",", ":"))
-    except Exception:
-        pass
-    set_latest_snapshot(snapshot)
-    # Publish the debris alerts now instead of waiting for the next 30 s refresh.
-    current = dict(get_latest_alerts() or {})
-    kept = [a for a in current.get("alerts", []) or [] if a.get("source") != "debris"]
-    current["alerts"] = kept + debris_alerts
-    current["count"] = len(current["alerts"])
-    current["debris_alert_count"] = len(debris_alerts)
-    set_latest_alerts(current)
+    collision = datetime.fromisoformat(event["collision_utc"])
+    clock = {"advanced": False, "offset_hours": sim_clock.get_offset_hours()}
+    if req.advance_to_impact:
+        lead = (collision - sim_clock.simulation_now()).total_seconds()
+        if lead > IMPACT_LEAD_S:
+            try:
+                sim_clock.set_offset_hours(sim_clock.get_offset_hours() + (lead - IMPACT_LEAD_S) / 3600.0)
+                clock = {"advanced": True, "offset_hours": sim_clock.get_offset_hours(),
+                         "jumped_s": round(lead - IMPACT_LEAD_S, 3)}
+            except ValueError as error:
+                clock["error"] = str(error)
+        else:
+            clock["note"] = "collision already within the lead time; clock unchanged"
+    clock["simulation_time"] = sim_clock.simulation_now().isoformat()
+    clock["seconds_to_impact"] = round((collision - sim_clock.simulation_now()).total_seconds(), 3)
+
+    screening = debris_model.set_screening_status(
+        event["event_id"], "running", started_sim_utc=clock["simulation_time"])
+    _spawn_debris_task(_debris_screening_bg(event["event_id"], _DEBRIS_GENERATION, clock["advanced"]))
 
     return {
         "status": "SUCCESS",
         "pair_source": pair_source,
+        "tca_hint_utc": hint,
+        "tca_hint_source": hint_source,
         "event": event,
         "fragments_generated": event["simulated_fragments"],
         "total_fragments": event["total_fragments"],
-        "debris_alerts": len(debris_alerts),
-        "debris_screening": debris_model.last_screen_meta,
+        "debris_alerts": None,          # published when the background screening finishes
+        "debris_screening": {"event_id": event["event_id"], **screening},
+        "sim_clock": clock,
     }
 
 
 @router.delete("/debris/active")
 async def clear_debris(session_id: str = Depends(resolve_session_id)):
-    """Clear all active debris clouds."""
-    if _propagator is None:
-        raise HTTPException(status_code=503, detail="Propagator not initialized")
-
+    """Clear all debris events, their alerts and any running fragment screening."""
     _require_valid_session(session_id)
 
     from app.core.debris_model import debris_model
     debris_model.clear()
     _drop_debris_alerts()
-    
-    snapshot = await asyncio.to_thread(_build_snapshot, _propagator, sim_clock.simulation_now())
-    set_latest_snapshot(snapshot)
-    
+    _spawn_debris_task(_rebuild_snapshot_bg())
     return {"status": "CLEARED"}
 
 
 @router.post("/simulation/reset")
 async def reset_simulation(session_id: str = Depends(resolve_session_id)):
-    """Reset the simulation and clear debris."""
-    if _propagator is None:
-        raise HTTPException(status_code=503, detail="Propagator not initialized")
-
+    """Reset: scenario objects, debris events/alerts and the sim-clock offset."""
     _require_valid_session(session_id)
 
-    if _sim_engine:
-        _sim_engine.clear_scenario()
+    removed = _clear_scenario_state()
     from app.core.debris_model import debris_model
     debris_model.clear()
     _drop_debris_alerts()
-    
-    snapshot = await asyncio.to_thread(_build_snapshot, _propagator, sim_clock.simulation_now())
-    set_latest_snapshot(snapshot)
-    
-    return {"status": "RESET"}
+    sim_clock.reset()
+    _spawn_debris_task(_rebuild_snapshot_bg())
+    return {"status": "RESET", "removed_object_ids": removed, "offset_hours": sim_clock.get_offset_hours(),
+            "simulation_time": sim_clock.simulation_now().isoformat()}
 
 
 @router.get("/scenarios")

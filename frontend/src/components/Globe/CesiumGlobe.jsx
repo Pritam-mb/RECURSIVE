@@ -43,7 +43,7 @@ const COLORS = {
   void: css(PALETTE.void),
   satNominal: css(PALETTE.text, 0.5),
   // Impact replay: live dots sit at sim-now, not at the playhead — recede them.
-  satReplay: css(PALETTE.text, 0.18),
+  satReplay: css(PALETTE.text, 0.14),
   satHover: css(PALETTE.bright, 1),
   satSelected: css(PALETTE.accent, 1),
   satSelectedA: css(PALETTE.accent, 1),
@@ -68,6 +68,7 @@ const LABEL_FONT = "500 11px 'IBM Plex Mono', ui-monospace, monospace";
 const SMALL_LABEL_FONT = "500 10px 'IBM Plex Mono', ui-monospace, monospace";
 
 const SATELLITE_DEFAULT_SCALE = 0.26;
+const SATELLITE_REPLAY_SCALE = 0.16;
 const SATELLITE_HOVER_SCALE = 0.34;
 const SATELLITE_SELECTED_SCALE = 0.42;
 const SATELLITE_SCALE_BY_DISTANCE = new Cesium.NearFarScalar(1.0e6, 1.4, 3.0e7, 0.2);
@@ -650,6 +651,8 @@ const CesiumGlobe = ({ mode = 'live', alerts = EMPTY, onSatelliteSelect }) => {
       if (isA) bb.color = COLORS.satSelectedA;
       else if (isB) bb.color = COLORS.satSelectedB;
       else if (isSelected) bb.color = COLORS.satSelected;
+      // Replay: live threat colours describe sim-now, not the playhead.
+      else if (impactActive && !isHovered) bb.color = COLORS.satReplay;
       else if (threat === THREAT_WARNING) bb.color = COLORS.satWarning;
       else if (threat === THREAT_CAUTION) bb.color = COLORS.satCaution;
       else if (isHovered) bb.color = COLORS.satHover;
@@ -657,7 +660,7 @@ const CesiumGlobe = ({ mode = 'live', alerts = EMPTY, onSatelliteSelect }) => {
 
       bb.scale = (isA || isB || isSelected)
         ? SATELLITE_SELECTED_SCALE
-        : (isHovered ? SATELLITE_HOVER_SCALE : SATELLITE_DEFAULT_SCALE);
+        : (isHovered ? SATELLITE_HOVER_SCALE : (impactActive ? SATELLITE_REPLAY_SCALE : SATELLITE_DEFAULT_SCALE));
     }
 
     const hoverItem = hoveredSatelliteId != null ? map.get(hoveredSatelliteId) : null;

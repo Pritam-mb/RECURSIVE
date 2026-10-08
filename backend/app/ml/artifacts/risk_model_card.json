@@ -1,0 +1,181 @@
+{
+  "model": "xgboost-pc-surrogate v1",
+  "task": "Pc surrogate (log10 Foster Pc regression)",
+  "purpose": "Fast surrogate of the physics Foster Pc for triage and cross-check. Never overwrites the physics Pc on an alert.",
+  "label_source": "Foster Pc on simulated encounters (numerical integration of the combined TLE-age covariance over the hard-body disk)",
+  "features": [
+    "miss_distance_km",
+    "radial_miss_km",
+    "relative_speed_kms",
+    "tle_age_max_h",
+    "tle_age_min_h",
+    "hbr_km",
+    "altitude_km"
+  ],
+  "features_not_seen_by_model": [
+    "combined covariance",
+    "B-plane projected sigmas",
+    "B-plane miss direction (only |radial| component)"
+  ],
+  "training_samples": 42000,
+  "validation_samples": 6000,
+  "heldout_samples": 12000,
+  "total_generated": 60000,
+  "positive_fraction_pc_ge_1e-4": 0.417,
+  "positive_fraction_pc_ge_1e-6": 0.6334,
+  "boosting_rounds": 62,
+  "heldout": {
+    "regression": {
+      "mae_log10_pc": 0.1617,
+      "rmse_log10_pc": 0.4512,
+      "mae_log10_pc_where_pc_ge_1e-8": 0.1541,
+      "samples_pc_ge_1e-8": 8036,
+      "samples": 12000
+    },
+    "classification_at_1e-4": {
+      "threshold_pc": 0.0001,
+      "positives": 5056,
+      "tp": 4894,
+      "fp": 94,
+      "fn": 162,
+      "tn": 6850,
+      "precision": 0.9812,
+      "recall": 0.968,
+      "f1": 0.9745
+    },
+    "classification_at_1e-6": {
+      "threshold_pc": 1e-06,
+      "positives": 7606,
+      "tp": 7509,
+      "fp": 64,
+      "fn": 97,
+      "tn": 4330,
+      "precision": 0.9915,
+      "recall": 0.9872,
+      "f1": 0.9894
+    }
+  },
+  "heldout_masked_features": {
+    "regression": {
+      "mae_log10_pc": 0.351,
+      "rmse_log10_pc": 0.9094,
+      "mae_log10_pc_where_pc_ge_1e-8": 0.3229,
+      "samples_pc_ge_1e-8": 8036,
+      "samples": 12000
+    },
+    "classification_at_1e-4": {
+      "threshold_pc": 0.0001,
+      "positives": 5056,
+      "tp": 4752,
+      "fp": 161,
+      "fn": 304,
+      "tn": 6783,
+      "precision": 0.9672,
+      "recall": 0.9399,
+      "f1": 0.9534
+    }
+  },
+  "heldout_without_radial_miss": {
+    "regression": {
+      "mae_log10_pc": 0.7184,
+      "rmse_log10_pc": 1.4952,
+      "mae_log10_pc_where_pc_ge_1e-8": 0.6056,
+      "samples_pc_ge_1e-8": 8036,
+      "samples": 12000
+    },
+    "classification_at_1e-4": {
+      "threshold_pc": 0.0001,
+      "positives": 5056,
+      "tp": 4565,
+      "fp": 181,
+      "fn": 491,
+      "tn": 6763,
+      "precision": 0.9619,
+      "recall": 0.9029,
+      "f1": 0.9314
+    }
+  },
+  "baselines": {
+    "miss_distance_only_xgboost": {
+      "regression": {
+        "mae_log10_pc": 1.0618,
+        "rmse_log10_pc": 1.6245,
+        "mae_log10_pc_where_pc_ge_1e-8": 1.091,
+        "samples_pc_ge_1e-8": 8036,
+        "samples": 12000
+      },
+      "classification_at_1e-4": {
+        "threshold_pc": 0.0001,
+        "positives": 5056,
+        "tp": 4499,
+        "fp": 1659,
+        "fn": 557,
+        "tn": 5285,
+        "precision": 0.7306,
+        "recall": 0.8898,
+        "f1": 0.8024
+      }
+    },
+    "constant_mean": {
+      "regression": {
+        "mae_log10_pc": 3.5776,
+        "rmse_log10_pc": 3.9134,
+        "mae_log10_pc_where_pc_ge_1e-8": 2.694,
+        "samples_pc_ge_1e-8": 8036,
+        "samples": 12000
+      }
+    }
+  },
+  "feature_importance_gain": {
+    "miss_distance_km": 0.7947,
+    "radial_miss_km": 0.1412,
+    "relative_speed_kms": 0.0082,
+    "tle_age_max_h": 0.0093,
+    "tle_age_min_h": 0.0073,
+    "hbr_km": 0.0339,
+    "altitude_km": 0.0053
+  },
+  "reference_check": {
+    "reference": "app.core.analytics",
+    "checked": 12,
+    "max_abs_covariance_diff_km2": 0.0,
+    "max_abs_log10_pc_diff_vs_dblquad": 2.5315471905429376e-06
+  },
+  "recipe": {
+    "generator": "app.ml.train_risk_surrogate.generate_encounters",
+    "seed": 20261008,
+    "split": "70% train / 10% validation (early stopping) / 20% held-out test",
+    "altitude_km": "U(300, 2000)",
+    "crossing_angle_deg": "85% U(10,175), 15% U(0.5,10)",
+    "flight_path_angle_deg": "U(-1.5, 1.5)",
+    "miss_distance_km": "60% loguniform(0.003, 25), 40% loguniform(0.003, 3)",
+    "tle_age_h": "loguniform(0.5, 336) per object",
+    "hbr_km": "loguniform(0.003, 0.050)",
+    "covariance": "RTN sigma_r=sigma_n=0.05 km, sigma_t=1.0*(1+age_h/24) km per object",
+    "foster_quadrature": "polar: 20-node Gauss-Legendre radius x 64-node trapezoid angle",
+    "target": "log10(max(Pc, 1e-12))",
+    "missing_feature_masking": "radial 30%, altitude 30%, both TLE ages 15%"
+  },
+  "trajectory_model": {
+    "name": "Trajectory Predictor",
+    "architecture": "numpy tanh RNN (12 hidden units, 8-step history)",
+    "label_source": "synthetic circular arcs (app.ml.synthetic_data.generate_trajectory_dataset)",
+    "eval_samples": 512,
+    "eval_seed": 27,
+    "mae_km": {
+      "model": 459.164,
+      "persistence": 347.001,
+      "linear_extrapolation": 20.513
+    },
+    "beats_baselines": false,
+    "status": "experimental",
+    "note": "Underperforms the linear-extrapolation baseline; not used for any alert, Pc or manoeuvre. SGP4 is the propagator of record.",
+    "torch_lstm": "optional (ENABLE_EXTENDED_PIPELINE=1); not loaded by predict()"
+  },
+  "trained_at_utc": "2026-10-08T07:22:04.586424+00:00",
+  "train_seconds": 7.45,
+  "generation_seconds": 3.91,
+  "xgboost_version": "3.4.1",
+  "python": "3.14.3",
+  "artifact": "risk_model_xgb.json"
+}

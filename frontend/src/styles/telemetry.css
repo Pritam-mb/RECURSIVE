@@ -225,3 +225,14 @@
 .tm-card-empty {
   padding: var(--s-3);
 }
+
+/* "SIM" provenance tag: value comes from a documented model, not a downlink. */
+.tm-sim-tag {
+  margin-left: 4px;
+  padding: 0 3px;
+  border: 1px solid var(--c-line-strong);
+  border-radius: var(--radius);
+  font-size: 9px;
+  color: var(--c-caution);
+  letter-spacing: 0.08em;
+}

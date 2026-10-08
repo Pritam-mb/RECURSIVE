@@ -1004,10 +1004,11 @@ def fig_cloud(res, snaps, event):
             a.scatter(x, y, s=1.8, color=col, lw=0, zorder=3)
             a.scatter([r0 @ e1], [r0 @ e2], marker="x", color=BAD, s=20, lw=1.1, zorder=4)
             a.set_aspect("equal"); a.set_xlim(-8800, 8800); a.set_ylim(-8800, 8800)
-            a.tick_params(labelsize=5.2)
+            a.tick_params(labelsize=6)
             oop = np.percentile(np.abs(z), 90) if len(z) else 0.0
-            a.set_title(f"+{t} min · {int(m.sum())} frag. · 90% within {oop:.0f} km of plane",
-                        fontsize=6.4, loc="center")
+            a.set_title(f"+{t} min: {int(m.sum())} fragments" + chr(10) + f"90 % within {oop:.0f} km of plane",
+                        fontsize=7, loc="center", linespacing=1.1)
+            a.set_xticks([-8000, -4000, 0, 4000, 8000]); a.set_yticks([-8000, -4000, 0, 4000, 8000])
             if c == 0:
                 a.set_ylabel(f"{event['parents'][k]['name'][:24]}\nalong-track axis [km]", fontsize=6.6)
             if k == 1:

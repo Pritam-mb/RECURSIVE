@@ -541,27 +541,36 @@ export default class ImpactScene {
     return busy;
   }
 
-  /** Camera: frame the collision point from a raking angle with the limb behind. */
+  /**
+   * Camera: frame the collision point from a raking angle with the limb
+   * behind. Target = event collision_point_eci_km rotated at the collision
+   * instant (same transform as the T0 frame); fallback = the parents' mean
+   * position at T0. Every value is validated — an invalid target is a no-op.
+   */
   flyTo(camera, target) {
+    const valid = (v) => Array.isArray(v) && v.length >= 3 && v.slice(0, 3).every(Number.isFinite)
+      && Math.hypot(v[0], v[1], v[2]) > RE_KM && Math.hypot(v[0], v[1], v[2]) < 100000;
     const m = this.model;
-    let eci = this.cpEci;
-    let ms = m ? m.collisionMs + ((this.lastT ?? 0) * 1000) : Number.NaN;
-    if (!eci && target?.eci) {
-      eci = target.eci;
-      ms = Date.parse(target.utc || '');
-    }
-    if (!eci) return;
-    const g = computeGmst(new Date(Number.isFinite(ms) ? ms : Date.now()));
+    const eciT = Array.isArray(target?.eci) ? target.eci.slice(0, 3).map(Number) : null;
+    let eci = null;
+    let ms = Date.parse(target?.utc || '');
+    if (valid(eciT) && Number.isFinite(ms)) eci = eciT;
+    else if (valid(this.cpEci) && m) { eci = this.cpEci; ms = m.collisionMs; }
+    if (!eci) return false;
+    const g = computeGmst(new Date(ms));
     const cos = Math.cos(g); const sin = Math.sin(g);
     const center = new Cesium.Cartesian3(
       ((eci[0] * cos) + (eci[1] * sin)) * 1000,
       ((-eci[0] * sin) + (eci[1] * cos)) * 1000,
       eci[2] * 1000,
     );
+    if (![center.x, center.y, center.z].every(Number.isFinite)) return false;
+    camera.cancelFlight();
     camera.flyToBoundingSphere(new Cesium.BoundingSphere(center, 800e3), {
       offset: new Cesium.HeadingPitchRange(Cesium.Math.toRadians(35), Cesium.Math.toRadians(-28), 6.5e6),
       duration: 2.2,
     });
+    return true;
   }
 
   destroy() {

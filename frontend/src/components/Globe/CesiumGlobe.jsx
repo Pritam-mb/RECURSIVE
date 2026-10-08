@@ -222,6 +222,8 @@ const CesiumGlobe = ({ mode = 'live', alerts = EMPTY, onSatelliteSelect }) => {
         infoBox: false,
         selectionIndicator: false,
         creditContainer: document.createElement('div'),
+        // Render errors are logged + recovered below, never shown as Cesium's panel.
+        showRenderLoopErrors: false,
         skyBox: false,
         skyAtmosphere: false,
         shadows: false,
@@ -250,6 +252,25 @@ const CesiumGlobe = ({ mode = 'live', alerts = EMPTY, onSatelliteSelect }) => {
       viewer.resolutionScale = Math.min(1, 1.25 / (window.devicePixelRatio || 1));
 
       const { scene } = viewer;
+      scene.rethrowRenderErrors = false;
+      // A render error stops Cesium's loop (black globe). Log it, drop the
+      // impact replay layers (the only per-frame-mutated geometry) and resume,
+      // at most a few times per minute so a persistent fault can't spin.
+      let recoveries = [];
+      scene.renderError.addEventListener((_scene, err) => {
+        console.error('[CesiumGlobe] render error', err);
+        const now = performance.now();
+        recoveries = recoveries.filter((t) => now - t < 60000);
+        if (recoveries.length >= 3) return;
+        recoveries.push(now);
+        try { impactRef.current?.setReplay(null); } catch { /* ignore */ }
+        setTimeout(() => {
+          if (viewer && !viewer.isDestroyed()) {
+            viewer.useDefaultRenderLoop = true;
+            viewer.scene.requestRender();
+          }
+        }, 250);
+      });
       scene.backgroundColor = COLORS.void;
       if (scene.postProcessStages?.fxaa) scene.postProcessStages.fxaa.enabled = false;
       if (scene.sun) scene.sun.show = false;
@@ -299,7 +320,12 @@ const CesiumGlobe = ({ mode = 'live', alerts = EMPTY, onSatelliteSelect }) => {
       // Debris impact replay layers (own collections; idle until a replay loads).
       impactRef.current = new ImpactScene(scene);
       removeFlyTo = onFlyTo((target) => {
-        if (viewer && !viewer.isDestroyed()) impactRef.current?.flyTo(viewer.camera, target);
+        if (!viewer || viewer.isDestroyed()) return;
+        try {
+          impactRef.current?.flyTo(viewer.camera, target);
+        } catch (err) {
+          console.error('[CesiumGlobe] fly to impact', err);
+        }
       });
 
       prims.focusLabel = prims.labels.add({

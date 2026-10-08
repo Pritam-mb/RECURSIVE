@@ -12,6 +12,7 @@ import SimulationDrawer from './components/SimulationDrawer';
 import MetricsDrawer from './components/MetricsDrawer';
 import ImpactConsole from './components/Impact/ImpactConsole';
 import LayersPanel from './components/Impact/LayersPanel';
+import ErrorBoundary from './components/ErrorBoundary';
 import useStore from './store/useStore';
 import useSelectedOrbit from './hooks/useSelectedOrbit';
 import { buildCascadeGraph } from './utils/cascadeGraph';
@@ -205,23 +206,33 @@ function App() {
       <div className="sh-main">
         <section className="sh-globe" aria-label="Live catalog globe">
           <div className="sh-globe-viewport">
-            <Suspense fallback={<GlobeLoader />}>
-              <CesiumGlobe
-                mode="live"
-                satellites={satellites}
-                alerts={alerts}
-                selectedSatId={selectedSatelliteId}
-                onSatelliteSelect={setSelectedSatelliteId}
-                agencyFilter={agencyFilter}
-              />
-            </Suspense>
+            <ErrorBoundary name="Live globe">
+              <Suspense fallback={<GlobeLoader />}>
+                <CesiumGlobe
+                  mode="live"
+                  satellites={satellites}
+                  alerts={alerts}
+                  selectedSatId={selectedSatelliteId}
+                  onSatelliteSelect={setSelectedSatelliteId}
+                  agencyFilter={agencyFilter}
+                />
+              </Suspense>
+            </ErrorBoundary>
           </div>
           <span className="sh-globe-label">
             <span className="ui-label">Live Catalog</span>
             <span className="sh-globe-label-meta">{satellites.length} OBJ</span>
           </span>
-          <LayersPanel />
-          <ImpactConsole />
+          <ErrorBoundary name="Layers" overlay>
+            <LayersPanel />
+          </ErrorBoundary>
+          <ErrorBoundary
+            name="Impact replay"
+            overlay
+            onReset={() => useStore.getState().setImpact({ replay: null, playing: false })}
+          >
+            <ImpactConsole />
+          </ErrorBoundary>
         </section>
 
         <div className="sh-cell sh-cell--fixed">
@@ -230,11 +241,13 @@ function App() {
 
         <section className="sh-globe" aria-label="Threat analysis globe">
           <div className="sh-globe-viewport">
-            <ThreatGlobe
-              alerts={alerts}
-              satellites={satellites}
-              selectedSatId={selectedSatelliteId}
-            />
+            <ErrorBoundary name="Threat globe">
+              <ThreatGlobe
+                alerts={alerts}
+                satellites={satellites}
+                selectedSatId={selectedSatelliteId}
+              />
+            </ErrorBoundary>
           </div>
           <span className="sh-globe-label">
             <span className="ui-label">Threat Analysis</span>

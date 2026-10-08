@@ -549,14 +549,12 @@ class XGBoostScorer:
         if _extended_pipeline_enabled():
             _ensure_trained_model()
 
-        if _using_trained and _trained_model is not None and xgb is not None:
+        # Only dict events can be mapped onto the trained model's named
+        # features; positional vectors use the legacy feature layout.
+        if isinstance(features, dict) and _using_trained and _trained_model is not None and xgb is not None:
             try:
-                if isinstance(features, dict):
-                    feature_array = self.extract_trained_features(features).reshape(1, -1)
-                else:
-                    feature_array = np.asarray(features, dtype=float).reshape(1, -1)
-
-                dmatrix = xgb.DMatrix(feature_array, feature_names=None)
+                feature_array = self.extract_trained_features(features).reshape(1, -1)
+                dmatrix = xgb.DMatrix(feature_array, feature_names=self.TRAINED_FEATURE_KEYS)
                 score_val = float(_trained_model.predict(dmatrix)[0])
                 return float(np.clip(score_val, 0.0, 1.0))
             except Exception as trained_err:

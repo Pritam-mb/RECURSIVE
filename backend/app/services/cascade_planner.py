@@ -1,902 +1,771 @@
 """
-Constellation cascade planner.
+Cascade planner: alert graph, BFS cascade depth, physics node probabilities,
+re-propagated avoidance manoeuvres and alert-derived hotspots.
 
-Builds a proximity graph with KD-tree pruning, scores each conjunction with a
-deterministic CPI heuristic, and produces a cascade maneuver plan that can be
-shown on the dashboard.
+Everything published here is derived from the alerts it is given (agent A's
+screening alerts with Foster Pc, agent B's debris alerts with parent_event)
+plus orbital re-propagation. There is no proximity heuristic, no ML score in
+the published depth / probability / manoeuvre, and no fixed constants
+presented as results.
+
+Graph
+-----
+* Object nodes: every object that appears in an alert.
+* Event nodes ("event:<id>"): every distinct ``parent_event`` (a simulated
+  collision). Edges: event -> each parent object (the colliding pair) and
+  event -> each fragment that appears in a debris alert.
+* Alert edges: sat1 <-> sat2, weighted by the alert's Pc.
+
+Cascade depth (BFS hop count, nothing else)
+-------------------------------------------
+Roots are the collision events. BFS over the graph gives every object its hop
+distance from the nearest event: fragments 1, satellites threatened by those
+fragments 2, objects in screened conjunctions with those satellites 3, ...
+An alert's ``cascade_depth`` is the hop count of its farther endpoint, i.e.
+the number of links from the root event to the threatened object. An alert in
+a component with no collision event is itself the primary (potential) event:
+its depth is 1. ``downstream_ids`` are objects reachable from the alert's
+deeper endpoint(s) moving away from the root (for a primary alert: objects
+that have their own screened conjunctions with either party).
+``upstream_event`` is the root event id, or None for a primary alert.
+
+Node probability
+----------------
+P(object is hit by at least one threat) = 1 - prod_i (1 - Pc_i) over all
+alerts incident to the object, assuming independent encounters.
+
+Manoeuvres: see app/services/maneuver_planner.py (re-propagation search).
+
+The GAT / GNN rankers trained on synthetic graphs are run, when available, as
+an ADVISORY cross-check only (``ranker_review``); their outputs never feed
+the depth, probabilities or the plan.
 """
 
 from __future__ import annotations
 
-from collections import deque
-from dataclasses import dataclass
 import logging
-from datetime import datetime, timezone
 import math
+import time
+from collections import deque
+from datetime import datetime, timezone
 from typing import Any
 
 import numpy as np
-from scipy.spatial import cKDTree
-from scipy.optimize import minimize
 
-from app.core.conjunction import classify_severity, find_tca
-from app.core.sgp4_propagator import SatelliteState, rsw_to_eci
-from app.ml.gat_cascade import CascadeGAT
-from app.ml.gnn_cascade import CascadeGNN
-from app.ml.xgboost_scorer import XGBoostScorer
 from app.core.agency import AGENCY_ALIASES as agency_aliases, infer_agency as agency_inference
 
 logger = logging.getLogger(__name__)
 
-R_EARTH_KM = 6371.0
-DEFAULT_INFLUENCE_RADIUS_KM = 200.0
-DEFAULT_CPI_THRESHOLD = 5.0
-# Probability gap above which the GAT and the GNN cross-check are considered to
-# disagree about a satellite. Tuned to sit above ordinary disagreement on the
-# synthetic graphs while still catching a ranker that is structurally wrong
-# rather than merely noisy.
-RANKER_DISAGREEMENT_THRESHOLD = 0.25
-
-
 AGENCY_ALIASES = agency_aliases
 infer_agency = agency_inference
 
+DEFAULT_CPI_THRESHOLD = 5.0          # kept for API compatibility (debris builder reads it)
+MANEUVER_PC_THRESHOLD = 1e-6         # alerts at/above this Pc get a recommended manoeuvre
+MAX_MANEUVER_ALERTS = 15             # cap re-propagation work per refresh (top-Pc alerts)
+MANEUVER_TIME_BUDGET_S = 3.0
+MAX_DOWNSTREAM_IDS = 50
+MAX_HOTSPOTS = 20
+RANKER_DISAGREEMENT_THRESHOLD = 0.25
 
-@dataclass
-class CascadeNode:
-    norad_id: int
-    name: str
-    position: np.ndarray
-    velocity: np.ndarray
-    speed_kmh: float
-    altitude_km: float
-    agency: str
+_EMPTY_RANKER_REVIEW = {
+    "role": "advisory",
+    "primary": "gat",
+    "cross_check": "gnn",
+    "primary_ok": False,
+    "cross_check_ok": False,
+    "fallback_used": False,
+    "degraded": False,
+    "disagreement_threshold": RANKER_DISAGREEMENT_THRESHOLD,
+    "disagreement_count": 0,
+    "max_disagreement": 0.0,
+    "disputed_satellites": [],
+    "spearman_vs_physics": None,
+    "note": "Synthetic-trained graph rankers; advisory only, never used for depth, probability or plan.",
+}
 
 
-def _norm(vec: np.ndarray) -> float:
-    return float(np.linalg.norm(vec))
+def _pc(alert: dict) -> float:
+    for key in ("p_collision", "probability_of_collision"):
+        value = alert.get(key)
+        if value is not None:
+            try:
+                return max(0.0, min(1.0, float(value)))
+            except (TypeError, ValueError):
+                pass
+    return 0.0
 
 
-def _parse_datetime(value: str | None) -> datetime | None:
-    if not value:
+def _parse_time(value) -> datetime | None:
+    if value is None:
         return None
-
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
     try:
-        parsed = datetime.fromisoformat(value)
+        parsed = datetime.fromisoformat(str(value))
     except ValueError:
         return None
-
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-
-    return parsed
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
-def _estimate_linear_tca_minutes(
-    pos_a: np.ndarray,
-    vel_a: np.ndarray,
-    pos_b: np.ndarray,
-    vel_b: np.ndarray,
-) -> tuple[float, float]:
-    relative_position = pos_a - pos_b
-    relative_velocity = vel_a - vel_b
-    relative_speed_sq = float(np.dot(relative_velocity, relative_velocity))
-
-    if relative_speed_sq <= 1e-12:
-        return 0.0, _norm(relative_position)
-
-    t_seconds = -float(np.dot(relative_position, relative_velocity)) / relative_speed_sq
-    if t_seconds < 0.0:
-        t_seconds = 0.0
-
-    closest_position = relative_position + (relative_velocity * t_seconds)
-    return t_seconds / 60.0, _norm(closest_position)
+def _get(obj, key, default=None):
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
 
 
-def _midpoint_position(pos_a: np.ndarray, pos_b: np.ndarray) -> np.ndarray:
-    return (pos_a + pos_b) / 2.0
-
-
-def _build_node(state: SatelliteState) -> CascadeNode:
-    speed_kmh = float(np.linalg.norm([state.vx, state.vy, state.vz]) * 3600.0)
-    altitude_km = float(np.linalg.norm([state.x, state.y, state.z]) - R_EARTH_KM)
-    return CascadeNode(
-        norad_id=state.norad_id,
-        name=state.name,
-        position=np.array([state.x, state.y, state.z], dtype=float),
-        velocity=np.array([state.vx, state.vy, state.vz], dtype=float),
-        speed_kmh=speed_kmh,
-        altitude_km=altitude_km,
-        agency=infer_agency(state.name),
-    )
+def _node_key(value) -> Any:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return value
 
 
 class CascadePlanner:
-    """KD-tree based proximity graph planner with cascade scoring."""
+    """Alert-graph cascade analysis with re-propagated manoeuvre planning."""
 
     def __init__(self) -> None:
-        self.risk_model = XGBoostScorer()
-        # The primary ranker was historically stored on an attribute called
-        # `self.gnn` while actually holding a CascadeGAT, which hid the fact
-        # that CascadeGNN was never in the request path. It is now named for
-        # what it is, and the GNN is kept as a deliberate cross-check.
-        self.primary_ranker = CascadeGAT()
-        # Second, structurally different ranker. It does not contribute to the
-        # manoeuvre plan; it exists so a broken or degenerate primary ranker is
-        # detectable instead of silently degrading every probability to zero.
-        self.cross_check_ranker = CascadeGNN()
+        self._primary_ranker = None
+        self._cross_check_ranker = None
+        self._rankers_loaded = False
 
-    def build_graph(
-        self,
-        states: list[SatelliteState],
-        influence_radius_km: float = DEFAULT_INFLUENCE_RADIUS_KM,
-        propagator: Any | None = None,
-        reference_time: datetime | None = None,
-        refine_limit: int = 30,
-    ) -> dict[str, Any]:
-        nodes = [_build_node(state) for state in states if state.error_code == 0]
-        if not nodes:
-            return {
-                "nodes": [],
-                "edges": [],
-                "hotspots": [],
-                "adjacency": {},
-                # analyze_snapshot() reads this key before its own `if not nodes`
-                # guard, so the empty graph must supply it too.
-                "node_index": {},
-                "summary": {
-                    "node_count": 0,
-                    "edge_count": 0,
-                    "influence_radius_km": influence_radius_km,
-                },
-            }
+    # ── Advisory ML rankers (lazy, optional) ────────────────────────────────
+    def _load_rankers(self) -> None:
+        if self._rankers_loaded:
+            return
+        self._rankers_loaded = True
+        try:
+            from app.ml.gat_cascade import CascadeGAT
 
-        positions = np.array([node.position for node in nodes], dtype=float)
-        velocities = np.array([node.velocity for node in nodes], dtype=float)
-        tree = cKDTree(positions)
-        candidate_pairs = sorted(tree.query_pairs(r=influence_radius_km))
+            self._primary_ranker = CascadeGAT()
+        except Exception as error:  # pragma: no cover - optional
+            logger.info("Advisory GAT ranker unavailable: %s", error)
+        try:
+            from app.ml.gnn_cascade import CascadeGNN
 
-        edges: list[dict[str, Any]] = []
-        adjacency: dict[int, list[dict[str, Any]]] = {node.norad_id: [] for node in nodes}
-        node_index = {node.norad_id: idx for idx, node in enumerate(nodes)}
-        node_lookup = {node.norad_id: node for node in nodes}
+            self._cross_check_ranker = CascadeGNN()
+        except Exception as error:  # pragma: no cover - optional
+            logger.info("Advisory GNN ranker unavailable: %s", error)
 
-        for idx_a, idx_b in candidate_pairs:
-            node_a = nodes[idx_a]
-            node_b = nodes[idx_b]
-            miss_distance_km = _norm(node_a.position - node_b.position)
-            relative_velocity_kms = _norm(node_a.velocity - node_b.velocity)
-            tca_minutes, predicted_miss_km = _estimate_linear_tca_minutes(
-                node_a.position,
-                node_a.velocity,
-                node_b.position,
-                node_b.velocity,
-            )
+    @property
+    def primary_ranker(self):
+        self._load_rankers()
+        return self._primary_ranker
 
-            tca_utc = None
-            hotspot_position = _midpoint_position(node_a.position, node_b.position)
+    @property
+    def cross_check_ranker(self):
+        self._load_rankers()
+        return self._cross_check_ranker
 
-            if propagator is not None:
-                start_time = reference_time or datetime.now(timezone.utc)
-                tca_event = find_tca(
-                    propagator,
-                    node_a.norad_id,
-                    node_b.norad_id,
-                    start=start_time,
-                    hours_ahead=24.0,
-                    steps=120,
-                )
-
-                if tca_event is not None:
-                    exact_tca = _parse_datetime(tca_event.tca_utc)
-                    if exact_tca is not None:
-                        state_a = propagator.propagate_one(node_a.norad_id, exact_tca)
-                        state_b = propagator.propagate_one(node_b.norad_id, exact_tca)
-                        if state_a is not None and state_b is not None and state_a.error_code == 0 and state_b.error_code == 0:
-                            pos_a = np.array([state_a.x, state_a.y, state_a.z], dtype=float)
-                            pos_b = np.array([state_b.x, state_b.y, state_b.z], dtype=float)
-                            vel_a = np.array([state_a.vx, state_a.vy, state_a.vz], dtype=float)
-                            vel_b = np.array([state_b.vx, state_b.vy, state_b.vz], dtype=float)
-
-                            miss_distance_km = _norm(pos_a - pos_b)
-                            relative_velocity_kms = _norm(vel_a - vel_b)
-                            tca_minutes = max(0.0, (exact_tca - start_time).total_seconds() / 60.0)
-                            predicted_miss_km = miss_distance_km
-                            tca_utc = exact_tca.isoformat()
-                            hotspot_position = _midpoint_position(pos_a, pos_b)
-
-            risk_features = {
-                "miss_distance_km": predicted_miss_km,
-                "relative_speed_kmh": relative_velocity_kms * 3600.0,
-                "sat1_altitude_km": node_a.altitude_km,
-                "sat2_altitude_km": node_b.altitude_km,
-                "tca_minutes": tca_minutes,
-            }
-            p_collision = self.risk_model.score(risk_features)
-            cpi_score = self._compute_cpi(predicted_miss_km, relative_velocity_kms, tca_minutes, p_collision)
-            severity = classify_severity(predicted_miss_km)
-            influence_weight = 1.0 / max(predicted_miss_km, 1.0)
-            hotspot_score = self._compute_hotspot_score(cpi_score, p_collision, predicted_miss_km, tca_minutes)
-
-            edge_ab = {
-                "source_id": node_a.norad_id,
-                "target_id": node_b.norad_id,
-                "source_name": node_a.name,
-                "target_name": node_b.name,
-                "source_index": idx_a,
-                "target_index": idx_b,
-                "miss_distance_km": round(float(miss_distance_km), 3),
-                "predicted_miss_distance_km": round(float(predicted_miss_km), 3),
-                "relative_velocity_kmh": round(float(relative_velocity_kms * 3600.0), 2),
-                "tca_minutes": round(float(tca_minutes), 2),
-                "tca_utc": tca_utc,
-                "p_collision": round(float(p_collision), 4),
-                "cpi_score": round(float(cpi_score), 2),
-                "hotspot_score": round(float(hotspot_score), 3),
-                "severity": severity,
-                "influence_weight": round(float(influence_weight), 6),
-                "hotspot_position": {
-                    "x": round(float(hotspot_position[0]), 3),
-                    "y": round(float(hotspot_position[1]), 3),
-                    "z": round(float(hotspot_position[2]), 3),
-                },
-            }
-            edge_ba = {**edge_ab, "source_id": node_b.norad_id, "target_id": node_a.norad_id, "source_name": node_b.name, "target_name": node_a.name, "source_index": idx_b, "target_index": idx_a}
-
-            edges.append(edge_ab)
-            adjacency[node_a.norad_id].append(edge_ab)
-            adjacency[node_b.norad_id].append(edge_ba)
-
-        if propagator is not None and edges:
-            refine_count = min(len(edges), max(refine_limit, 1))
-            edges_to_refine = sorted(edges, key=lambda item: item["cpi_score"], reverse=True)[:refine_count]
-            for edge in edges_to_refine:
-                refined = self._refine_edge_with_tca(
-                    node_lookup[edge["source_id"]],
-                    node_lookup[edge["target_id"]],
-                    edge,
-                    propagator,
-                    reference_time or datetime.now(timezone.utc),
-                )
-                if refined is not None:
-                    edge.update(refined)
-
-            adjacency = {node.norad_id: [] for node in nodes}
-            for edge in edges:
-                edge_ba = {
-                    **edge,
-                    "source_id": edge["target_id"],
-                    "target_id": edge["source_id"],
-                    "source_name": edge["target_name"],
-                    "target_name": edge["source_name"],
-                    "source_index": edge["target_index"],
-                    "target_index": edge["source_index"],
-                }
-                adjacency[edge["source_id"]].append(edge)
-                adjacency[edge["target_id"]].append(edge_ba)
-
-        hotspots = self._serialize_hotspots(edges)
-
-        return {
-            "nodes": nodes,
-            "edges": edges,
-            "hotspots": hotspots,
-            "adjacency": adjacency,
-            "node_index": node_index,
-            "positions": positions,
-            "velocities": velocities,
-            "summary": {
-                "node_count": len(nodes),
-                "edge_count": len(edges),
-                "influence_radius_km": influence_radius_km,
-            },
-        }
-
+    # ── Public entry point ──────────────────────────────────────────────────
     def analyze_snapshot(
         self,
-        states: list[SatelliteState],
+        states: list[Any] | None,
         alerts: list[dict[str, Any]] | None = None,
         propagator: Any | None = None,
-        reference_time: datetime | None = None,
-        influence_radius_km: float = DEFAULT_INFLUENCE_RADIUS_KM,
-        cpi_threshold: float = DEFAULT_CPI_THRESHOLD,
-        max_depth: int = 3,
-        max_maneuvers: int = 50,
+        reference_time: datetime | str | None = None,
+        *,
+        plan_maneuvers: bool = True,
+        max_maneuver_alerts: int = MAX_MANEUVER_ALERTS,
+        maneuver_time_budget_s: float = MANEUVER_TIME_BUDGET_S,
+        run_rankers: bool = True,
+        **_ignored: Any,
     ) -> dict[str, Any]:
-        graph = self.build_graph(
-            states,
-            influence_radius_km=influence_radius_km,
-            propagator=propagator,
-            reference_time=reference_time,
-        )
-        nodes: list[CascadeNode] = graph["nodes"]
-        edges: list[dict[str, Any]] = graph["edges"]
-        hotspots: list[dict[str, Any]] = graph.get("hotspots", [])
-        adjacency: dict[int, list[dict[str, Any]]] = graph["adjacency"]
-        node_index: dict[int, int] = graph["node_index"]
+        t_start = time.perf_counter()
+        alerts = [a.to_dict() if hasattr(a, "to_dict") else a for a in (alerts or [])]
+        alerts = [a for a in alerts if isinstance(a, dict) and a.get("sat1") and a.get("sat2")]
+        ref = _parse_time(reference_time)
+        if ref is None:
+            from app.core.sim_clock import simulation_now
 
-        if not nodes:
-            return {
-                "graph": graph["summary"],
-                "alerts": [],
-                "cascade_plan": [],
-                "hotspots": [],
-                "total_delta_v_ms": 0.0,
-                "cascade_depth": 0,
-                "agencies_involved": [],
-                "ranker_review": {
-                    "primary": "gat",
-                    "cross_check": "gnn",
-                    "primary_ok": True,
-                    "cross_check_ok": True,
-                    "fallback_used": False,
-                    "degraded": False,
-                    "disagreement_threshold": RANKER_DISAGREEMENT_THRESHOLD,
-                    "disagreement_count": 0,
-                    "max_disagreement": 0.0,
-                    "disputed_satellites": [],
-                },
-            }
+            ref = simulation_now()
 
-        # ── Ranker scoring (P15/P16) ─────────────────────────────────────────
-        # The primary ranker drives the plan. The cross-check ranker never
-        # contributes; it only reports where the two disagree so a silently
-        # broken or degenerate primary is visible. Neither model's score is
-        # blended: they share a data generator, so agreement between them is
-        # weak evidence and a fused number would imply precision neither has.
-        ranker_review: dict[str, Any] = {
-            "primary": "gat",
-            "cross_check": "gnn",
-            "primary_ok": False,
-            "cross_check_ok": False,
-            "fallback_used": False,
-            "degraded": False,
-            "disagreement_threshold": RANKER_DISAGREEMENT_THRESHOLD,
-            "disagreement_count": 0,
-            "max_disagreement": 0.0,
-            "disputed_satellites": [],
-        }
-        maneuver_probability = np.zeros(len(nodes), dtype=float)
-        ranker_depth = np.zeros(len(nodes), dtype=int)
+        state_by_id = {}
+        for s in states or []:
+            if _get(s, "error_code", 0) in (0, None) and _get(s, "norad_id") is not None:
+                state_by_id[_node_key(_get(s, "norad_id"))] = s
 
-        try:
-            node_features, edge_index, edge_attr = self._build_gnn_inputs(
-                nodes, edges, node_index, adjacency
-            )
-        except Exception as error:
-            # Without a graph there is nothing for any ranker to score, and
-            # fabricating zeros here would produce a plausible-looking plan
-            # with no basis in the physics.
-            raise RuntimeError(
-                f"Could not build cascade graph inputs: {error}"
-            ) from error
+        graph = build_alert_graph(alerts)
+        depth_info = bfs_cascade(graph)
+        node_prob = node_hit_probabilities(graph)
+        annotate_alerts(alerts, graph, depth_info)
 
-        primary_error: Exception | None = None
-        try:
-            primary_output = self.primary_ranker.predict(
-                node_features, edge_index, edge_attr
-            )
-            maneuver_probability = np.asarray(
-                primary_output["maneuver_probability"], dtype=float
-            )
-            ranker_depth = np.asarray(primary_output["cascade_depth"], dtype=int)
-            ranker_review["primary_ok"] = True
-        except Exception as error:
-            primary_error = error
-            logger.error("Primary cascade ranker (GAT) failed: %s", error)
+        maneuver_stats: dict[str, Any] = {"status": "skipped"}
+        if plan_maneuvers and alerts:
+            maneuver_stats = self._plan_maneuvers(alerts, propagator, ref, state_by_id,
+                                                  max_maneuver_alerts, maneuver_time_budget_s)
+        for alert in alerts:
+            alert.setdefault("recommended_maneuver", None)
 
-        try:
-            cross_output = self.cross_check_ranker.predict(
-                node_features, edge_index, edge_attr
-            )
-            cross_probability = np.asarray(
-                cross_output["maneuver_probability"], dtype=float
-            )
-            ranker_review["cross_check_ok"] = True
-        except Exception as error:
-            cross_probability = None
-            logger.error("Cross-check cascade ranker (GNN) failed: %s", error)
+        hotspots = build_hotspots(alerts, graph, propagator, ref)
+        cascade_plan = build_cascade_plan(alerts, graph, node_prob)
+        ranker_review = self._ranker_review(graph, node_prob, state_by_id) if run_rankers else dict(_EMPTY_RANKER_REVIEW)
 
-        if not ranker_review["primary_ok"]:
-            if cross_probability is None:
-                # Both rankers are unavailable. Raising leaves the previous
-                # alert cache in place, so the UI keeps showing the last real
-                # plan. Emitting zeros instead would be a fresh, entirely
-                # fabricated plan that looks normal to the operator.
-                raise RuntimeError(
-                    "Both cascade rankers failed; refusing to emit a plan with "
-                    f"fabricated probabilities. primary={primary_error!r}"
-                )
-            # The primary failed but the cross-check is healthy: use it, and
-            # mark the result degraded so the UI can say so.
-            maneuver_probability = cross_probability
-            ranker_depth = np.asarray(cross_output["cascade_depth"], dtype=int)
-            ranker_review["fallback_used"] = True
-            ranker_review["degraded"] = True
-            ranker_review["degraded_reason"] = (
-                "Primary GAT ranker failed; probabilities came from the GNN "
-                "cross-check and are not attention-derived."
-            )
-        elif cross_probability is not None:
-            # Both healthy: report where they disagree. The primary still wins.
-            if cross_probability.shape == maneuver_probability.shape:
-                delta = np.abs(cross_probability - maneuver_probability)
-                disputed = np.flatnonzero(
-                    delta > RANKER_DISAGREEMENT_THRESHOLD
-                )
-                ranker_review["disagreement_count"] = int(disputed.size)
-                ranker_review["max_disagreement"] = (
-                    round(float(delta.max()), 4) if delta.size else 0.0
-                )
-                ranker_review["disputed_satellites"] = [
-                    {
-                        "satellite_id": int(nodes[i].norad_id),
-                        "satellite_name": nodes[i].name,
-                        "gat_probability": round(float(maneuver_probability[i]), 4),
-                        "gnn_probability": round(float(cross_probability[i]), 4),
-                        "delta": round(float(delta[i]), 4),
-                    }
-                    for i in disputed
-                ]
+        involved = set()
+        for alert in alerts:
+            if _pc(alert) >= MANEUVER_PC_THRESHOLD or alert.get("upstream_event"):
+                for side in ("sat1", "sat2"):
+                    node = graph["nodes"].get(_node_key(alert[side].get("id")))
+                    if node is not None:
+                        involved.add(node["agency"])
+        involved.discard("Debris")  # synthetic fragments have no operator
 
-        ranked_nodes = sorted(
-            nodes,
-            key=lambda node: (
-                maneuver_probability[node_index[node.norad_id]],
-                self._node_peak_cpi(node.norad_id, adjacency),
-            ),
-            reverse=True,
-        )
-
-        if alerts:
-            seed_ids = []
-            for alert in sorted(alerts, key=lambda item: item.get("cpi_score", 0.0), reverse=True):
-                seed_ids.append(alert["sat1"]["id"])
-                seed_ids.append(alert["sat2"]["id"])
-            seed_ids = list(dict.fromkeys(seed_ids))
-        else:
-            seed_ids = [node.norad_id for node in ranked_nodes[:3]]
-
-        resolved_maneuvers = self._resolve_cascade(
-            seed_ids=seed_ids,
-            nodes=nodes,
-            node_index=node_index,
-            adjacency=adjacency,
-            maneuver_probability=maneuver_probability,
-            ranker_depth=ranker_depth,
-            max_depth=max_depth,
-            max_maneuvers=max_maneuvers,
-            cpi_threshold=cpi_threshold,
-        )
-
-        optimized_maneuvers, optimization_summary = self._optimize_cascade_plan(
-            resolved_maneuvers,
-            cpi_threshold=cpi_threshold,
-        )
-
-        agencies_involved = sorted({maneuver["agency"] for maneuver in optimized_maneuvers})
-        total_delta_v_ms = round(sum(maneuver["maneuver"]["delta_v_ms"] for maneuver in optimized_maneuvers), 3)
-        max_cascade_depth = max([1] + [maneuver["cascade_depth"] for maneuver in optimized_maneuvers])
+        seeds = []
+        for alert in sorted(alerts, key=_pc, reverse=True):
+            for side in ("sat1", "sat2"):
+                sid = _node_key(alert[side].get("id"))
+                if sid not in seeds:
+                    seeds.append(sid)
+        max_depth = max((int(a.get("cascade_depth") or 0) for a in alerts), default=0)
 
         return {
-            "graph": graph["summary"],
-            "alerts": self._serialize_alerts(edges),
+            "graph": {
+                "node_count": len(graph["nodes"]),
+                "edge_count": len(graph["edges"]),
+                "event_count": len(graph["events"]),
+                "edge_source": "alerts",
+                "influence_radius_km": None,
+                "max_downstream_hops": depth_info["max_hops"],
+            },
+            "alerts": alerts,
             "hotspots": hotspots,
-            "cascade_plan": optimized_maneuvers,
-            "seed_satellites": seed_ids,
-            "total_delta_v_ms": total_delta_v_ms,
-            "cascade_depth": max_cascade_depth,
-            "agencies_involved": agencies_involved,
-            "cpi_threshold": cpi_threshold,
-            "optimization": optimization_summary,
-            "ranker_review": ranker_review,
-            "node_probabilities": {
-                str(node.norad_id): round(float(maneuver_probability[node_index[node.norad_id]]), 3)
-                for node in nodes
+            "cascade_plan": cascade_plan,
+            "seed_satellites": seeds[:20],
+            "total_delta_v_ms": round(sum(p["maneuver"]["delta_v_ms"] for p in cascade_plan), 4),
+            "cascade_depth": max_depth,
+            "cascade_depth_definition": "BFS hops from the root collision event (primary conjunction = 1)",
+            "agencies_involved": sorted(involved),
+            "cpi_threshold": DEFAULT_CPI_THRESHOLD,
+            "node_probabilities": {str(k): v for k, v in node_prob.items()},
+            "node_probability_definition": "1 - prod(1 - Pc_i) over alerts incident to the object",
+            "optimization": {
+                "method": "repropagation_candidate_search",
+                **maneuver_stats,
             },
+            "ranker_review": ranker_review,
+            "runtime_s": round(time.perf_counter() - t_start, 3),
         }
 
-    def _resolve_cascade(
-        self,
-        seed_ids: list[int],
-        nodes: list[CascadeNode],
-        node_index: dict[int, int],
-        adjacency: dict[int, list[dict[str, Any]]],
-        maneuver_probability: np.ndarray,
-        ranker_depth: np.ndarray,
-        max_depth: int,
-        max_maneuvers: int,
-        cpi_threshold: float,
-    ) -> list[dict[str, Any]]:
-        queue = deque((sat_id, 1, None, "PRIMARY_CONJUNCTION") for sat_id in seed_ids)
-        visited: set[int] = set()
-        resolved_maneuvers: list[dict[str, Any]] = []
+    # ── Manoeuvres ──────────────────────────────────────────────────────────
+    def _plan_maneuvers(self, alerts, propagator, ref, state_by_id, max_alerts, budget_s) -> dict:
+        from app.services import maneuver_planner as mp
 
-        while queue and len(resolved_maneuvers) < max_maneuvers:
-            sat_id, depth, trigger_sat_id, trigger_label = queue.popleft()
-            if sat_id in visited or depth > max_depth:
-                continue
-            visited.add(sat_id)
-
-            threat = self._strongest_threat(sat_id, adjacency)
-            if threat is None:
-                continue
-
-            node = nodes[node_index[sat_id]]
-            threat_node = nodes[node_index[threat["target_id"]]]
-            node_prob = float(maneuver_probability[node_index[sat_id]])
-            local_cpi = float(threat["cpi_score"])
-            cascade_depth_score = int(max(depth, int(ranker_depth[node_index[sat_id]])))
-
-            maneuver_rsw = self._recommend_maneuver_rsw(node, threat_node, local_cpi, node_prob)
-            maneuver_eci = rsw_to_eci(maneuver_rsw, node.position, node.velocity)
-            total_delta_v_ms = float(np.linalg.norm(maneuver_rsw))
-            risk_before = local_cpi
-            risk_after = max(0.0, risk_before - (node_prob * 3.0) - (total_delta_v_ms * 0.6))
-
-            resolved_maneuvers.append(
-                {
-                    "satellite_id": sat_id,
-                    "satellite_name": node.name,
-                    "agency": node.agency,
-                    "cascade_depth": cascade_depth_score,
-                    "triggered_by": trigger_sat_id,
-                    "trigger_label": trigger_label,
-                    "threat": {
-                        "satellite_id": threat["target_id"],
-                        "satellite_name": threat["target_name"],
-                        "miss_distance_km": threat["predicted_miss_distance_km"],
-                        "relative_velocity_kmh": threat["relative_velocity_kmh"],
-                        "tca_minutes": threat["tca_minutes"],
-                        "p_collision": threat["p_collision"],
-                        "cpi_score": threat["cpi_score"],
-                    },
-                    "maneuver": {
-                        "frame": "RSW",
-                        "dv_r": round(float(maneuver_rsw[0]), 3),
-                        "dv_s": round(float(maneuver_rsw[1]), 3),
-                        "dv_w": round(float(maneuver_rsw[2]), 3),
-                        "delta_v_ms": round(total_delta_v_ms, 3),
-                        "eci_ms": [
-                            round(float(maneuver_eci[0]), 3),
-                            round(float(maneuver_eci[1]), 3),
-                            round(float(maneuver_eci[2]), 3),
-                        ],
-                    },
-                    "risk_before": round(risk_before, 2),
-                    "risk_after": round(risk_after, 2),
-                    "maneuver_probability": round(node_prob, 3),
-                }
-            )
-
-            for neighbor_edge in sorted(adjacency.get(sat_id, []), key=lambda item: item["cpi_score"], reverse=True):
-                if neighbor_edge["target_id"] in visited:
-                    continue
-                if neighbor_edge["cpi_score"] >= cpi_threshold or maneuver_probability[node_index[neighbor_edge["target_id"]]] >= 0.55:
-                    queue.append(
-                        (
-                            neighbor_edge["target_id"],
-                            depth + 1,
-                            sat_id,
-                            f"CASCADE_FROM_{sat_id}",
-                        )
-                    )
-
-        return resolved_maneuvers
-
-    def _optimize_cascade_plan(
-        self,
-        maneuvers: list[dict[str, Any]],
-        cpi_threshold: float,
-    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-        if not maneuvers:
-            return [], {
-                "status": "empty",
-                "initial_total_delta_v_ms": 0.0,
-                "optimized_total_delta_v_ms": 0.0,
-                "optimization_gain_pct": 0.0,
-                "iterations": 0,
-            }
-
-        base_delta_v = np.array([float(m["maneuver"]["delta_v_ms"]) for m in maneuvers], dtype=float)
-        risk_before = np.array([float(m.get("risk_before", 0.0)) for m in maneuvers], dtype=float)
-        maneuver_prob = np.array([float(m.get("maneuver_probability", 0.0)) for m in maneuvers], dtype=float)
-        node_targets = np.array([max(0.5, min(risk_before[i] * 0.75, cpi_threshold - 0.25)) for i in range(len(maneuvers))], dtype=float)
-
-        x0 = np.ones(len(maneuvers), dtype=float)
-        bounds = [(0.45, 1.9) for _ in maneuvers]
-
-        def adjusted_risk(scale_vector: np.ndarray) -> np.ndarray:
-            total_dv = base_delta_v * scale_vector
-            return np.maximum(0.0, risk_before - (maneuver_prob * 3.0) - (total_dv * 0.6))
-
-        def objective(scale_vector: np.ndarray) -> float:
-            total_dv = float(np.sum(base_delta_v * scale_vector))
-            risk_penalty = float(np.sum(np.square(np.maximum(0.0, adjusted_risk(scale_vector) - node_targets))))
-            smoothness_penalty = float(np.sum(np.square(scale_vector - 1.0)))
-            return total_dv + (1.5 * risk_penalty) + (0.05 * smoothness_penalty)
-
-        constraints = []
-        for idx in range(len(maneuvers)):
-            constraints.append({
-                "type": "ineq",
-                "fun": lambda scale_vector, i=idx: float(node_targets[i] - adjusted_risk(scale_vector)[i]),
-            })
+        satrecs: dict = {}
+        if propagator is not None:
+            lock = getattr(propagator, "_lock", None)
+            try:
+                if lock is not None:
+                    with lock:
+                        satrecs = dict(getattr(propagator, "_satellites", {}))
+                else:
+                    satrecs = dict(getattr(propagator, "_satellites", {}))
+            except Exception:
+                satrecs = {}
+        if not satrecs:
+            for alert in alerts:
+                if _pc(alert) >= MANEUVER_PC_THRESHOLD:
+                    alert["maneuver_status"] = "no_propagator"
+            return {"status": "no_propagator"}
 
         try:
-            result = minimize(
-                objective,
-                x0,
-                method="SLSQP",
-                bounds=bounds,
-                constraints=constraints,
-                options={"maxiter": 200, "ftol": 1e-6},
-            )
-            scales = np.asarray(result.x if result.success and result.x is not None else x0, dtype=float)
-            status = "optimized" if result.success else "fallback"
-            iterations = int(getattr(result, "nit", 0) or 0)
-            objective_value = float(result.fun) if result.success and result.fun is not None else float(objective(scales))
+            from app.core import satcat
+        except Exception:  # pragma: no cover
+            satcat = None
+
+        eligible = sorted((a for a in alerts if _pc(a) >= MANEUVER_PC_THRESHOLD), key=_pc, reverse=True)
+        jobs = []
+        for alert in eligible[:max_alerts]:
+            tca = _parse_time(alert.get("tca_utc"))
+            if tca is None:
+                alert["maneuver_status"] = "no_tca"
+                continue
+            tca_s = (tca - ref).total_seconds()
+            if tca_s <= 0 or tca_s > mp.MAX_HORIZON_S:
+                alert["maneuver_status"] = "tca_outside_planning_horizon"
+                continue
+            tracks = {}
+            for side in ("sat1", "sat2"):
+                info = alert[side]
+                sid = _node_key(info.get("id"))
+                name = info.get("name") or str(sid)
+                if sid in satrecs:
+                    tracks[side] = mp.ObjectTrack(sid, name, satrec=satrecs[sid][0])
+                else:
+                    st = alert.get(f"{side}_state") or (alert.get("fragment_state") if info.get("object_type") == "DEB" else None)
+                    if st and st.get("r_km") is not None and st.get("v_kms") is not None:
+                        r0, v0 = np.asarray(st["r_km"], float), np.asarray(st["v_kms"], float)
+                        epoch = _parse_time(st.get("epoch_utc")) or ref
+                        if abs((epoch - ref).total_seconds()) > 1e-3:
+                            r0, v0 = mp.propagate_j2(r0, v0, (ref - epoch).total_seconds())
+                            r0, v0 = r0[0], v0[0]
+                        tracks[side] = mp.ObjectTrack(sid, name, r0=r0, v0=v0)
+                    elif sid in state_by_id:
+                        s = state_by_id[sid]
+                        tracks[side] = mp.ObjectTrack(
+                            sid, name,
+                            r0=np.array([_get(s, "x"), _get(s, "y"), _get(s, "z")], float),
+                            v0=np.array([_get(s, "vx"), _get(s, "vy"), _get(s, "vz")], float))
+            if len(tracks) < 2:
+                alert["maneuver_status"] = "object_state_unavailable"
+                continue
+            movers, others, is_sat1 = [], [], []
+            for side, other_side in (("sat1", "sat2"), ("sat2", "sat1")):
+                info = alert[side]
+                track = tracks[side]
+                rec = satcat.lookup(track.norad_id) if satcat else None
+                otype = (info.get("object_type") or (rec or {}).get("object_type") or "UNK")
+                decayed = bool(rec and rec.get("decay_date"))
+                # SATCAT OPS_STATUS_CODE: '-' nonoperational, 'D' decayed -> no thrust available.
+                dead = bool(rec and rec.get("ops_status") in ("-", "D"))
+                if track.satrec is None or otype != "PAY" or decayed or dead:
+                    continue
+                agency = info.get("agency") or infer_agency(track.name, track.norad_id)
+                movers.append(mp.Mover(track, agency, agency not in ("Unknown", "UNKNOWN", None), rec))
+                others.append(tracks[other_side])
+                is_sat1.append(side == "sat1")
+            if not movers:
+                alert["maneuver_status"] = "no_operational_payload"
+                continue
+            ages = alert.get("tle_age_days")
+            ages_t = (float(ages[0]), float(ages[1])) if isinstance(ages, (list, tuple)) and len(ages) == 2 else None
+            if ages_t is None:
+                ages_t = tuple(
+                    (tca_s / 86400.0) if tracks[s].satrec is None else
+                    ((tca - ref).total_seconds() / 86400.0 + _satrec_age_days(tracks[s].satrec, ref))
+                    for s in ("sat1", "sat2"))
+            iso_sigma = None
+            if alert.get("covariance_model") == "isotropic_bplane":
+                a_m = (alert.get("covariance_ellipse") or {}).get("a")
+                iso_sigma = float(a_m) / 1000.0 if a_m else None
+            jobs.append(mp.EncounterJob(
+                alert=alert, is_sat1=is_sat1, movers=movers, others=others, tca_s=tca_s,
+                hbr_km=float(alert.get("hbr_km") or 0.01), ages_days=ages_t, iso_sigma_km=iso_sigma))
+
+        for alert in eligible[max_alerts:]:
+            alert["maneuver_status"] = "not_planned_outside_top_n"
+        if not jobs:
+            return {"status": "no_jobs", "eligible_alerts": len(eligible)}
+
+        stats = mp.plan_maneuvers(jobs, ref, time_budget_s=budget_s)
+        for job in jobs:
+            res = job.alert.pop("_maneuver_result", None) or {}
+            job.alert["maneuver_status"] = res.get("status", "failed")
+            job.alert["recommended_maneuver"] = res.get("recommended_maneuver")
+            if res.get("baseline"):
+                job.alert["maneuver_baseline"] = res["baseline"]
+        stats["eligible_alerts"] = len(eligible)
+        stats["planned_alerts"] = sum(1 for j in jobs if j.alert.get("recommended_maneuver"))
+        return stats
+
+    # ── Advisory rankers ───────────────────────────────────────────────────
+    def _ranker_review(self, graph, node_prob, state_by_id) -> dict:
+        review = dict(_EMPTY_RANKER_REVIEW)
+        review["disputed_satellites"] = []
+        ids = [n for n in graph["nodes"] if n in state_by_id]
+        if len(ids) < 2:
+            return review
+        index = {n: i for i, n in enumerate(ids)}
+        agencies = sorted({graph["nodes"][n]["agency"] for n in ids})
+        agency_id = {a: i + 1 for i, a in enumerate(agencies)}
+        feats = []
+        for n in ids:
+            s = state_by_id[n]
+            pos = np.array([_get(s, "x"), _get(s, "y"), _get(s, "z")], float)
+            vel = np.array([_get(s, "vx"), _get(s, "vy"), _get(s, "vz")], float)
+            peak = max((e["cpi_score"] for e in graph["adjacency"].get(n, [])), default=0.0)
+            feats.append([*pos, *vel, np.linalg.norm(vel) * 3600.0, np.linalg.norm(pos) - 6371.0,
+                          agency_id[graph["nodes"][n]["agency"]], peak])
+        ei, ea = [], []
+        for e in graph["edges"]:
+            if e["kind"] != "alert" or e["source"] not in index or e["target"] not in index:
+                continue
+            for a, b in ((e["source"], e["target"]), (e["target"], e["source"])):
+                ei.append([index[a], index[b]])
+                ea.append([e["miss_distance_km"], e["relative_speed_kms"], e["tca_minutes"], e["pc"]])
+        if not ei:
+            return review
+        node_features = np.array(feats, float)
+        edge_index = np.array(ei, int).T
+        edge_attr = np.array(ea, float)
+        gat = gnn = None
+        try:
+            if self.primary_ranker is not None:
+                gat = np.asarray(self.primary_ranker.predict(node_features, edge_index, edge_attr)["maneuver_probability"], float)
+                review["primary_ok"] = True
         except Exception as error:
-            logger.warning("Cascade optimizer failed, using unoptimized maneuvers: %s", error)
-            scales = x0
-            status = "fallback"
-            iterations = 0
-            objective_value = float(objective(scales))
+            logger.info("Advisory GAT failed: %s", error)
+        try:
+            if self.cross_check_ranker is not None:
+                gnn = np.asarray(self.cross_check_ranker.predict(node_features, edge_index, edge_attr)["maneuver_probability"], float)
+                review["cross_check_ok"] = True
+        except Exception as error:
+            logger.info("Advisory GNN failed: %s", error)
+        if gat is None and gnn is not None:
+            review["fallback_used"] = True
+            review["degraded"] = True
+        if gat is not None and gnn is not None and gat.shape == gnn.shape:
+            delta = np.abs(gat - gnn)
+            disputed = np.flatnonzero(delta > RANKER_DISAGREEMENT_THRESHOLD)
+            review["disagreement_count"] = int(disputed.size)
+            review["max_disagreement"] = round(float(delta.max()), 4)
+            review["disputed_satellites"] = [
+                {"satellite_id": ids[i], "gat_probability": round(float(gat[i]), 4),
+                 "gnn_probability": round(float(gnn[i]), 4), "delta": round(float(delta[i]), 4)}
+                for i in disputed[:20]]
+        ml = gat if gat is not None else gnn
+        if ml is not None and len(ids) >= 3:
+            phys = np.array([node_prob.get(n, 0.0) for n in ids])
+            rho = _spearman(ml, phys)
+            review["spearman_vs_physics"] = None if rho is None else round(rho, 3)
+        return review
 
-        optimized_maneuvers = []
-        for idx, (maneuver, scale) in enumerate(zip(maneuvers, scales, strict=False)):
-            updated = dict(maneuver)
-            base_vec = np.array([
-                float(maneuver["maneuver"]["dv_r"]),
-                float(maneuver["maneuver"]["dv_s"]),
-                float(maneuver["maneuver"]["dv_w"]),
-            ], dtype=float)
-            optimized_vec = base_vec * float(scale)
-            optimized_delta_v = float(np.linalg.norm(optimized_vec))
-            updated["optimization_scale"] = round(float(scale), 3)
-            updated["maneuver"]["dv_r"] = round(float(optimized_vec[0]), 3)
-            updated["maneuver"]["dv_s"] = round(float(optimized_vec[1]), 3)
-            updated["maneuver"]["dv_w"] = round(float(optimized_vec[2]), 3)
-            updated["maneuver"]["delta_v_ms"] = round(optimized_delta_v, 3)
-            updated["optimization_status"] = status
-            per_scale = np.array([scale if j == idx else 1.0 for j in range(len(maneuvers))], dtype=float)
-            updated["optimized_risk_after"] = round(float(adjusted_risk(per_scale)[idx]), 2)
-            optimized_maneuvers.append(updated)
 
-        initial_total = float(np.sum(base_delta_v))
-        optimized_total = float(np.sum([m["maneuver"]["delta_v_ms"] for m in optimized_maneuvers]))
-        optimization_summary = {
-            "status": status,
-            "iterations": iterations,
-            "initial_total_delta_v_ms": round(initial_total, 3),
-            "optimized_total_delta_v_ms": round(optimized_total, 3),
-            "optimization_gain_pct": round(max(0.0, (1.0 - (optimized_total / max(initial_total, 1e-6))) * 100.0), 2),
-            "objective_value": round(float(objective_value), 4),
-            "maneuver_count": len(maneuvers),
-            "scale_factors": [round(float(scale), 3) for scale in scales],
-        }
+def _satrec_age_days(satrec, ref: datetime) -> float:
+    from sgp4.api import jday
 
-        return optimized_maneuvers, optimization_summary
+    jd, fr = jday(ref.year, ref.month, ref.day, ref.hour, ref.minute, ref.second + ref.microsecond / 1e6)
+    return (jd + fr) - (satrec.jdsatepoch + satrec.jdsatepochF)
 
-    def _build_gnn_inputs(
-        self,
-        nodes: list[CascadeNode],
-        edges: list[dict[str, Any]],
-        node_index: dict[int, int],
-        adjacency: dict[int, list[dict[str, Any]]],
-    ):
-        agency_ids = self._agency_id_map(nodes)
-        node_features = []
-        for node in nodes:
-            node_peak_cpi = self._node_peak_cpi(node.norad_id, adjacency)
-            node_features.append(
-                [
-                    node.position[0],
-                    node.position[1],
-                    node.position[2],
-                    node.velocity[0],
-                    node.velocity[1],
-                    node.velocity[2],
-                    node.speed_kmh,
-                    node.altitude_km,
-                    agency_ids[node.agency],
-                    node_peak_cpi,
-                ]
-            )
 
-        edge_index = []
-        edge_attr = []
-        for edge in edges:
-            edge_index.append([node_index[edge["source_id"]], node_index[edge["target_id"]]])
-            edge_attr.append([
-                edge["predicted_miss_distance_km"],
-                edge["relative_velocity_kmh"] / 3600.0,
-                edge["tca_minutes"],
-                edge["p_collision"],
-            ])
+def _spearman(a: np.ndarray, b: np.ndarray) -> float | None:
+    if np.ptp(a) == 0 or np.ptp(b) == 0:
+        return None
+    ra = np.argsort(np.argsort(a)).astype(float)
+    rb = np.argsort(np.argsort(b)).astype(float)
+    return float(np.corrcoef(ra, rb)[0, 1])
 
-        if not edge_index:
-            edge_index = np.zeros((2, 0), dtype=int)
-            edge_attr = np.zeros((0, 4), dtype=float)
-        else:
-            edge_index = np.array(edge_index, dtype=int).T
-            edge_attr = np.array(edge_attr, dtype=float)
 
-        return np.array(node_features, dtype=float), edge_index, edge_attr
+# ══════════════════════════════════════════════════════════════════════════
+# Graph construction and BFS (pure functions, unit-tested)
+# ══════════════════════════════════════════════════════════════════════════
 
-    def _agency_id_map(self, nodes: list[CascadeNode]) -> dict[str, int]:
-        agencies = sorted({node.agency for node in nodes})
-        return {agency: idx + 1 for idx, agency in enumerate(agencies)}
+def build_alert_graph(alerts: list[dict]) -> dict[str, Any]:
+    """Nodes from alert endpoints + collision events; edges from alerts and parent links."""
+    nodes: dict[Any, dict] = {}
+    events: dict[str, dict] = {}
+    edges: list[dict] = []
+    adjacency: dict[Any, list[dict]] = {}
 
-    def _compute_cpi(self, miss_distance_km: float, relative_velocity_kms: float, tca_minutes: float, p_collision: float) -> float:
-        from app.core.conjunction import compute_cpi_score
-        return compute_cpi_score(
-            probability_of_collision=float(p_collision),
-            miss_distance_km=float(miss_distance_km),
-            tca_hours=max(0.0, float(tca_minutes)) / 60.0,
-            relative_velocity_kms=float(relative_velocity_kms),
-        )
+    def add_node(info: dict) -> Any:
+        nid = _node_key(info.get("id"))
+        if nid not in nodes:
+            name = info.get("name") or str(nid)
+            otype = info.get("object_type")
+            if not otype:
+                try:
+                    from app.core.satcat import lookup, object_type_from_name
 
-    def _strongest_threat(self, sat_id: int, adjacency: dict[int, list[dict[str, Any]]]) -> dict[str, Any] | None:
-        threats = adjacency.get(sat_id, [])
-        if not threats:
-            return None
-        return max(threats, key=lambda item: item["cpi_score"])
+                    rec = lookup(nid) if isinstance(nid, int) else None
+                    otype = (rec or {}).get("object_type") or object_type_from_name(name)
+                except Exception:
+                    otype = "UNK"
+            agency = info.get("agency") or infer_agency(name, nid if isinstance(nid, int) else None)
+            nodes[nid] = {"id": nid, "name": name, "agency": agency, "object_type": otype, "kind": "object"}
+            adjacency.setdefault(nid, [])
+        return nid
 
-    def _node_peak_cpi(self, sat_id: int, adjacency: dict[int, list[dict[str, Any]]]) -> float:
-        threats = adjacency.get(sat_id, [])
-        if not threats:
-            return 0.0
-        return float(max(item["cpi_score"] for item in threats))
+    def link(a, b, edge):
+        edges.append(edge)
+        adjacency.setdefault(a, []).append({**edge, "neighbor": b})
+        adjacency.setdefault(b, []).append({**edge, "neighbor": a})
 
-    def _recommend_maneuver_rsw(
-        self,
-        node: CascadeNode,
-        threat: CascadeNode,
-        local_cpi: float,
-        maneuver_probability: float,
-    ) -> np.ndarray:
-        r_hat = node.position / max(_norm(node.position), 1e-6)
-        h_vec = np.cross(node.position, node.velocity)
-        h_norm = max(_norm(h_vec), 1e-6)
-        w_hat = h_vec / h_norm
-        s_hat = np.cross(w_hat, r_hat)
-
-        relative = threat.position - node.position
-        radial_sign = -1.0 if float(np.dot(relative, r_hat)) > 0 else 1.0
-        along_sign = -1.0 if float(np.dot(relative, s_hat)) > 0 else 1.0
-        cross_sign = -1.0 if float(np.dot(relative, w_hat)) > 0 else 1.0
-
-        magnitude = max(0.05, min(2.5, 0.15 + (local_cpi / 10.0) * 1.4 + maneuver_probability * 0.7))
-        return np.array([
-            radial_sign * magnitude * 0.25,
-            along_sign * magnitude * 0.85,
-            cross_sign * magnitude * 0.15,
-        ], dtype=float)
-
-    def _serialize_alerts(self, edges: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        normalized = []
-        for item in sorted(edges, key=lambda edge: edge["cpi_score"], reverse=True):
-            hotspot_position = item.get("hotspot_position") or {"x": 0.0, "y": 0.0, "z": 0.0}
-            normalized.append(
-                {
-                    "id": f"{item['source_id']}-{item['target_id']}",
-                    "sat1": {"id": item["source_id"], "name": item["source_name"]},
-                    "sat2": {"id": item["target_id"], "name": item["target_name"]},
-                    "miss_distance_km": item["predicted_miss_distance_km"],
-                    "relative_speed_kmh": item["relative_velocity_kmh"],
-                    "tca_utc": item.get("tca_utc"),
-                    "tca_minutes": item.get("tca_minutes"),
-                    "severity": item["severity"],
-                    "cpi_score": item["cpi_score"],
-                    "p_collision": item["p_collision"],
-                    "hotspot_score": item.get("hotspot_score", 0.0),
-                    "influence_weight": item["influence_weight"],
-                    "position": hotspot_position,
-                    "zone_radius_km": 100.0,
-                    "tca_hours": round(float(item.get("tca_minutes", 0.0)) / 60.0, 2),
-                }
-            )
-
-        return normalized
-
-    def _serialize_hotspots(self, edges: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        hotspots = []
-        for item in sorted(edges, key=lambda edge: edge.get("hotspot_score", 0.0), reverse=True):
-            hotspot_position = item.get("hotspot_position") or {"x": 0.0, "y": 0.0, "z": 0.0}
-            hotspots.append(
-                {
-                    "sat1": {"id": item["source_id"], "name": item["source_name"]},
-                    "sat2": {"id": item["target_id"], "name": item["target_name"]},
-                    "tca_utc": item.get("tca_utc"),
-                    "tca_minutes": item.get("tca_minutes"),
-                    "miss_distance_km": item["predicted_miss_distance_km"],
-                    "relative_speed_kmh": item["relative_velocity_kmh"],
-                    "cpi_score": item["cpi_score"],
-                    "p_collision": item["p_collision"],
-                    "severity": item["severity"],
-                    "hotspot_score": item.get("hotspot_score", 0.0),
-                    "position": hotspot_position,
-                    "affected_satellites": item.get("affected_satellites", []),
-                    "affected_count": item.get("affected_count", 0),
-                    "zone_radius_km": 100.0,
-                    "tca_hours": round(float(item.get("tca_minutes", 0.0)) / 60.0, 2),
-                }
-            )
-
-        return hotspots
-
-    def _compute_hotspot_score(
-        self,
-        cpi_score: float,
-        p_collision: float,
-        miss_distance_km: float,
-        tca_minutes: float,
-    ) -> float:
-        proximity_component = max(0.0, 1.0 - (miss_distance_km / 500.0))
-        time_component = 1.0 / (1.0 + (max(tca_minutes, 0.0) / 60.0))
-        cpi_component = min(max(cpi_score / 10.0, 0.0), 1.0)
-        score = (0.40 * p_collision) + (0.30 * cpi_component) + (0.20 * proximity_component) + (0.10 * time_component)
-        return max(0.0, min(1.0, score))
-
-    def _refine_edge_with_tca(
-        self,
-        node_a: CascadeNode,
-        node_b: CascadeNode,
-        edge: dict[str, Any],
-        propagator: Any,
-        reference_time: datetime,
-    ) -> dict[str, Any] | None:
-        tca_event = find_tca(
-            propagator,
-            node_a.norad_id,
-            node_b.norad_id,
-            start=reference_time,
-            hours_ahead=24.0,
-            steps=120,
-        )
-        if tca_event is None:
-            return None
-
-        exact_tca = _parse_datetime(tca_event.tca_utc)
-        if exact_tca is None:
-            return None
-
-        state_a = propagator.propagate_one(node_a.norad_id, exact_tca)
-        state_b = propagator.propagate_one(node_b.norad_id, exact_tca)
-        if state_a is None or state_b is None or state_a.error_code != 0 or state_b.error_code != 0:
-            return None
-
-        pos_a = np.array([state_a.x, state_a.y, state_a.z], dtype=float)
-        pos_b = np.array([state_b.x, state_b.y, state_b.z], dtype=float)
-        vel_a = np.array([state_a.vx, state_a.vy, state_a.vz], dtype=float)
-        vel_b = np.array([state_b.vx, state_b.vy, state_b.vz], dtype=float)
-
-        miss_distance_km = _norm(pos_a - pos_b)
-        relative_velocity_kms = _norm(vel_a - vel_b)
-        tca_minutes = max(0.0, (exact_tca - reference_time).total_seconds() / 60.0)
-        p_collision = self.risk_model.score({
-            "miss_distance_km": miss_distance_km,
-            "relative_speed_kmh": relative_velocity_kms * 3600.0,
-            "sat1_altitude_km": node_a.altitude_km,
-            "sat2_altitude_km": node_b.altitude_km,
-            "tca_minutes": tca_minutes,
+    for alert in alerts:
+        a = add_node(alert["sat1"])
+        b = add_node(alert["sat2"])
+        pc = _pc(alert)
+        link(a, b, {
+            "kind": "alert", "source": a, "target": b, "alert_id": alert.get("id"), "pc": pc,
+            "miss_distance_km": float(alert.get("miss_distance_km") or 0.0),
+            "relative_speed_kms": float(alert.get("relative_speed_kms") or
+                                        (alert.get("relative_speed_kmh") or 0.0) / 3600.0),
+            "tca_minutes": float(alert.get("tca_minutes") or 0.0),
+            "cpi_score": float(alert.get("cpi_score") or 0.0),
         })
-        cpi_score = self._compute_cpi(miss_distance_km, relative_velocity_kms, tca_minutes, p_collision)
-        hotspot_score = self._compute_hotspot_score(cpi_score, p_collision, miss_distance_km, tca_minutes)
+        pe = alert.get("parent_event")
+        if isinstance(pe, dict) and pe.get("event_id"):
+            ev_key = f"event:{pe['event_id']}"
+            if ev_key not in events:
+                events[ev_key] = {"id": ev_key, "event_id": pe["event_id"], "parent_ids": list(pe.get("parent_ids") or []),
+                                  "collision_utc": pe.get("collision_utc"), "fragment_count": pe.get("fragment_count"),
+                                  "kind": "event"}
+                adjacency.setdefault(ev_key, [])
+                for pid in events[ev_key]["parent_ids"]:
+                    p = add_node({"id": pid, "name": None})
+                    link(ev_key, p, {"kind": "event_parent", "source": ev_key, "target": p, "pc": 1.0})
+            # The fragment is whichever endpoint is debris from this event.
+            frag = None
+            for side in ("sat2", "sat1"):
+                info = alert[side]
+                if info.get("object_type") == "DEB" or str(info.get("name", "")).upper().startswith("FRAG"):
+                    frag = _node_key(info.get("id"))
+                    break
+            if frag is not None and not any(e["neighbor"] == frag for e in adjacency[ev_key]):
+                link(ev_key, frag, {"kind": "event_fragment", "source": ev_key, "target": frag, "pc": 1.0})
+    return {"nodes": nodes, "events": events, "edges": edges, "adjacency": adjacency}
 
-        return {
-            "miss_distance_km": round(float(miss_distance_km), 3),
-            "predicted_miss_distance_km": round(float(miss_distance_km), 3),
-            "relative_velocity_kmh": round(float(relative_velocity_kms * 3600.0), 2),
-            "tca_minutes": round(float(tca_minutes), 2),
-            "tca_utc": exact_tca.isoformat(),
-            "p_collision": round(float(p_collision), 4),
-            "cpi_score": round(float(cpi_score), 2),
-            "hotspot_score": round(float(hotspot_score), 3),
-            "hotspot_position": {
-                "x": round(float((pos_a[0] + pos_b[0]) / 2.0), 3),
-                "y": round(float((pos_a[1] + pos_b[1]) / 2.0), 3),
-                "z": round(float((pos_a[2] + pos_b[2]) / 2.0), 3),
+
+def bfs_cascade(graph: dict) -> dict[str, Any]:
+    """Hop distance of every node from its nearest collision event (multi-source BFS)."""
+    adjacency = graph["adjacency"]
+    hops: dict[Any, int] = {}
+    root: dict[Any, str] = {}
+    queue = deque()
+    for ev_key, ev in graph["events"].items():
+        hops[ev_key] = 0
+        root[ev_key] = ev["event_id"]
+        queue.append(ev_key)
+    while queue:
+        node = queue.popleft()
+        for edge in adjacency.get(node, []):
+            nb = edge["neighbor"]
+            if nb not in hops:
+                hops[nb] = hops[node] + 1
+                root[nb] = root[node]
+                queue.append(nb)
+    return {"hops": hops, "root": root, "max_hops": max(hops.values(), default=0)}
+
+
+def _downstream(graph: dict, starts: list, blocked: set, hops: dict | None, limit: int) -> list:
+    """Objects reachable from `starts` without passing through `blocked`, moving away from the root."""
+    adjacency = graph["adjacency"]
+    seen = set(blocked) | set(starts)
+    out = []
+    queue = deque(starts)
+    while queue and len(out) < limit:
+        node = queue.popleft()
+        for edge in adjacency.get(node, []):
+            nb = edge["neighbor"]
+            if nb in seen or str(nb).startswith("event:"):
+                continue
+            if hops is not None and nb in hops and node in hops and hops[nb] <= hops[node]:
+                continue
+            seen.add(nb)
+            out.append(nb)
+            queue.append(nb)
+    return out[:limit]
+
+
+def annotate_alerts(alerts: list[dict], graph: dict, depth_info: dict) -> None:
+    """Attach cascade_depth, downstream_ids and upstream_event to each alert in place."""
+    hops, root = depth_info["hops"], depth_info["root"]
+    for alert in alerts:
+        a = _node_key(alert["sat1"].get("id"))
+        b = _node_key(alert["sat2"].get("id"))
+        if a in hops and b in hops:
+            far = a if hops[a] >= hops[b] else b
+            alert["cascade_depth"] = int(hops[far])
+            alert["upstream_event"] = root.get(far)
+            starts = [n for n in (a, b) if hops[n] == hops[far]]
+            alert["downstream_ids"] = _downstream(graph, starts, {a, b} - set(starts), hops, MAX_DOWNSTREAM_IDS)
+        else:
+            alert["cascade_depth"] = 1
+            alert["upstream_event"] = None
+            alert["downstream_ids"] = _downstream(graph, [a, b], set(), None, MAX_DOWNSTREAM_IDS)
+
+
+def node_hit_probabilities(graph: dict) -> dict[Any, float]:
+    """1 - prod(1 - Pc_i) over alerts incident to each object node."""
+    out: dict[Any, float] = {}
+    for nid in graph["nodes"]:
+        survive = 1.0
+        for edge in graph["adjacency"].get(nid, []):
+            if edge["kind"] == "alert":
+                survive *= (1.0 - edge["pc"])
+        out[nid] = float(1.0 - survive)
+    return out
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Plan + hotspots
+# ══════════════════════════════════════════════════════════════════════════
+
+def build_cascade_plan(alerts: list[dict], graph: dict, node_prob: dict) -> list[dict]:
+    plan = []
+    for alert in sorted(alerts, key=_pc, reverse=True):
+        rec = alert.get("recommended_maneuver")
+        if not rec:
+            continue
+        sat_id = rec["sat_id"]
+        threat_side = "sat2" if _node_key(alert["sat1"].get("id")) == sat_id else "sat1"
+        threat = alert[threat_side]
+        rsw = rec["delta_v_rsw_ms"]
+        node = graph["nodes"].get(sat_id, {})
+        plan.append({
+            "satellite_id": sat_id,
+            "satellite_name": rec.get("sat_name") or node.get("name"),
+            "agency": rec.get("agency") or node.get("agency"),
+            "alert_id": alert.get("id"),
+            "cascade_depth": alert.get("cascade_depth", 1),
+            "triggered_by": _node_key(threat.get("id")),
+            "trigger_label": (f"EVENT_{alert['upstream_event']}" if alert.get("upstream_event")
+                              else "PRIMARY_CONJUNCTION"),
+            "threat": {
+                "satellite_id": _node_key(threat.get("id")),
+                "satellite_name": threat.get("name"),
+                "miss_distance_km": alert.get("miss_distance_km"),
+                "relative_velocity_kmh": alert.get("relative_speed_kmh"),
+                "tca_minutes": alert.get("tca_minutes"),
+                "p_collision": _pc(alert),
+                "cpi_score": alert.get("cpi_score"),
             },
-        }
+            "maneuver": {
+                "frame": "RSW",
+                "dv_r": rsw[0], "dv_s": rsw[1], "dv_w": rsw[2],
+                "delta_v_ms": rec["delta_v_ms"],
+                "eci_ms": rec.get("delta_v_eci_ms"),
+                "burn_epoch_utc": rec.get("burn_epoch_utc"),
+            },
+            "risk_before": rec.get("pc_before"),
+            "risk_after": rec.get("new_pc_collision"),
+            "risk_metric": "collision_probability",
+            "new_miss_distance_km": rec.get("new_miss_distance_km"),
+            "achieved_target": rec.get("achieved_target"),
+            "fuel_cost_pct": rec.get("fuel_cost_pct"),
+            "maneuver_probability": round(float(node_prob.get(sat_id, 0.0)), 8),
+            "verified_by": rec.get("verified_by"),
+        })
+    return plan
+
+
+def _alert_position(alert: dict, propagator, cache: dict) -> np.ndarray | None:
+    pos = alert.get("tca_position_km")
+    if pos is not None and len(pos) == 3:
+        return np.asarray(pos, float)
+    tca = _parse_time(alert.get("tca_utc"))
+    if propagator is None or tca is None:
+        return None
+    pts = []
+    for side in ("sat1", "sat2"):
+        sid = _node_key(alert[side].get("id"))
+        try:
+            sats = getattr(propagator, "_satellites", {})
+            if sid not in sats:
+                return None
+            from sgp4.api import jday
+
+            jd, fr = jday(tca.year, tca.month, tca.day, tca.hour, tca.minute, tca.second + tca.microsecond / 1e6)
+            e, r, _ = sats[sid][0].sgp4(jd, fr)
+            if e != 0:
+                return None
+            pts.append(np.asarray(r, float))
+        except Exception:
+            return None
+    return 0.5 * (pts[0] + pts[1])
+
+
+def _objects_near(propagator, when: datetime, center: np.ndarray, radius_km: float, cache: dict) -> list[dict]:
+    """All tracked objects within radius_km of center at `when` (one vectorised SGP4 call)."""
+    if propagator is None:
+        return []
+    key = when.isoformat()
+    if key not in cache:
+        try:
+            from sgp4.api import SatrecArray, jday
+
+            lock = getattr(propagator, "_lock", None)
+            if lock is not None:
+                with lock:
+                    sats = dict(getattr(propagator, "_satellites", {}))
+            else:
+                sats = dict(getattr(propagator, "_satellites", {}))
+            ids = list(sats)
+            if not ids:
+                cache[key] = None
+            else:
+                jd, fr = jday(when.year, when.month, when.day, when.hour, when.minute, when.second + when.microsecond / 1e6)
+                e, r, _ = SatrecArray([sats[i][0] for i in ids]).sgp4(np.array([jd]), np.array([fr]))
+                r = r[:, 0, :]
+                r[e[:, 0] != 0] = np.nan
+                cache[key] = (ids, [sats[i][1] for i in ids], r)
+        except Exception as error:
+            logger.debug("hotspot neighbour propagation failed: %s", error)
+            cache[key] = None
+    data = cache[key]
+    if data is None:
+        return []
+    ids, names, r = data
+    d = np.linalg.norm(r - center[None, :], axis=1)
+    sel = np.flatnonzero(np.isfinite(d) & (d <= radius_km))
+    return [{"id": ids[i], "name": names[i], "distance_km": round(float(d[i]), 3)}
+            for i in sel[np.argsort(d[sel])][:50]]
+
+
+def build_hotspots(alerts: list[dict], graph: dict, propagator, ref: datetime) -> list[dict]:
+    """
+    Hotspots from alerts:
+      * screening alert -> location = TCA midpoint, radius = 3-sigma major axis of
+        the B-plane covariance (>= miss distance), score = Pc.
+      * debris event -> location = centroid of its fragment-encounter TCA points,
+        radius = 90th-percentile spread of those points, score = 1 - prod(1 - Pc).
+    affected_satellites = tracked objects inside the zone at the hotspot TCA.
+    """
+    pos_cache: dict = {}
+    near_cache: dict = {}
+    candidates = []
+    by_event: dict[str, list[dict]] = {}
+    for alert in alerts:
+        if alert.get("parent_event") and alert.get("source") == "debris":
+            by_event.setdefault(alert["parent_event"]["event_id"], []).append(alert)
+            continue
+        candidates.append(("alert", alert, [alert]))
+    for ev_id, group in by_event.items():
+        candidates.append(("event", ev_id, group))
+
+    def score(group):
+        survive = 1.0
+        for a in group:
+            survive *= (1.0 - _pc(a))
+        return 1.0 - survive
+
+    candidates.sort(key=lambda c: score(c[2]), reverse=True)
+    hotspots = []
+    for kind, ref_obj, group in candidates[:MAX_HOTSPOTS]:
+        pts = [p for p in (_alert_position(a, propagator, pos_cache) for a in group) if p is not None]
+        if not pts:
+            continue
+        lead = max(group, key=_pc)
+        center = np.mean(pts, axis=0)
+        if kind == "alert":
+            ell = lead.get("covariance_ellipse") or {}
+            a_m = ell.get("a")
+            radius = max(float(a_m) / 1000.0 if a_m else 0.0, float(lead.get("miss_distance_km") or 0.0))
+            radius_source = "covariance_3sigma_major_axis" if a_m else "miss_distance"
+        else:
+            spread = np.linalg.norm(np.asarray(pts) - center[None, :], axis=1)
+            radius = float(np.percentile(spread, 90)) if len(pts) > 1 else float(lead.get("miss_distance_km") or 0.0)
+            radius_source = "fragment_encounter_p90_spread"
+        radius = max(radius, 0.01)
+        tca_times = [t for t in (_parse_time(a.get("tca_utc")) for a in group) if t is not None]
+        when = min(tca_times) if tca_times else ref
+        affected = _objects_near(propagator, when, center, radius, near_cache)
+        if not affected:
+            affected = []
+        for a in group:  # the alert's own objects are affected by definition
+            for side in ("sat1", "sat2"):
+                sid = _node_key(a[side].get("id"))
+                if not any(x["id"] == sid for x in affected) and graph["nodes"].get(sid, {}).get("object_type") != "DEB":
+                    affected.append({"id": sid, "name": a[side].get("name"), "distance_km": None})
+        hs = score(group)
+        tca_minutes = max(0.0, (when - ref).total_seconds() / 60.0)
+        hotspots.append({
+            "kind": "conjunction" if kind == "alert" else "debris_event",
+            "event_id": ref_obj if kind == "event" else lead.get("upstream_event"),
+            "sat1": lead["sat1"], "sat2": lead["sat2"],
+            "tca_utc": when.isoformat(),
+            "tca_minutes": round(tca_minutes, 2),
+            "tca_hours": round(tca_minutes / 60.0, 3),
+            "miss_distance_km": lead.get("miss_distance_km"),
+            "relative_speed_kmh": lead.get("relative_speed_kmh"),
+            "cpi_score": lead.get("cpi_score"),
+            "p_collision": _pc(lead),
+            "severity": lead.get("severity"),
+            "hotspot_score": hs,
+            "hotspot_score_definition": "1 - prod(1 - Pc) over alerts in the zone",
+            "alert_count": len(group),
+            "position": {"x": round(float(center[0]), 3), "y": round(float(center[1]), 3), "z": round(float(center[2]), 3)},
+            "zone_radius_km": round(radius, 3),
+            "zone_radius_source": radius_source,
+            "affected_satellites": affected,
+            "affected_count": len(affected),
+        })
+    hotspots.sort(key=lambda h: h["hotspot_score"], reverse=True)
+    return hotspots

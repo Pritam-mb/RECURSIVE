@@ -180,6 +180,21 @@ def _hermite_deriv(t: np.ndarray, t0: float, step: float, P: np.ndarray, D: np.n
     return d00 * P[..., k, :] + d10 * D[..., k, :] + d01 * P[..., k + 1, :] + d11 * D[..., k + 1, :]
 
 
+def _hermite_batch(t: np.ndarray, t0: float, step: float, P: np.ndarray, D: np.ndarray):
+    """Batched cubic Hermite value and derivative: t (C, N), P/D (C, nodes, 3) -> (C, N, 3) each."""
+    n = P.shape[1]
+    u = (t - t0) / step
+    k = np.clip(np.floor(u).astype(int), 0, n - 2)
+    s = (u - k)[..., None]
+    kk = np.repeat(k[..., None], 3, axis=2)
+    P0 = np.take_along_axis(P, kk, axis=1); P1 = np.take_along_axis(P, kk + 1, axis=1)
+    D0 = np.take_along_axis(D, kk, axis=1); D1 = np.take_along_axis(D, kk + 1, axis=1)
+    s2, s3 = s * s, s * s * s
+    val = (2 * s3 - 3 * s2 + 1) * P0 + (s3 - 2 * s2 + s) * step * D0 + (-2 * s3 + 3 * s2) * P1 + (s3 - s2) * step * D1
+    der = ((6 * s2 - 6 * s) / step) * P0 + (3 * s2 - 4 * s + 1) * D0 + ((-6 * s2 + 6 * s) / step) * P1 + (3 * s2 - 2 * s) * D1
+    return val, der
+
+
 # ── Problem description ────────────────────────────────────────────────────
 
 @dataclass
@@ -369,15 +384,13 @@ def plan_maneuvers(jobs: list[EncounterJob], burn_epoch: datetime, *, pc_target:
                     return _sgp4_states(sat, jd0, fr0, t)
 
             def mover_state(t, sat=mover.track.satrec, dR=dR, dV=dV):
-                # t: (ncand+1, nt) or (ncand+1,)
+                # t: (ncand+1, nt) or (ncand+1,): candidate c evaluated at its own times
                 rr, vv = _sgp4_states(sat, jd0, fr0, t)
                 tt = np.asarray(t, float)
+                t2 = tt[:, None] if tt.ndim == 1 else tt
+                dr, dv = _hermite_batch(t2, t_node0, NODE_STEP_S, dR, dV)
                 if tt.ndim == 1:
-                    dr = np.stack([_hermite(tt[c:c + 1], t_node0, NODE_STEP_S, dR[c], dV[c])[0] for c in range(dR.shape[0])])
-                    dv = np.stack([_hermite_deriv(tt[c:c + 1], t_node0, NODE_STEP_S, dR[c], dV[c])[0] for c in range(dR.shape[0])])
-                else:
-                    dr = np.stack([_hermite(tt[c], t_node0, NODE_STEP_S, dR[c], dV[c]) for c in range(dR.shape[0])])
-                    dv = np.stack([_hermite_deriv(tt[c], t_node0, NODE_STEP_S, dR[c], dV[c]) for c in range(dR.shape[0])])
+                    dr, dv = dr[:, 0], dv[:, 0]
                 return rr + dr, vv + dv
 
             ncr = dR.shape[0]

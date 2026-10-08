@@ -98,14 +98,14 @@ def _require_satellite_authority(session_id: str, norad_id: int) -> str:
                 detail=f"Could not resolve satellite {norad_id} for authorization: {error}",
             ) from error
 
-    if not authority_manager.check_authority(session_id, norad_id, satellite_name):
-        session = authority_manager.get_session_info(session_id) or {}
+    decision = authority_manager.explain_authority(session_id, norad_id, satellite_name)
+    if not decision["allowed"]:
         raise HTTPException(
             status_code=403,
             detail=(
-                f"Session agency '{session.get('agency', 'unknown')}' is not authorized "
-                f"to command '{satellite_name}' (NORAD {norad_id}), which is controlled by "
-                f"'{authority_manager.get_controlling_agency(satellite_name)}'."
+                f"Session agency '{decision.get('session_agency') or 'unknown'}' is not authorized "
+                f"to command '{satellite_name}' (NORAD {norad_id}, type {decision['object_type']}), "
+                f"controlled by '{decision['controlling_agency']}' [rule: {decision['rule']}]."
             ),
         )
 
@@ -165,6 +165,9 @@ class ManeuverFeedbackRequest(BaseModel):
     sat2_id: int | None = None
     decision: str
     delta_v_ms: float = 0.1
+    # Recommended manoeuvre as computed by the cascade planner (RSW, m/s).
+    sat_id: int | None = None
+    delta_v_rsw_ms: list[float] | None = None
 
 
 # These will be set by main.py on startup
@@ -248,11 +251,19 @@ async def get_satellite_detail(norad_id: int):
     if _propagator is None:
         raise HTTPException(status_code=503, detail="Propagator not initialized")
 
-    state = _propagator.propagate_one(norad_id)
+    state = _propagator.propagate_one(norad_id, sim_clock.simulation_now())
     if state is None:
         raise HTTPException(status_code=404, detail="Satellite not found")
 
-    return state.to_dict()
+    from app.core import satcat
+    from app.core.agency import agency_attribution
+
+    detail = state.to_dict()
+    detail.update(agency_attribution(state.name, norad_id))
+    # CelesTrak SATCAT record (offline snapshot) or TLE-derived fallback; None
+    # for synthetic scenario objects that exist in no catalogue.
+    detail["satcat"] = satcat.lookup(norad_id, name=state.name)
+    return detail
 
 
 def _fallback_telemetry(norad_id: int, satellite_name: str) -> dict:
@@ -500,13 +511,18 @@ async def get_cascade_status():
     """Get the current cascade prediction status."""
     alerts_snapshot = get_latest_alerts()
     plan = alerts_snapshot.get("cascade_plan", [])
-    
-    predictions = len(plan)
-    depth = alerts_snapshot.get("cascade_depth", 0)
-    
+    alerts = alerts_snapshot.get("alerts", []) or []
+    depths = [int(a["cascade_depth"]) for a in alerts if isinstance(a.get("cascade_depth"), (int, float))]
+
     return {
-        "cascade_predictions": predictions,
-        "mean_cascade_depth": depth,
+        "cascade_predictions": len(plan),
+        # BFS hop counts from the root collision event (primary conjunction = 1).
+        "mean_cascade_depth": round(sum(depths) / len(depths), 3) if depths else 0.0,
+        "max_cascade_depth": max(depths) if depths else 0,
+        "alerts_with_depth": len(depths),
+        "events": sorted({a["upstream_event"] for a in alerts if a.get("upstream_event")}),
+        "planned_maneuvers": sum(1 for a in alerts if a.get("recommended_maneuver")),
+        "depth_definition": "BFS hops from root collision event",
     }
 
 
@@ -832,11 +848,49 @@ async def maneuver_feedback(
     req: ManeuverFeedbackRequest,
     session_id: str = Depends(resolve_session_id),
 ):
-    """Record an operator decision and (for approve/modify) apply the maneuver."""
+    """Record an operator decision and (for approve/modify) apply the manoeuvre.
+
+    The burn applied is, in order of preference:
+      1. the alert's server-side ``recommended_maneuver`` (looked up by alert_id
+         in the latest alert cache; computed by re-propagation in the cascade
+         planner) - full RSW vector on its ``sat_id``;
+      2. the RSW vector the client sent (``delta_v_rsw_ms`` on ``sat_id``,
+         falling back to ``sat1_id``);
+      3. legacy: a scalar along-track burn of ``delta_v_ms`` on ``sat1_id``.
+    For MODIFY, the chosen direction is kept and rescaled to ``delta_v_ms``.
+    """
+    import math as _math
+
     if _propagator is None or _sim_engine is None:
         return {"status": "ERROR", "message": "Not initialized"}
 
-    _require_satellite_authority(session_id, req.sat1_id)
+    recommended = None
+    if req.alert_id:
+        for cached in get_latest_alerts().get("alerts", []) or []:
+            if cached.get("id") == req.alert_id and cached.get("recommended_maneuver"):
+                recommended = cached["recommended_maneuver"]
+                break
+
+    if recommended is not None:
+        target_id = int(recommended["sat_id"])
+        dv_rsw = [float(x) for x in recommended["delta_v_rsw_ms"]]
+        maneuver_source = "server_recommended_maneuver"
+    elif req.delta_v_rsw_ms and len(req.delta_v_rsw_ms) == 3:
+        target_id = int(req.sat_id if req.sat_id is not None else req.sat1_id)
+        dv_rsw = [float(x) for x in req.delta_v_rsw_ms]
+        maneuver_source = "client_rsw_vector"
+    else:
+        target_id = int(req.sat_id if req.sat_id is not None else req.sat1_id)
+        dv_rsw = [0.0, float(req.delta_v_ms), 0.0]
+        maneuver_source = "operator_scalar_along_track"
+
+    if req.decision == "MODIFY":
+        norm = _math.sqrt(sum(x * x for x in dv_rsw))
+        if norm > 0:
+            dv_rsw = [x * float(req.delta_v_ms) / norm for x in dv_rsw]
+            maneuver_source += "+operator_rescaled"
+
+    _require_satellite_authority(session_id, target_id)
 
     # Persist the decision for the RLHF counters exposed by /api/ml/status.
     try:
@@ -855,10 +909,10 @@ async def maneuver_feedback(
     executed = None
     if req.decision in ("APPROVE", "MODIFY"):
         executed = _sim_engine.apply_maneuver(
-            req.sat1_id,
-            0.0,
-            req.delta_v_ms,
-            0.0,
+            target_id,
+            dv_rsw[0],
+            dv_rsw[1],
+            dv_rsw[2],
             frame="RSW",
             session_id=session_id,
         )
@@ -872,6 +926,10 @@ async def maneuver_feedback(
         "decision": req.decision,
         "alert_id": req.alert_id,
         "sat1_id": req.sat1_id,
+        "sat_id": target_id,
+        "delta_v_rsw_ms": [round(x, 5) for x in dv_rsw],
+        "maneuver_source": maneuver_source,
+        "recommended_maneuver": recommended,
         "executed_maneuver": executed,
         "alerts": (payload or {}).get("alerts", []),
     }
@@ -1045,43 +1103,65 @@ AGENCY_COLORS = {
     "NASA": "#1d9e75",
     "ISS": "#e24b4a",
     "ESA": "#8f5fd6",
-    "ISRO": "#ef9f27",
-    "Roscosmos": "#c94f4f",
-    "CNSA": "#e24b4a",
+    "India": "#ef9f27",
+    "Russia/CIS": "#c94f4f",
+    "China": "#d9534f",
+    "USA": "#5b8def",
+    "US Space Force": "#3b5fa0",
     "NOAA": "#3fa9c9",
     "Iridium": "#f5c518",
+    "OneWeb": "#9bc53d",
+    "Amazon": "#ff9900",
+    "Japan": "#e8a0bf",
+    "France": "#6c8ebf",
+    "UK": "#7f6fbf",
     "Unknown": "#8a8f98",
 }
 
 
 @router.get("/agencies")
 async def list_agencies():
-    """List the agencies present in the current catalog with satellite counts."""
+    """Agencies in the current catalog, attributed from CelesTrak SATCAT owners
+    (operator name patterns refine e.g. US-owned STARLINK -> SpaceX)."""
     if _propagator is None:
         return {"agencies": []}
 
-    counts: dict[str, int] = {}
-    try:
-        ids = _propagator.norad_ids
-    except Exception:
-        ids = []
+    from app.core.agency import agency_attribution
 
-    for norad_id in ids:
-        state = _propagator.propagate_one(norad_id)
-        if state is None:
-            continue
-        agency = infer_agency(state.name)
+    try:
+        with _propagator._lock:
+            catalog = [(nid, entry[1]) for nid, entry in _propagator._satellites.items()]
+    except Exception:
+        catalog = []
+
+    counts: dict[str, int] = {}
+    owners: dict[str, dict[str, int]] = {}
+    sources: dict[str, int] = {}
+    for norad_id, name in catalog:
+        info = agency_attribution(name, norad_id)
+        agency = info["agency"]
         counts[agency] = counts.get(agency, 0) + 1
+        if info["owner"]:
+            owners.setdefault(agency, {})
+            owners[agency][info["owner"]] = owners[agency].get(info["owner"], 0) + 1
+        sources[info["agency_source"]] = sources.get(info["agency_source"], 0) + 1
 
     agencies = [
         {
             "name": name,
             "count": count,
             "color": AGENCY_COLORS.get(name, "#8a8f98"),
+            "satcat_owner_codes": owners.get(name, {}),
         }
         for name, count in sorted(counts.items(), key=lambda item: (-item[1], item[0]))
     ]
-    return {"agencies": agencies, "total": sum(counts.values())}
+    total = sum(counts.values())
+    return {
+        "agencies": agencies,
+        "total": total,
+        "unknown_fraction": round(counts.get("Unknown", 0) / total, 4) if total else 0.0,
+        "attribution_sources": sources,
+    }
 
 
 class SimulationTimeRequest(BaseModel):

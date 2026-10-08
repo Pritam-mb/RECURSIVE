@@ -433,9 +433,21 @@ def find_tca(
             return 1e12
         return float(np.linalg.norm(np.subtract(ra, rb)))
 
-    lo, hi = max(0.0, ts[k] - dt), min(span, ts[k] + dt)
-    res = minimize_scalar(dist, bounds=(lo, hi), method="bounded", options={"xatol": 1e-3})
-    t_best = float(res.x) if res.fun <= d[k] else float(ts[k])
+    # Every local minimum of the sampled distance is a candidate encounter: a
+    # fast crossing can fall between samples, so the grid argmin alone is not
+    # reliable. Refine the 20 lowest local minima and keep the true closest.
+    left = np.r_[np.inf, d[:-1]]
+    right = np.r_[d[1:], np.inf]
+    minima = np.flatnonzero((d <= left) & (d <= right) & np.isfinite(d))
+    if minima.size == 0:
+        minima = np.array([k])
+    minima = minima[np.argsort(d[minima])][:20]
+    t_best, d_best = float(ts[k]), float(d[k])
+    for km in minima:
+        lo, hi = max(0.0, ts[km] - dt), min(span, ts[km] + dt)
+        res = minimize_scalar(dist, bounds=(lo, hi), method="bounded", options={"xatol": 1e-3})
+        if res.fun < d_best:
+            t_best, d_best = float(res.x), float(res.fun)
 
     ea, ra, va = sat1.sgp4(jd0, fr0 + t_best / 86400.0)
     eb, rb, vb = sat2.sgp4(jd0, fr0 + t_best / 86400.0)

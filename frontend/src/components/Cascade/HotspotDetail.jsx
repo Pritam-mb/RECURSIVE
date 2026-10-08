@@ -285,11 +285,12 @@ export default function HotspotDetail({ hs, fetchedAt, onHoverOption, onSelectNo
             <KV items={[
               ['Parents', (e.parent_names || []).join(' × ')],
               ['Fragments (SBM ≥10 cm)', `${e.fragment_count_total} (simulated ${e.fragments_simulated}, ×${num(e.fragment_weight, 2)})`],
-              ['State at TCA', e.state === 'released' ? `released ${num(e.t_rel_s / 60, 1)} min earlier` : pretty(e.state)],
+              ['State at TCA', e.state !== 'released' ? pretty(e.state)
+                : Math.abs(e.t_rel_s) <= 1 ? 'breakup happens here at TCA' : `released ${num(e.t_rel_s / 60, 1)} min earlier`],
               ['Inside zone', e.represented_inside == null ? '—' : `${e.represented_inside} (${e.sampled_inside} sampled)`],
               ['Nearest fragment', fmtDist(e.nearest_fragment_km)],
-              e.spread && ['Cloud spread p50 / p90', `${fmtDist(e.spread.p50_km)} / ${fmtDist(e.spread.p90_km)}`],
-              e.spread?.along_track_spread_km != null && ['Along-track arc', fmtDist(e.spread.along_track_spread_km)],
+              e.spread && Math.abs(e.t_rel_s) > 1 && ['Cloud spread p50 / p90', `${fmtDist(e.spread.p50_km)} / ${fmtDist(e.spread.p90_km)}`],
+              e.spread?.along_track_spread_km != null && Math.abs(e.t_rel_s) > 1 && ['Along-track arc', fmtDist(e.spread.along_track_spread_km)],
             ]}
             />
             {e.spread_timeline?.length > 0 && (

@@ -140,26 +140,29 @@ export function components(nodes, edges) {
 }
 
 /**
- * Focus subset: components that contain a CRITICAL/WARNING node, a collision
- * event, or a CRITICAL/WARNING edge. Returns { nodes, edges, hotspots, hidden }.
+ * Focus subset: the CRITICAL/WARNING links, collision events with their parent
+ * and fragment links, the objects on them, every member of a hotspot that
+ * touches them, and any link between two kept objects (for context distances).
+ * Returns { nodes, edges, hotspots, hidden }.
  */
 export function focusSubset(model, showAll) {
   const { nodes, edges, hotspots } = model;
   if (showAll) return { ...model, hidden: 0 };
-  const comp = components(nodes, edges);
-  const focus = new Set();
-  for (const n of nodes) {
-    if (n.kind === 'event' || n.severity === 'CRITICAL' || n.severity === 'WARNING') focus.add(comp.get(n.id));
-  }
+  const hot = new Set(['CRITICAL', 'WARNING']);
+  const strong = new Set(['event-parent', 'debris', 'cascade']);
+  const keep = new Set();
+  for (const n of nodes) if (n.kind === 'event' || hot.has(n.severity)) keep.add(n.id);
   for (const e of edges) {
-    if (e.severity === 'CRITICAL' || e.severity === 'WARNING') focus.add(comp.get(e.source));
+    if (hot.has(e.severity) || strong.has(e.kind)) { keep.add(e.source); keep.add(e.target); }
   }
-  const keep = new Set(nodes.filter((n) => focus.has(comp.get(n.id))).map((n) => n.id));
+  const hs = hotspots.filter((h) => h.members.some((m) => keep.has(m)));
+  for (const h of hs) for (const m of h.members) keep.add(m);
+  const known = new Set(nodes.map((n) => n.id));
   return {
     nodes: nodes.filter((n) => keep.has(n.id)),
     edges: edges.filter((e) => keep.has(e.source) && keep.has(e.target)),
-    hotspots: hotspots.filter((h) => h.members.some((m) => keep.has(m))),
-    hidden: nodes.length - keep.size,
+    hotspots: hs.map((h) => ({ ...h, members: h.members.filter((m) => known.has(m)) })),
+    hidden: nodes.length - [...keep].filter((id) => known.has(id)).length,
   };
 }
 

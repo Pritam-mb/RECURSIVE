@@ -52,7 +52,18 @@ async function expandRow(alert, freshAlerts, signal) {
 }
 
 async function fetchAlerts(signal) {
-  return gdFetch('/api/alerts', { timeoutMs: 30000, signal });
+  return gdFetch('/api/alerts', { timeoutMs: 90000, signal });
+}
+
+/** Polling variant: a slow/busy backend is reported as progress, not as a failure. */
+async function pollAlerts(signal, progress, label) {
+  try {
+    return await fetchAlerts(signal);
+  } catch (e) {
+    if (signal?.aborted) throw e;
+    progress(`${label} (backend busy: ${e.message}; retrying)`);
+    return null;
+  }
 }
 
 function findPairAlert(data, pair) {
@@ -175,10 +186,10 @@ export const TOUR_STEPS = [
       let data = null;
       while (!alert) {
         const secs = Math.round((performance.now() - t0) / 1000);
-        if (secs > 180) throw new Error('The pair did not appear in /api/alerts within 180 s. The alert refresh may be slow; try Retry.');
+        if (secs > 300) throw new Error('The pair did not appear in /api/alerts within 300 s. The alert refresh may be slow; try Retry.');
         progress(`Waiting for the screening pipeline to report ${ctx.pair} … ${secs} s (it re-screens every 30 s and after each change)`);
-        data = await fetchAlerts(signal);
-        alert = findPairAlert(data, ctx.pair);
+        data = await pollAlerts(signal, progress, `Waiting for ${ctx.pair}`);
+        alert = data ? findPairAlert(data, ctx.pair) : null;
         if (!alert) await sleep(3000, signal);
       }
       ctx.alert = alert;
@@ -295,14 +306,14 @@ export const TOUR_STEPS = [
       const t0 = performance.now();
       const tick = setInterval(() => {
         const s = Math.round((performance.now() - t0) / 1000);
-        progress(`Breaking up ${ctx.satA} × ${ctx.satB} at their predicted TCA (NASA Standard Breakup Model), then screening the fragments against the catalogue … ${s} s (can take up to ~2 min)`);
+        progress(`Breaking up ${ctx.satA} × ${ctx.satB} at their predicted TCA (NASA Standard Breakup Model), then screening the fragments against the catalogue … ${s} s (can take 1–3 min on this laptop)`);
       }, 1000);
       let res;
       try {
         res = await gdFetch('/api/debris/simulate', {
           method: 'POST',
           body: { sat_a: ctx.satA, sat_b: ctx.satB, advance_to_impact: true },
-          timeoutMs: 180000,
+          timeoutMs: 300000,
           signal,
         });
       } finally {
@@ -389,9 +400,9 @@ export const TOUR_STEPS = [
       for (;;) {
         const s = Math.round((performance.now() - t0) / 1000);
         progress(`Looking for fragment alerts of ${ctx.eventId} … ${s} s`);
-        data = await fetchAlerts(signal);
+        data = await pollAlerts(signal, progress, 'Looking for fragment alerts') || data;
         mine = (data?.alerts || []).filter((a) => a.source === 'debris' && a.parent_event?.event_id === ctx.eventId);
-        if (mine.length || s > 60) break;
+        if (mine.length || s > 120) break;
         await sleep(3000, signal);
       }
       clickAllTab();

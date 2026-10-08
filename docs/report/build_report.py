@@ -1025,7 +1025,7 @@ def fig_debris_alerts(alerts_deb):
     for y, ((sid, name, ag), lst) in zip(ys, items):
         pcs = [max(x["probability_of_collision"], 1e-20) for x in lst]
         a.scatter(np.log10(pcs), [y] * len(pcs), color=CAT[1], s=18, zorder=3)
-        a.text(max(np.log10(pcs)) + 0.15, y, f"{len(lst)} frag., min miss {min(x['miss_distance_km'] for x in lst):.2f} km",
+        a.text(max(np.log10(pcs)) + 0.5, y, f"{len(lst)} frag., min miss {min(x['miss_distance_km'] for x in lst):.2f} km",
                va="center", fontsize=5.8, color=INK2)
     a.set_yticks(ys, [f"{n[:20]} #{s} ({ag})" for (s, n, ag), _ in items], fontsize=5.9)
     lo = min(math.log10(max(x["probability_of_collision"], 1e-20)) for x in deb)
@@ -1041,7 +1041,7 @@ def fig_debris_alerts(alerts_deb):
     b.text(0.02, 5.1, "5 km screening threshold", fontsize=5.6, color=INK2, va="bottom", transform=b.get_yaxis_transform())
     b.set_xlabel("minutes from now to fragment TCA"); b.set_ylabel("miss distance [km]")
     b.set_ylim(0, 6.2); b.set_title("When and how close")
-    b.legend(fontsize=5.4, ncol=2, loc="lower right")
+    b.legend(fontsize=5.4, ncol=1, loc="upper left", bbox_to_anchor=(1.0, 1.02))
     fig.tight_layout()
     return save(fig, "19_debris_alerts", "source=='debris' alerts from GET /api/alerts after POST /api/debris/simulate "
                 "and a pipeline recompute (6 h window, 30 s step, 5 km threshold, isotropic Foster Pc); agency = SATCAT owner.")
@@ -1062,7 +1062,7 @@ def fig_cascade(alerts_deb, node_prob):
         s = a["sat1"]["id"]
         G.add_node(f"F{f}", layer=1, label=a["fragment_id"].split(":")[-1])
         G.add_edge(ev, f"F{f}")
-        G.add_node(s, layer=2, label=f"{a['sat1']['name'][:16]}\n#{s}")
+        G.add_node(s, layer=2, label=f"{a['sat1']['name'][:18]}\n#{s}")
         G.add_edge(f"F{f}", s, pc=a["probability_of_collision"])
         threatened[s] = a["sat1"].get("agency", "?")
     nbr = []
@@ -1075,7 +1075,7 @@ def fig_cascade(alerts_deb, node_prob):
                 nbr.append((a["probability_of_collision"], s, o, on))
     nbr.sort(key=lambda x: -x[0])
     for pc, s, o, on in nbr[:8]:
-        G.add_node(o, layer=3, label=f"{on['name'][:16]}\n#{o}")
+        G.add_node(o, layer=3, label=f"{on['name'][:18]} #{o}")
         G.add_edge(s, o, pc=pc)
     for s, ag in threatened.items():
         G.add_node(f"AG:{ag}", layer=4, label=ag)
@@ -1089,7 +1089,8 @@ def fig_cascade(alerts_deb, node_prob):
         sp = 1.0 if L == 1 else 1.55
         for i, n in enumerate(ns):
             pos[n] = (L, ((k - 1) / 2 - i) * sp)
-    fig, ax = plt.subplots(figsize=(7.2, 4.4))
+    nmax = max(len(v) for k, v in layers.items() if k in (2, 3))
+    fig, ax = plt.subplots(figsize=(7.2, max(4.0, 0.62 * nmax + 1.2)))
     for u, v, d in G.edges(data=True):
         (x1, y1), (x2, y2) = pos[u], pos[v]
         style = ":" if d.get("agency") else "-"
@@ -1104,7 +1105,7 @@ def fig_cascade(alerts_deb, node_prob):
         if d["layer"] == 2:
             p = node_prob.get(str(n)) if node_prob else None
             if p is not None:
-                lab += f"\nP(hit) {p:.1e}"
+                lab = lab.replace("\n#", " #") + f"\nP(hit) {p:.1e}"
         ax.text(x, y - (0.3 if d["layer"] != 1 else 0.22), lab, ha="center", va="top", fontsize=5.0 if d["layer"] == 1 else 5.5,
                 color=INK, linespacing=1.05, bbox=dict(fc="white", ec="none", alpha=0.75, pad=0.3) if d["layer"] in (2, 3) else None)
     top_y = max(p[1] for p in pos.values()) + 0.6
@@ -1775,6 +1776,7 @@ def main():
 
     # ── numbers used in text ────────────────────────────────────────────────
     n_obj = sats_payload.get("count", len(sats))
+    bench500 = next((r.get("t_total_s", float("nan")) for r in (bench or []) if r.get("objects") == 500), float("nan"))
     n_alerts = alerts_payload.get("count", len(alerts))
     sev = Counter(a["severity"] for a in alerts)
     summ = val.get("summary", {})
@@ -1873,8 +1875,8 @@ def main():
     hl = [
         f"<b>Screening is a real look-ahead.</b> {n_obj} objects are screened over 24 h at 60 s with a KD-tree and "
         f"Brent-refined TCA; this snapshot yields {n_alerts} pairs ({sev.get('CRITICAL', 0)} critical, "
-        f"{sev.get('WARNING', 0)} warning). A full pipeline refresh took "
-        f"{scen.get('pipeline_refresh_s', float('nan')):.1f} s on a laptop.",
+        f"{sev.get('WARNING', 0)} warning). Screening 500 objects takes {bench500:.2f} s in-process on a laptop; "
+        f"a full API pipeline recompute took {scen.get('pipeline_refresh_s', float('nan')):.1f} s during this report run.",
         f"<b>Collision probability is cross-validated.</b> {n_pass} of {n_tot} live physics checks pass "
         "(Foster vs Chan series, Monte Carlo, exact Rice CDF and Alfano maximum; propagation energy; CW, Hohmann "
         "and rocket-equation manoeuvre checks; NASA SBM fragment counts).",

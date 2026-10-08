@@ -10,6 +10,8 @@ import CascadeDiagram from './components/CascadeDiagram';
 import ModelStatusV2 from './components/ModelStatusV2';
 import SimulationDrawer from './components/SimulationDrawer';
 import MetricsDrawer from './components/MetricsDrawer';
+import ImpactConsole from './components/Impact/ImpactConsole';
+import LayersPanel from './components/Impact/LayersPanel';
 import useStore from './store/useStore';
 import useSelectedOrbit from './hooks/useSelectedOrbit';
 import { buildCascadeGraph } from './utils/cascadeGraph';
@@ -218,6 +220,8 @@ function App() {
             <span className="ui-label">Live Catalog</span>
             <span className="sh-globe-label-meta">{satellites.length} OBJ</span>
           </span>
+          <LayersPanel />
+          <ImpactConsole />
         </section>
 
         <div className="sh-cell sh-cell--fixed">

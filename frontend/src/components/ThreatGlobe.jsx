@@ -674,9 +674,9 @@ export default function ThreatGlobe({ alerts = EMPTY, satellites = EMPTY, select
 
       view.cx = W / 2;
       view.cy = H / 2;
-      // Zoom scales the disc but always leaves a margin on the long side so
-      // callouts (which never sit on the disc) still have somewhere to go.
-      view.R = Math.max(20, Math.min(Math.min(W, H) * 0.40 * nav.zoom, (Math.max(W, H) / 2) - 70));
+      // Zoom scales the disc; callouts never sit on it (drawCallout rejects
+      // on-disc slots), so when zoomed in they simply drop out.
+      view.R = Math.max(20, Math.min(W, H) * 0.40 * nav.zoom);
       view.cosV = Math.cos(nav.lon * DEG);
       view.sinV = Math.sin(nav.lon * DEG);
       view.cosT = Math.cos(nav.lat * DEG);
@@ -1015,7 +1015,7 @@ export default function ThreatGlobe({ alerts = EMPTY, satellites = EMPTY, select
         }
 
         // Collision marker (after breakup) and the flash / shockwave.
-        if (prep.hasCollision) {
+        if (prep.hasCollision && (showFrags || showParents)) {
           const c = prep.collision;
           const p = projectEci(c[0], c[1], c[2], scratchProj);
           if (p.visible) {

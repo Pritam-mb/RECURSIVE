@@ -248,7 +248,9 @@ class _Window:
         tle_rows = [i for i, o in enumerate(objs) if o.satrec is not None]
         ext_rows = [i for i, o in enumerate(objs) if o.satrec is None]
         if tle_rows:
-            arr = SatrecArray([objs[i].satrec for i in tle_rows])
+            # Burned objects carry a BurnedSatrec (SGP4 + propagated burn
+            # deviation): vectorise the SGP4 part, add the deviation below.
+            arr = SatrecArray([getattr(objs[i].satrec, "base_satrec", objs[i].satrec) for i in tle_rows])
             if SGP4_ACCELERATED and not FORCE_ANCHOR_MODE:
                 # Full SGP4 on every grid sample (C++ vectorised).
                 fr = self.fr0 + np.arange(nt) * step_s / 86400.0
@@ -276,6 +278,13 @@ class _Window:
                         rr, vv = _rk4(rr, vv, step_s, 1)
                         r[:, kk], v[:, kk] = rr, vv
                     r[bad, k0:k1] = np.nan; v[bad, k0:k1] = np.nan
+            burned = [(a, i) for a, i in enumerate(tle_rows) if hasattr(objs[i].satrec, "burn_offsets")]
+            if burned:
+                jd_g = np.full(nt, self.jd0)
+                fr_g = self.fr0 + np.arange(nt) * step_s / 86400.0
+                for a, i in burned:
+                    dr, dv = objs[i].satrec.burn_offsets(jd_g, fr_g)
+                    r[a] += dr; v[a] += dv
             self.R[tle_rows], self.V[tle_rows] = r, v
         if ext_rows:
             r0 = np.array([objs[i].r0 for i in ext_rows], dtype=float)
@@ -476,6 +485,7 @@ def screen(
     propagator = propagator or _DEFAULT_PROPAGATOR
 
     satrecs: dict = {}
+    burned_ids: set = set()
     if propagator is not None:
         lock = getattr(propagator, "_lock", None)
         if lock is not None:
@@ -483,6 +493,8 @@ def screen(
                 satrecs = dict(getattr(propagator, "_satellites", {}))
         else:
             satrecs = dict(getattr(propagator, "_satellites", {}))
+        if hasattr(propagator, "burned_ids") and hasattr(propagator, "trajectory"):
+            burned_ids = propagator.burned_ids()
 
     objs: list[_Obj] = []
     seen = set()
@@ -495,7 +507,10 @@ def screen(
         seen.add(nid)
         name = _get(s, "name", str(nid))
         if nid in satrecs:
-            objs.append(_Obj(nid, name, satrec=satrecs[nid][0]))
+            sat = satrecs[nid][0]
+            if nid in burned_ids:  # executed burns: SGP4 + propagated deviation
+                sat = propagator.trajectory(nid) or sat
+            objs.append(_Obj(nid, name, satrec=sat))
         else:
             r0 = np.array([_get(s, "x"), _get(s, "y"), _get(s, "z")], float)
             v0 = np.array([_get(s, "vx"), _get(s, "vy"), _get(s, "vz")], float)

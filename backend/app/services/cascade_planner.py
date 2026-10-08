@@ -288,7 +288,11 @@ class CascadePlanner:
                 sid = _node_key(info.get("id"))
                 name = info.get("name") or str(sid)
                 if sid in satrecs:
-                    tracks[side] = mp.ObjectTrack(sid, name, satrec=satrecs[sid][0])
+                    sat = satrecs[sid][0]
+                    traj = getattr(propagator, "trajectory", None)
+                    if traj is not None:  # includes executed burns (SGP4 + deviation)
+                        sat = traj(sid) or sat
+                    tracks[side] = mp.ObjectTrack(sid, name, satrec=sat)
                 else:
                     st = alert.get(f"{side}_state") or (alert.get("fragment_state") if info.get("object_type") == "DEB" else None)
                     if st and st.get("r_km") is not None and st.get("v_kms") is not None:
@@ -643,7 +647,9 @@ def _alert_position(alert: dict, propagator, cache: dict) -> np.ndarray | None:
             from sgp4.api import jday
 
             jd, fr = jday(tca.year, tca.month, tca.day, tca.hour, tca.minute, tca.second + tca.microsecond / 1e6)
-            e, r, _ = sats[sid][0].sgp4(jd, fr)
+            traj = getattr(propagator, "trajectory", None)
+            sat = (traj(sid) if traj is not None else None) or sats[sid][0]
+            e, r, _ = sat.sgp4(jd, fr)
             if e != 0:
                 return None
             pts.append(np.asarray(r, float))
@@ -672,7 +678,12 @@ def _objects_near(propagator, when: datetime, center: np.ndarray, radius_km: flo
                 cache[key] = None
             else:
                 jd, fr = jday(when.year, when.month, when.day, when.hour, when.minute, when.second + when.microsecond / 1e6)
-                e, r, _ = SatrecArray([sats[i][0] for i in ids]).sgp4(np.array([jd]), np.array([fr]))
+                e, r, v = SatrecArray([sats[i][0] for i in ids]).sgp4(np.array([jd]), np.array([fr]))
+                try:
+                    from app.core.sgp4_propagator import add_burn_offsets
+                    add_burn_offsets(propagator, ids, np.array([jd]), np.array([fr]), r, v)
+                except ImportError:  # pragma: no cover
+                    pass
                 r = r[:, 0, :]
                 r[e[:, 0] != 0] = np.nan
                 cache[key] = (ids, [sats[i][1] for i in ids], r)

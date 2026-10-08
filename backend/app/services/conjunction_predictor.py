@@ -29,7 +29,11 @@ import numpy as np
 
 from app.core.frames import ecef_to_eci, eci_to_geodetic, geodetic_to_ecef
 from app.core.sgp4_propagator import SGP4Propagator, SatelliteState, MU
-from app.core.analytics import compute_collision_probability
+from app.core import sim_clock
+from app.core.breakup import DEFAULT_LC_MIN_M, sbm_cumulative_count, sbm_reference_mass
+from app.core.conjunction import compute_cpi_score
+from app.core.debris_model import object_physical_properties
+from app.core.screening import classify_severity, compute_pc, object_meta, propagate_j2
 from app.core.state_cache import set_latest_alerts
 from app.services.conjunction_solver import (
     COLLISION_THRESHOLD_M,
@@ -71,7 +75,7 @@ def classify_approach(miss_distance_m: float) -> str:
 def parse_epoch(value: Optional[str], fallback: Optional[datetime] = None) -> datetime:
     """Parse an ISO-8601 UTC timestamp with a 'Z' suffix tolerance."""
     if not value:
-        return fallback or datetime.now(timezone.utc)
+        return fallback or sim_clock.simulation_now()
 
     cleaned = value.strip()
     if cleaned.endswith("Z"):
@@ -313,6 +317,82 @@ def enrich_payload_with_geodetic(payload: dict[str, Any], tca_time: datetime) ->
     return payload
 
 
+def _tle_age_days(propagator, norad_id: int, at: datetime) -> float | None:
+    """|at - TLE epoch| in days for a catalogue object, else None."""
+    try:
+        with propagator._lock:
+            entry = propagator._satellites.get(int(norad_id))
+    except Exception:
+        return None
+    if not entry:
+        return None
+    satrec = entry[0]
+    from sgp4.api import jday
+
+    jd, fr = jday(at.year, at.month, at.day, at.hour, at.minute, at.second + at.microsecond / 1e6)
+    return abs((jd - satrec.jdsatepoch) + (fr - satrec.jdsatepochF))
+
+
+def assess_pair_risk(propagator, obj_a: tuple, obj_b: tuple, tca_time: datetime, ref_time: datetime) -> dict:
+    """
+    Foster Pc, B-plane geometry and SBM fragment forecast for one pair at TCA.
+
+    obj_* = (norad_id, name, r_tca_km, v_tca_kms). Covariance: TLE-age RTN
+    model of app.core.screening (age = |TCA - TLE epoch| for catalogue objects;
+    for objects given only as a state, the propagation span ref -> TCA).
+    HBR: sum of app.core.screening.object_meta radii. Fragment count: NASA SBM
+    N(>=10 cm) = 0.1 M_ref^0.75 Lc^-1.71 with masses from
+    app.core.debris_model.object_physical_properties (mass_source tagged).
+    Anything that cannot be computed is returned as None, never substituted.
+    """
+    span_days = max(0.0, (tca_time - ref_time).total_seconds()) / 86400.0
+    metas, ages, age_src, props = [], [], [], []
+    for nid, name, _, _ in (obj_a, obj_b):
+        metas.append(object_meta(int(nid), name))
+        age = _tle_age_days(propagator, nid, tca_time)
+        ages.append(span_days if age is None else age)
+        age_src.append("propagation_span_from_state" if age is None else "tle_epoch_to_tca")
+        props.append(object_physical_properties(int(nid), name))
+    hbr_km = (metas[0]["radius_m"] + metas[1]["radius_m"]) / 1000.0
+    r1, v1, r2, v2 = (np.asarray(x, float) for x in (obj_a[2], obj_a[3], obj_b[2], obj_b[3]))
+    out: dict[str, Any] = {
+        "hbr_km": round(hbr_km, 6),
+        "tle_age_days": [round(a, 4) for a in ages],
+        "tle_age_source": age_src,
+        "meta": metas,
+        "p_collision": None, "b_t_km": None, "b_n_km": None,
+        "covariance_ellipse": None, "short_encounter_valid": None,
+    }
+    try:
+        pc = compute_pc(r1, v1, r2, v2, age1_days=ages[0], age2_days=ages[1], hbr_km=hbr_km)
+        out.update(
+            p_collision=float(pc["pc"]),
+            b_t_km=round(pc["b_t_km"], 6),
+            b_n_km=round(pc["b_n_km"], 6),
+            covariance_ellipse={**pc["covariance_ellipse"],
+                                "radius_source": [m["radius_source"] for m in metas]},
+            short_encounter_valid=pc["short_encounter_valid"],
+        )
+    except Exception as exc:
+        logger.warning("compute_pc failed for %s-%s: %s", obj_a[0], obj_b[0], exc)
+
+    v_rel = float(np.linalg.norm(v2 - v1))
+    m_ref, catastrophic, emr = sbm_reference_mass(props[0]["mass_kg"], props[1]["mass_kg"], v_rel)
+    out["breakup_forecast"] = {
+        "expected_fragments": int(round(sbm_cumulative_count(m_ref, DEFAULT_LC_MIN_M))),
+        "lc_min_m": DEFAULT_LC_MIN_M,
+        "is_catastrophic": catastrophic,
+        "emr_j_per_g": round(emr / 1000.0, 3),
+        "sbm_reference_mass_kg": round(m_ref, 2),
+        "relative_velocity_kms": round(v_rel, 5),
+        "masses_kg": [props[0]["mass_kg"], props[1]["mass_kg"]],
+        "mass_source": [props[0]["mass_source"], props[1]["mass_source"]],
+        "model": "NASA SBM: N(>=Lc) = 0.1 * M_ref^0.75 * Lc^-1.71",
+        "conditional_on": "collision_occurring",
+    }
+    return out
+
+
 def build_collision_prediction(
     propagator: SGP4Propagator,
     sat_a: SimpleNamespace,
@@ -349,6 +429,17 @@ def build_collision_prediction(
     sat1_id = int(sat_a.norad_id)
     sat2_id = int(sat_b.norad_id)
 
+    # Reference epoch = the epoch the two states were resolved at (the sim
+    # clock "now" for the live predictor). TCA is reported relative to it and
+    # the cascade / manoeuvre analysis runs from it (a burn happens BEFORE TCA).
+    ref_time = getattr(sat_a, "epoch_utc", None)
+    if not isinstance(ref_time, datetime):
+        ref_time = parse_epoch(ref_time if isinstance(ref_time, str) else None)
+    elif ref_time.tzinfo is None:
+        ref_time = ref_time.replace(tzinfo=timezone.utc)
+    tca_s = max(0.0, (tca_time - ref_time).total_seconds())
+
+    # Catalogue states at TCA (debris / affected satellites) ...
     active_states = propagate_states_to(propagator, target_utc=tca_time)
 
     state_a_tca = _build_test_state(
@@ -361,50 +452,70 @@ def build_collision_prediction(
     )
     all_states = active_states + [state_a_tca, state_b_tca]
 
-    state_a_dict = {
-        "x": state_a_tca.x, "y": state_a_tca.y, "z": state_a_tca.z,
-        "vx": state_a_tca.vx, "vy": state_a_tca.vy, "vz": state_a_tca.vz,
-    }
-    state_b_dict = {
-        "x": state_b_tca.x, "y": state_b_tca.y, "z": state_b_tca.z,
-        "vx": state_b_tca.vx, "vy": state_b_tca.vy, "vz": state_b_tca.vz,
-    }
+    # ... and at the reference epoch (cascade / manoeuvre planner). The pair is
+    # brought back from its TCA state with the same two-body + J2 dynamics the
+    # TCA solver integrated forward.
+    states_now = propagate_states_to(propagator, target_utc=ref_time) if tca_s > 0 else list(active_states)
+    pair_now = []
+    for sid, name, r_t, v_t in ((sat1_id, sat_a.name, result.position_a_eci, result.velocity_a_eci),
+                                (sat2_id, sat_b.name, result.position_b_eci, result.velocity_b_eci)):
+        r0, v0 = propagate_j2(np.asarray(r_t, float)[None, :], np.asarray(v_t, float)[None, :], -tca_s)
+        pair_now.append(_build_test_state(sid, name, [float(x) for x in r0[0]], [float(x) for x in v0[0]],
+                                          ref_time.isoformat()))
+    pair_ids = {sat1_id, sat2_id}
+    cascade_states = [st for st in states_now if int(st.norad_id) not in pair_ids] + pair_now
 
-    try:
-        prob_res = compute_collision_probability(state_a_dict, state_b_dict)
-        p_col = prob_res.get("p_collision", 0.0)
-        bt_km = prob_res.get("b_t_km", 0.0)
-        bn_km = prob_res.get("b_n_km", 0.0)
-        covariance_ellipse = prob_res.get("covariance_ellipse") or {}
-    except Exception as exc:
-        logger.warning("compute_collision_probability failed: %s", exc)
-        miss_km = result.miss_distance_m / 1000.0
-        p_col = math.exp(-0.5 * (miss_km / 0.5) ** 2)
-        bt_km = 0.0
-        bn_km = 0.0
-        covariance_ellipse = {
-            "a": 3000.0, "b": 1000.0, "angle": 0.5,
-            "affection_rate": p_col * 100.0, "predicted_fragments": 150,
-        }
-
+    risk = assess_pair_risk(
+        propagator,
+        (sat1_id, sat_a.name, result.position_a_eci, result.velocity_a_eci),
+        (sat2_id, sat_b.name, result.position_b_eci, result.velocity_b_eci),
+        tca_time, ref_time,
+    )
+    p_col = risk["p_collision"]
+    bt_km = risk["b_t_km"]
+    bn_km = risk["b_n_km"]
+    covariance_ellipse = risk["covariance_ellipse"]
     miss_km = result.miss_distance_m / 1000.0
-    cpi = max(1.0, min(10.0, 10.0 - 1.8 * miss_km))
-    severity = "critical" if cpi >= 8.0 else "warning" if cpi >= 5.0 else "watch"
+    rel_kms = float(result.relative_velocity_kms)
+    tca_hours = tca_s / 3600.0
+    if p_col is not None:
+        cpi = round(compute_cpi_score(p_col, miss_km, tca_hours=tca_hours, relative_velocity_kms=rel_kms,
+                                      tle_age_hours=24.0 * max(risk["tle_age_days"])), 4)
+        severity = classify_severity(p_col, miss_km)
+    else:
+        cpi = None
+        severity = None
+    # Zone radius = 3-sigma semi-major axis of the combined B-plane covariance.
+    zone_radius_km = round(covariance_ellipse["a"] / 1000.0, 3) if covariance_ellipse else None
 
     primary_alert = {
-        "sat1": {"id": sat1_id, "name": sat_a.name},
-        "sat2": {"id": sat2_id, "name": sat_b.name},
+        "sat1": {"id": sat1_id, "name": sat_a.name, "object_type": risk["meta"][0]["object_type"],
+                 "agency": risk["meta"][0]["agency"]},
+        "sat2": {"id": sat2_id, "name": sat_b.name, "object_type": risk["meta"][1]["object_type"],
+                 "agency": risk["meta"][1]["agency"]},
         "miss_distance_km": round(miss_km, 6),
-        "relative_speed_kmh": round(float(result.relative_velocity_kms) * 3600.0, 3),
+        "relative_speed_kmh": round(rel_kms * 3600.0, 3),
+        "relative_speed_kms": round(rel_kms, 5),
         "p_collision": p_col,
+        "probability_of_collision": p_col,
+        "pc_method": "foster" if p_col is not None else None,
+        "hbr_km": risk["hbr_km"],
+        "sigma_source": "tle_age_model",
+        "tle_age_days": risk["tle_age_days"],
+        "tle_age_source": risk["tle_age_source"],
+        "short_encounter_valid": risk["short_encounter_valid"],
         "cpi_score": cpi,
+        "cpi_method": "app.core.conjunction.compute_cpi_score" if cpi is not None else None,
         "hotspot_score": cpi,
         "severity": severity,
-        "tca_minutes": 0.0,
-        "tca_hours": 0.0,
+        "tca_minutes": round(tca_s / 60.0, 3),
+        "tca_hours": round(tca_hours, 5),
         "tca_utc": result.tca_utc,
+        "reference_utc": ref_time.isoformat(),
         "bt_km": bt_km,
         "bn_km": bn_km,
+        "b_t_km": bt_km,
+        "b_n_km": bn_km,
         "b_plane_bt_km": bt_km,
         "b_plane_bn_km": bn_km,
         "hotspot_position": {
@@ -412,15 +523,17 @@ def build_collision_prediction(
             "y": round(float(state_a_tca.y + state_b_tca.y) / 2.0, 3),
             "z": round(float(state_a_tca.z + state_b_tca.z) / 2.0, 3),
         },
-        "zone_radius_km": 100.0,
+        "zone_radius_km": zone_radius_km,
+        "zone_radius_source": "3sigma_bplane_semi_major" if zone_radius_km is not None else None,
         "covariance_ellipse": covariance_ellipse,
+        "breakup_forecast": risk["breakup_forecast"],
     }
 
     cascade_summary = _cascade_planner.analyze_snapshot(
-        states=all_states,
+        states=cascade_states,
         alerts=[primary_alert],
         propagator=propagator,
-        reference_time=tca_time,
+        reference_time=ref_time,
         cpi_threshold=5.0,
     )
 
@@ -441,18 +554,7 @@ def build_collision_prediction(
                 a["bn_km"] = bn_km
                 a["b_plane_bt_km"] = bt_km
                 a["b_plane_bn_km"] = bn_km
-
-    for a in planner_alerts:
-        if "covariance_ellipse" not in a or not a["covariance_ellipse"]:
-            a_miss_km = a.get("miss_distance_km", 1.0)
-            a_p_col = a.get("p_collision", 0.01)
-            a["covariance_ellipse"] = {
-                "a": max(100.0, a_miss_km * 400.0),
-                "b": max(50.0, a_miss_km * 150.0),
-                "angle": 0.5,
-                "affection_rate": round(a_p_col * 100.0, 2),
-                "predicted_fragments": 150,
-            }
+    # Other alerts keep the covariance their own screening computed; none is invented here.
 
     hotspots = cascade_summary.get("hotspots", [])
     primary_hotspot = {
@@ -464,11 +566,11 @@ def build_collision_prediction(
         "cpi_score": cpi,
         "hotspot_score": cpi,
         "severity": severity,
-        "tca_minutes": 0.0,
-        "tca_hours": 0.0,
+        "tca_minutes": primary_alert["tca_minutes"],
+        "tca_hours": primary_alert["tca_hours"],
         "tca_utc": result.tca_utc,
         "position": primary_alert["hotspot_position"],
-        "zone_radius_km": 100.0,
+        "zone_radius_km": zone_radius_km,
     }
     has_primary_hotspot = any(
         (h["sat1"]["id"] == sat1_id and h["sat2"]["id"] == sat2_id) or
@@ -496,6 +598,8 @@ def build_collision_prediction(
 
     payload = {
         "timestamp": tca_time.isoformat(),
+        "reference_utc": ref_time.isoformat(),
+        "breakup_forecast": risk["breakup_forecast"],
         "alerts": planner_alerts,
         "count": len(planner_alerts),
         "hotspots": hotspots,

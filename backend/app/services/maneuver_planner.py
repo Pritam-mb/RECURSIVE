@@ -231,6 +231,7 @@ class EncounterJob:
     k1: int = 0
     nodes_R: dict = field(default_factory=dict)
     nodes_V: dict = field(default_factory=dict)
+    other_nodes: dict = field(default_factory=dict)   # m_idx -> (R, V) node arrays of a fragment (drag model)
 
 
 def _sgp4_states(satrec, jd0: float, fr0: float, t_s: np.ndarray):
@@ -264,6 +265,48 @@ def _isotropic_pc(r1, v1, r2, v2, sigma_km: float, hbr_km: float) -> float:
     return foster_pc(np.array([np.linalg.norm(b), 0.0]), np.eye(2) * sigma_km ** 2, hbr_km)
 
 
+def _fragment_state_for(job: EncounterJob, other: ObjectTrack) -> dict | None:
+    """The alert's ``fragment_state`` when ``other`` is the debris fragment of a debris alert.
+
+    Debris alerts (app.core.debris_model.compute_debris_alerts) carry the
+    fragment's state at a known sim epoch plus its ballistic coefficient; the
+    fragment is then propagated here with the same two-body + J2 + drag model
+    (app.core.breakup.propagate) that generated the alert, instead of the
+    drag-free J2 batch used for objects given only as a state."""
+    if other.satrec is not None:
+        return None
+    alert = job.alert
+    st = alert.get("fragment_state")
+    if not isinstance(st, dict) or st.get("r_km") is None or st.get("v_kms") is None or not st.get("epoch_utc"):
+        return None
+    deb_ids = {str(alert.get(s, {}).get("id")) for s in ("sat1", "sat2")
+               if (alert.get(s) or {}).get("object_type") == "DEB"}
+    if str(other.norad_id) not in deb_ids:
+        return None
+    return st
+
+
+def _fragment_nodes(st: dict, burn_epoch: datetime, k0: int, k1: int):
+    """Fragment positions/velocities on the node grid t_k = k * NODE_STEP_S after burn_epoch."""
+    from app.core import breakup as sbm
+
+    epoch = datetime.fromisoformat(str(st["epoch_utc"]).replace("Z", "+00:00"))
+    if epoch.tzinfo is None:
+        epoch = epoch.replace(tzinfo=timezone.utc)
+    bc = st.get("ballistic_coeff_m2_kg")
+    bc_arr = None if bc is None else np.array([float(bc)])
+    r = np.asarray(st["r_km"], float)[None, :]
+    v = np.asarray(st["v_kms"], float)[None, :]
+    dt0 = k0 * NODE_STEP_S - (epoch - burn_epoch).total_seconds()
+    if abs(dt0) > 1e-9:
+        r, v = sbm.propagate(r, v, bc_arr, dt0, max_step_s=NODE_STEP_S / RK4_SUBSTEPS)
+    R = [r[0]]; V = [v[0]]
+    for _ in range(k0 + 1, k1 + 1):
+        r, v = sbm.propagate(r, v, bc_arr, NODE_STEP_S, max_step_s=NODE_STEP_S / RK4_SUBSTEPS)
+        R.append(r[0]); V.append(v[0])
+    return np.array(R), np.array(V)
+
+
 def plan_maneuvers(jobs: list[EncounterJob], burn_epoch: datetime, *, pc_target: float = PC_TARGET,
                    time_budget_s: float = 3.0) -> dict[str, Any]:
     """Run the batched re-propagation search. Returns stats; writes job results in place."""
@@ -291,8 +334,11 @@ def plan_maneuvers(jobs: list[EncounterJob], burn_epoch: datetime, *, pc_target:
     V0: list[np.ndarray] = []
     n_rows = 0
     for job in jobs:
-        job.rows, job.other_rows = [], []
-        for mover, other in zip(job.movers, job.others):
+        job.rows, job.other_rows, job.other_nodes = [], [], {}
+        lo = max(0.0, job.tca_s - WINDOW_HALF_S)
+        job.k0 = int(math.floor(lo / NODE_STEP_S))
+        job.k1 = int(math.ceil((job.tca_s + WINDOW_HALF_S) / NODE_STEP_S)) + 1
+        for m_idx, (mover, other) in enumerate(zip(job.movers, job.others)):
             e, r, v = mover.track.satrec.sgp4(jd0, fr0)
             if e != 0:
                 job.rows.append(None); job.other_rows.append(None)
@@ -304,15 +350,16 @@ def plan_maneuvers(jobs: list[EncounterJob], burn_epoch: datetime, *, pc_target:
             V0.append(np.vstack([v[None, :], v[None, :] + dv_eci_kms]))
             job.rows.append(np.arange(n_rows, n_rows + n_cand + 1))
             n_rows += n_cand + 1
-            if other.satrec is None:
+            frag = _fragment_state_for(job, other)
+            if frag is not None:
+                job.other_nodes[m_idx] = _fragment_nodes(frag, burn_epoch, job.k0, job.k1)
+                job.other_rows.append(None)
+            elif other.satrec is None:
                 job.other_rows.append(n_rows)
                 R0.append(np.asarray(other.r0, float)[None, :]); V0.append(np.asarray(other.v0, float)[None, :])
                 n_rows += 1
             else:
                 job.other_rows.append(None)
-        lo = max(0.0, job.tca_s - WINDOW_HALF_S)
-        job.k0 = int(math.floor(lo / NODE_STEP_S))
-        job.k1 = int(math.ceil((job.tca_s + WINDOW_HALF_S) / NODE_STEP_S)) + 1
         job.nodes_R, job.nodes_V = {}, {}
 
     if not R0:
@@ -373,7 +420,12 @@ def plan_maneuvers(jobs: list[EncounterJob], burn_epoch: datetime, *, pc_target:
                 continue
             li = np.array([local[int(x)] for x in rows])
             dR = NR[li] - NR[li[0]]; dV = NV[li] - NV[li[0]]           # deviations (cand+1, nodes, 3)
-            if other.satrec is None:
+            if m_idx in job.other_nodes:
+                fR, fV = job.other_nodes[m_idx]
+
+                def other_state(t, o_R=fR, o_V=fV):
+                    return _hermite(t, t_node0, NODE_STEP_S, o_R, o_V), _hermite_deriv(t, t_node0, NODE_STEP_S, o_R, o_V)
+            elif other.satrec is None:
                 oi = local[int(job.other_rows[m_idx])]
                 o_R, o_V = NR[oi], NV[oi]
 
@@ -431,6 +483,7 @@ def plan_maneuvers(jobs: list[EncounterJob], burn_epoch: datetime, *, pc_target:
             stats["candidates_evaluated"] += ncr - 1
             per_mover.append({
                 "mover": mover, "pcs": pcs, "miss": miss, "t_star": t_star, "edge": edge,
+                "fragment_drag": m_idx in job.other_nodes,
             })
 
         job.alert["_maneuver_result"] = _select(job, per_mover, cand_rsw, cand_label, burn_epoch, pc_target, jd0, fr0)
@@ -504,6 +557,9 @@ def _select(job: EncounterJob, per_mover: list[dict], cand_rsw: np.ndarray, cand
             "movers_considered": [p["mover"].track.norad_id for p in per_mover],
             "rescreen_scope": "pair",
             "propagation": "sgp4_reference+j2_rk4_deviation",
+            "other_object_propagation": ("fragment_state:two_body+J2+drag(app.core.breakup.propagate)"
+                                         if pm.get("fragment_drag") else
+                                         ("sgp4" if any(o.satrec is not None for o in job.others) else "two_body+J2_rk4")),
             "verified_by": "repropagation",
         },
     }

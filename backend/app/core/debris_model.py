@@ -772,6 +772,11 @@ class DebrisModel:
             from sgp4.api import SatrecArray
             jd, fr = _jd_grid(sim_time, offsets)
             err, r, v = SatrecArray(satrecs).sgp4(jd, fr)
+            try:  # executed burns ride on SGP4 as a propagated deviation
+                from app.core.sgp4_propagator import add_burn_offsets
+                add_burn_offsets(prop, [sats[i][0] for i in sgp_rows], jd, fr, r, v)
+            except ImportError:  # pragma: no cover
+                pass
             r = np.where((err == 0)[..., None], r, np.nan)
             R[sgp_rows] = r
             V[sgp_rows] = v
@@ -901,6 +906,11 @@ def find_pair_tca(propagator, a_id: int, b_id: int, start: datetime, *, window_h
     offsets = np.arange(0.0, max(span, coarse_step_s) + coarse_step_s, coarse_step_s)
     jd, fr = _jd_grid(scan_start, offsets)
     err, r, v = SatrecArray([ea[0], eb[0]]).sgp4(jd, fr)
+    try:  # executed burns ride on SGP4 as a propagated deviation
+        from app.core.sgp4_propagator import add_burn_offsets
+        add_burn_offsets(propagator, [int(a_id), int(b_id)], jd, fr, r, v)
+    except ImportError:  # pragma: no cover
+        pass
     d = np.linalg.norm(r[0] - r[1], axis=1)
     d[(err[0] != 0) | (err[1] != 0)] = np.inf
     k = int(np.argmin(d))

@@ -410,6 +410,10 @@ def find_tca(
     if e1 is None or e2 is None:
         return None
     (sat1, name1), (sat2, name2) = e1, e2
+    traj = getattr(propagator, "trajectory", None)
+    if traj is not None:  # executed burns: SGP4 + propagated deviation
+        sat1 = traj(id1) or sat1
+        sat2 = traj(id2) or sat2
 
     span = float(hours_ahead) * 3600.0
     n = max(int(steps), int(math.ceil(span / 60.0))) + 1

@@ -288,11 +288,9 @@ class SimEngine:
         return _infer_shared_agency(name)
 
     def _clone_propagator(self) -> SGP4Propagator:
-        clone = SGP4Propagator()
-        with self.propagator._lock:
-            clone._satellites = dict(self.propagator._satellites)
-            clone._maneuvers = dict(self.propagator._maneuvers)
-        return clone
+        # Copies TLEs AND executed burns (deviation model), so what-if burns
+        # on the clone start from the trajectory the live propagator flies.
+        return self.propagator.clone()
 
     def _assess_future_conjunctions(self, propagator: SGP4Propagator, target_id: int, start_time: datetime) -> dict:
         nearest = None
@@ -438,8 +436,12 @@ class SimEngine:
         be dropped here, which silently downgraded every maneuver to
         DEMO_SESSION and made the agency authorization model inert.
         """
+        from app.core import sim_clock
+
+        # One burn epoch (simulation clock) for the dry run and the real burn.
+        epoch = sim_clock.simulation_now()
         preflight = self.preflight_check(
-            norad_id, dvx, dvy, dvz, frame=frame, session_id=session_id
+            norad_id, dvx, dvy, dvz, frame=frame, session_id=session_id, epoch=epoch
         )
 
         if not all(preflight["gates"].values()):
@@ -448,7 +450,7 @@ class SimEngine:
                 "preflight": preflight,
             }
 
-        result = self.propagator.apply_delta_v(norad_id, dvx, dvy, dvz, frame=frame)
+        result = self.propagator.apply_delta_v(norad_id, dvx, dvy, dvz, frame=frame, epoch=epoch)
         if result.get("status") != "success":
             return {"status": "ERROR", "preflight": preflight, **result}
 
@@ -462,6 +464,7 @@ class SimEngine:
         dvz: float,
         frame: str = "RSW",
         session_id: str = "DEMO_SESSION",
+        epoch: datetime | None = None,
     ) -> dict:
         """
         6-gate pre-flight validation based on cloned orbit simulation.
@@ -474,7 +477,9 @@ class SimEngine:
         import numpy as np
 
         dv_magnitude = float(np.sqrt(dvx**2 + dvy**2 + dvz**2))
-        now = datetime.now(timezone.utc)
+        from app.core import sim_clock
+
+        now = epoch or sim_clock.simulation_now()
         current_state = self.propagator.propagate_one(norad_id, now)
         target_name = current_state.name if current_state is not None else f"NORAD-{norad_id}"
         agency = self._infer_agency(target_name)
@@ -493,7 +498,7 @@ class SimEngine:
             agency_auth = (session_id == "DEMO_SESSION")
 
         cloned_propagator = self._clone_propagator()
-        burn_result = cloned_propagator.apply_delta_v(norad_id, dvx, dvy, dvz, frame=frame)
+        burn_result = cloned_propagator.apply_delta_v(norad_id, dvx, dvy, dvz, frame=frame, epoch=now)
 
         future_risk = None
         gates = {

@@ -303,6 +303,12 @@ def _compute_debris_alerts(states, sim_now):
 def _attach_ml(alerts: list[dict]) -> None:
     """Agent D's ML surrogate (never replaces the physics Pc)."""
     try:
+        from app.ml.risk_api import score_alerts
+        score_alerts(alerts)
+        return
+    except Exception as exc:
+        logger.debug("score_alerts unavailable/failed: %s", exc)
+    try:
         from app.ml.risk_api import score_alert
     except Exception:
         for a in alerts:

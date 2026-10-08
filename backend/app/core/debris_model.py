@@ -802,6 +802,24 @@ class DebrisModel:
             else:
                 p50 = p90 = pmax = 0.0
                 frags = []
+            # Per-parent streams: after a high-angle collision the fragments of each
+            # parent stay on (perturbed) copies of that parent's orbit.
+            streams = []
+            if not pending:
+                for k in (0, 1):
+                    sel = ev.alive & (res.parent_index == k)
+                    if sel.sum() >= 3:
+                        rs = ev.r[sel]
+                        cs = rs.mean(axis=0)
+                        ds = np.linalg.norm(rs - cs, axis=1)
+                        streams.append({
+                            "parent_id": ev.parent_ids[k] if len(ev.parent_ids) > k else None,
+                            "fragments_simulated": int(sel.sum()),
+                            "fragment_count": int(round(sel.sum() * res.weight)),
+                            "centroid_eci_km": {"x": float(cs[0]), "y": float(cs[1]), "z": float(cs[2])},
+                            "radius_p50_km": round(float(np.percentile(ds, 50)), 3),
+                            "radius_p90_km": round(float(np.percentile(ds, 90)), 3),
+                        })
             affected = exposure.get(ev.event_id, [])
             tl = timelines.get(ev.event_id) or []
             if len(tl) >= 3:
@@ -838,6 +856,7 @@ class DebrisModel:
                                  "parent_ids": ev.parent_ids, "parent_names": ev.parent_names,
                                  "fragment_count": res.n_total, "is_catastrophic": res.catastrophic,
                                  "seed": res.seed},
+                "streams": streams,
                 "affected_satellites": affected[:25],
                 "affected_count": len(affected),
                 "affected_high_risk": sum(1 for a in affected if a.get("severity") == "CRITICAL"),

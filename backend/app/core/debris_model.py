@@ -1063,8 +1063,9 @@ class DebrisModel:
                 "kernel_process": "worker" if in_worker else "in_process",
                 "satellites_sgp4": len(sats) - len(rest), "satellites_rk4_j2": len(rest),
             }
-        logger.info("Debris screening: %d fragments x %d sats over %.1f h -> %d pairs (%.2f s)",
-                    len(F_r), len(sats), window_hours, total, elapsed)
+        logger.info("Debris screening: %d fragments x %d sats over %.1f h -> %d pairs (%.2f s; tracks %.2f s, "
+                    "kernel %.2f s in %s)", len(F_r), len(sats), window_hours, total, elapsed, t_tracks, t_kernel,
+                    "worker" if in_worker else "process")
         return alerts
 
     def _satellite_tracks(self, sats, sim_time, offsets):

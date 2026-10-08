@@ -86,6 +86,8 @@ const DV_EDGES_MS = [50, 150, 300];
 const TRAIL_SAMPLES = 8;
 const FLASH_MS = 2000;
 const MAX_THREAT_CALLOUTS = 3;
+const THREAT_WINDOW_MS = 10 * 60 * 1000; // threat line only within ±10 min of its TCA
+const MAX_THREAT_PROP_S = 6 * 3600; // longest short-arc propagation from a snapshot
 const SIZE_LEGEND = ['<0.1 M', '0.1–0.3 M', '0.3–1 M', '≥1 M'];
 const DV_LEGEND = ['<50 M/S', '50–150', '150–300', '≥300 M/S'];
 
@@ -199,7 +201,56 @@ function projectEci(x, y, z, out) {
   const py = ((uz * cosT) - (d0 * sinT)) * k;
   out.sx = cx + px;
   out.sy = cy - py;
-  out.visible = (d0 * cosT) + (uz * sinT) >= 0 || Math.hypot(px, py) > R + 1;
+  out.front = (d0 * cosT) + (uz * sinT) >= 0;
+  out.visible = out.front || Math.hypot(px, py) > R + 1;
+  return out;
+}
+
+/**
+ * Polyline pen for tracks: lifts at hidden points AND whenever consecutive
+ * points switch between near side and far-side-outside-limb, or jump far on
+ * screen, so a track never draws a chord across the disc.
+ */
+const pen = { down: false, front: true, sx: 0, sy: 0 };
+function penTo(ctx, p) {
+  if (!p.visible) { pen.down = false; return; }
+  const jump = pen.down && (p.front !== pen.front
+    || Math.abs(p.sx - pen.sx) + Math.abs(p.sy - pen.sy) > view.R * 0.5);
+  if (pen.down && !jump) ctx.lineTo(p.sx, p.sy);
+  else ctx.moveTo(p.sx, p.sy);
+  pen.down = true; pen.front = p.front; pen.sx = p.sx; pen.sy = p.sy;
+}
+
+// ── Short-arc propagation for threatened satellites (two-body + J2) ───────
+// Places a satellite at the replay instant from its snapshot state
+// (position + velocity). Velocity-Verlet, <= 20 s steps; scratch reused.
+const MU = 398600.4418;
+const J2 = 1.08262668e-3;
+const PROP_STEP_S = 20;
+const acc = new Float64Array(3);
+function accelJ2(x, y, z) {
+  const r2 = (x * x) + (y * y) + (z * z);
+  const r = Math.sqrt(r2);
+  const k0 = -MU / (r2 * r);
+  const k = (1.5 * J2 * MU * EARTH_RADIUS_KM * EARTH_RADIUS_KM) / (r2 * r2 * r);
+  const zz = (5 * z * z) / r2;
+  acc[0] = (k0 * x) + (k * x * (zz - 1));
+  acc[1] = (k0 * y) + (k * y * (zz - 1));
+  acc[2] = (k0 * z) + (k * z * (zz - 3));
+}
+function propagateJ2(pos, vel, dtS, out) {
+  let x = pos.x; let y = pos.y; let z = pos.z;
+  let vx = vel.vx || 0; let vy = vel.vy || 0; let vz = vel.vz || 0;
+  const n = Math.max(1, Math.ceil(Math.abs(dtS) / PROP_STEP_S));
+  const h = dtS / n;
+  accelJ2(x, y, z);
+  for (let i = 0; i < n; i += 1) {
+    vx += acc[0] * h * 0.5; vy += acc[1] * h * 0.5; vz += acc[2] * h * 0.5;
+    x += vx * h; y += vy * h; z += vz * h;
+    accelJ2(x, y, z);
+    vx += acc[0] * h * 0.5; vy += acc[1] * h * 0.5; vz += acc[2] * h * 0.5;
+  }
+  out.x = x; out.y = y; out.z = z;
   return out;
 }
 
@@ -391,11 +442,21 @@ function prepareReplay(replay) {
     if (n > 0) { collision[0] /= n; collision[1] /= n; collision[2] /= n; hasCollision = true; }
   }
 
+  const threatened = Array.isArray(replay.threatened) ? replay.threatened : EMPTY;
+  const collisionMs = Date.parse(replay.collision_utc ?? '');
+  const tcaMs = Float64Array.from(threatened, (th) => {
+    const ms = Date.parse(th?.tca_utc ?? '');
+    return Number.isFinite(ms) ? ms : Number.NaN;
+  });
   return {
+    collisionMs,
+    tcaMs,
+    threatPos: threatened.map(() => ({ x: 0, y: 0, z: 0 })),
+    threatProj: threatened.map(() => ({ sx: 0, sy: 0, visible: false, front: false })),
     nS, nF, t, fragPos, fragOk, parents, bucket, envC, envR, envOk,
     collision, hasCollision,
     stepS: finiteOr(replay.step_s, nS > 1 ? t[1] - t[0] : 0),
-    threatened: Array.isArray(replay.threatened) ? replay.threatened : EMPTY,
+    threatened,
     // Per-frame scratch (reused).
     i0: 0, i1: 0, a: 0,
     cur: new Float32Array(nF * 3),
@@ -825,13 +886,8 @@ export default function ThreatGlobe({ alerts = EMPTY, satellites = EMPTY, select
           ctx.strokeStyle = k === 0 ? PALETTE.accent : PALETTE.info;
           ctx.globalAlpha = 0.6;
           ctx.beginPath();
-          let penDown = false;
-          for (const pt of traj) {
-            const p = projectEci(pt[1], pt[2], pt[3], scratchProj);
-            if (!p.visible) { penDown = false; continue; }
-            if (penDown) ctx.lineTo(p.sx, p.sy);
-            else { ctx.moveTo(p.sx, p.sy); penDown = true; }
-          }
+          pen.down = false;
+          for (const pt of traj) penTo(ctx, projectEci(pt[1], pt[2], pt[3], scratchProj));
           ctx.stroke();
         }
         ctx.globalAlpha = 1;
@@ -869,14 +925,11 @@ export default function ThreatGlobe({ alerts = EMPTY, satellites = EMPTY, select
         ctx.globalAlpha = 0.75;
         ctx.lineWidth = 1.25;
         ctx.beginPath();
-        let penDown = false;
+        pen.down = false;
         for (const sample of orbit) {
           const pos = sample.position;
-          if (!pos) { penDown = false; continue; }
-          const p = projectEci(pos.x, pos.y, pos.z, scratchProj);
-          if (!p.visible) { penDown = false; continue; }
-          if (penDown) ctx.lineTo(p.sx, p.sy);
-          else { ctx.moveTo(p.sx, p.sy); penDown = true; }
+          if (!pos) { pen.down = false; continue; }
+          penTo(ctx, projectEci(pos.x, pos.y, pos.z, scratchProj));
         }
         ctx.stroke();
         ctx.globalAlpha = 1;
@@ -910,15 +963,12 @@ export default function ThreatGlobe({ alerts = EMPTY, satellites = EMPTY, select
               ctx.setLineDash(pass === 0 ? [] : [2, 4]);
               ctx.globalAlpha = pass === 0 ? 0.6 : 0.25;
               ctx.beginPath();
-              let penDown = false;
+              pen.down = false;
               for (let si = 0; si < prep.nS; si += 1) {
                 const ts = prep.t[si];
-                if ((pass === 0 && ts > 0) || (pass === 1 && ts < 0) || !par.ok[si]) { penDown = false; continue; }
+                if ((pass === 0 && ts > 0) || (pass === 1 && ts < 0) || !par.ok[si]) { pen.down = false; continue; }
                 const o = si * 3;
-                const p = projectEci(par.pos[o], par.pos[o + 1], par.pos[o + 2], scratchProj);
-                if (!p.visible) { penDown = false; continue; }
-                if (penDown) ctx.lineTo(p.sx, p.sy);
-                else { ctx.moveTo(p.sx, p.sy); penDown = true; }
+                penTo(ctx, projectEci(par.pos[o], par.pos[o + 1], par.pos[o + 2], scratchProj));
               }
               ctx.stroke();
             }
@@ -968,17 +1018,16 @@ export default function ThreatGlobe({ alerts = EMPTY, satellites = EMPTY, select
             ctx.beginPath();
             for (let f = 0; f < nF; f += 1) {
               if (buckets[f] !== b || !curVis[f]) continue;
-              let penDown = false;
+              pen.down = false;
               for (let si = first; si <= i0; si += 1) {
                 const k = (si * nF) + f;
-                if (!prep.fragOk[k]) { penDown = false; continue; }
+                if (!prep.fragOk[k]) { pen.down = false; continue; }
                 const o = k * 3;
-                const p = projectEci(prep.fragPos[o], prep.fragPos[o + 1], prep.fragPos[o + 2], scratchProj);
-                if (!p.visible) { penDown = false; continue; }
-                if (penDown) ctx.lineTo(p.sx, p.sy);
-                else { ctx.moveTo(p.sx, p.sy); penDown = true; }
+                penTo(ctx, projectEci(prep.fragPos[o], prep.fragPos[o + 1], prep.fragPos[o + 2], scratchProj));
               }
-              if (penDown) ctx.lineTo(curSx[f], curSy[f]);
+              if (pen.down && Math.abs(curSx[f] - pen.sx) + Math.abs(curSy[f] - pen.sy) <= view.R * 0.5) {
+                ctx.lineTo(curSx[f], curSy[f]);
+              }
             }
             ctx.stroke();
           }
@@ -1179,33 +1228,55 @@ export default function ThreatGlobe({ alerts = EMPTY, satellites = EMPTY, select
       if (prep && showThreatened && prep.threatened.length > 0) {
         const phase = (nowMs % 1400) / 1400;
         const { nF, cur, curOk, curVis, curSx, curSy } = prep;
+        // Replay instant (sim time) for this frame.
+        const replayMs = Number.isFinite(prep.collisionMs) ? prep.collisionMs + (tRel * 1000) : Number.NaN;
+        const dtFromSnap = (replayMs - (motion.lastSimMs ?? Number.NaN)) / 1000;
         let threatCallouts = 0;
-        for (const th of prep.threatened) {
+        for (let ti = 0; ti < prep.threatened.length; ti += 1) {
+          const th = prep.threatened[ti];
           const entry = motion.sats.get(Number(th?.sat_id));
-          if (!entry || !entry.proj.visible) continue;
-          const p = entry.proj;
-          const r = entry.render;
-          let best = -1;
-          let bestD2 = Infinity;
-          for (let f = 0; f < nF; f += 1) {
-            if (!curOk[f]) continue;
-            const o = f * 3;
-            const dx = cur[o] - r.x;
-            const dy = cur[o + 1] - r.y;
-            const dz = cur[o + 2] - r.z;
-            const d2 = (dx * dx) + (dy * dy) + (dz * dz);
-            if (d2 < bestD2) { bestD2 = d2; best = f; }
+          if (!entry) continue;
+          const tca = prep.tcaMs[ti];
+          // Within ±10 min of this threat's TCA the satellite is moved to the
+          // replay instant (J2 short arc from its snapshot state) and linked
+          // to the nearest live fragment. Outside it: live position, pulse
+          // ring + TCA label only (the two would be on different clocks).
+          const inWindow = Number.isFinite(tca) && Math.abs(replayMs - tca) <= THREAT_WINDOW_MS
+            && !!entry.velocity && Number.isFinite(dtFromSnap) && Math.abs(dtFromSnap) <= MAX_THREAT_PROP_S;
+          let p = entry.proj;
+          let r = entry.render;
+          if (inWindow) {
+            r = propagateJ2(entry.base, entry.velocity, dtFromSnap, prep.threatPos[ti]);
+            p = projectEci(r.x, r.y, r.z, prep.threatProj[ti]);
           }
-          if (best >= 0 && curVis[best]) {
-            ctx.strokeStyle = PALETTE.warning;
-            ctx.globalAlpha = 0.6;
-            ctx.setLineDash([2, 3]);
-            ctx.lineWidth = 1;
-            ctx.beginPath();
-            ctx.moveTo(p.sx, p.sy);
-            ctx.lineTo(curSx[best], curSy[best]);
-            ctx.stroke();
-            ctx.setLineDash([]);
+          if (!p.visible) continue;
+          if (inWindow && p.front) {
+            let best = -1;
+            let bestD2 = MAX_LINK_KM * MAX_LINK_KM; // same chord rule as conjunction lines
+            for (let f = 0; f < nF; f += 1) {
+              if (!curOk[f]) continue;
+              const o = f * 3;
+              const dx = cur[o] - r.x;
+              const dy = cur[o + 1] - r.y;
+              const dz = cur[o + 2] - r.z;
+              const d2 = (dx * dx) + (dy * dy) + (dz * dz);
+              if (d2 < bestD2) { bestD2 = d2; best = f; }
+            }
+            if (best >= 0 && curVis[best]) {
+              const o = best * 3;
+              projectEci(cur[o], cur[o + 1], cur[o + 2], scratchProj);
+              if (scratchProj.front) {
+                ctx.strokeStyle = PALETTE.warning;
+                ctx.globalAlpha = 0.7;
+                ctx.setLineDash([2, 3]);
+                ctx.lineWidth = 1;
+                ctx.beginPath();
+                ctx.moveTo(p.sx, p.sy);
+                ctx.lineTo(curSx[best], curSy[best]);
+                ctx.stroke();
+                ctx.setLineDash([]);
+              }
+            }
           }
           ctx.globalAlpha = 1;
           ctx.fillStyle = PALETTE.warning;
@@ -1221,9 +1292,11 @@ export default function ThreatGlobe({ alerts = EMPTY, satellites = EMPTY, select
           ctx.globalAlpha = 1;
           ctx.lineWidth = 1;
           if (showLabels && threatCallouts < MAX_THREAT_CALLOUTS) {
-            const miss = formatMiss(Number(th.miss_km));
             const name = shortName(th.name ?? entry.name ?? `#${th.sat_id}`, 14);
-            if (drawCallout(ctx, p, miss ? `${name}  ${miss}` : name, PALETTE.warning, W, H)) threatCallouts += 1;
+            const extra = inWindow
+              ? formatMiss(Number(th.miss_km))
+              : (th.tca_utc ? `TCA ${String(th.tca_utc).slice(11, 16)}Z` : '');
+            if (drawCallout(ctx, p, extra ? `${name}  ${extra}` : name, PALETTE.warning, W, H)) threatCallouts += 1;
           }
         }
       }

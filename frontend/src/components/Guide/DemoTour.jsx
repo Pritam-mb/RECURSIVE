@@ -55,7 +55,11 @@ export default function DemoTour({ open, onClose }) {
   const abortRef = useRef(null);
   const mounted = useRef(true);
 
-  useEffect(() => () => { mounted.current = false; abortRef.current?.abort(); }, []);
+  useEffect(() => {
+    // StrictMode mounts twice: re-arm on every mount.
+    mounted.current = true;
+    return () => { mounted.current = false; abortRef.current?.abort(); };
+  }, []);
 
   const patch = useCallback((i, p) => {
     if (!mounted.current) return;

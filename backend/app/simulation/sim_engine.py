@@ -26,6 +26,21 @@ AGENCY_ALIASES = _AGENCY_ALIASES
 SCENARIOS_DIR = os.path.join(os.path.dirname(__file__))
 
 
+def _to_native(value):
+    """Recursively convert numpy scalars/arrays into JSON-safe Python types."""
+    import numpy as np
+
+    if isinstance(value, dict):
+        return {key: _to_native(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_to_native(item) for item in value]
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
 class SimEngine:
     """Manages deterministic simulation scenarios."""
 
@@ -212,7 +227,7 @@ class SimEngine:
         """
         import numpy as np
 
-        dv_magnitude = np.sqrt(dvx**2 + dvy**2 + dvz**2)
+        dv_magnitude = float(np.sqrt(dvx**2 + dvy**2 + dvz**2))
         now = datetime.now(timezone.utc)
         current_state = self.propagator.propagate_one(norad_id, now)
         target_name = current_state.name if current_state is not None else f"NORAD-{norad_id}"
@@ -256,9 +271,12 @@ class SimEngine:
                 "sim_dryrun": True,
             })
 
+        gates = {name: bool(passed) for name, passed in gates.items()}
         all_clear = all(gates.values())
 
-        return {
+        # The burn and risk results carry numpy scalars/arrays, which the
+        # JSON encoder rejects (500 on /api/preflight); convert to plain types.
+        return _to_native({
             "norad_id": norad_id,
             "satellite_name": target_name,
             "agency": agency,
@@ -268,7 +286,7 @@ class SimEngine:
             "all_clear": all_clear,
             "trajectory": future_risk,
             "burn": burn_result,
-        }
+        })
 
     def list_scenarios(self) -> list[str]:
         """List available scenario files."""
